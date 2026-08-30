@@ -1,27 +1,55 @@
+<div align="center">
+
 # OTserver Otter
 
-Windows and Linux read-only discovery CLI for [OTserver](https://otserver.org). It discovers IPv4/MAC pairs
-with ARP and directly queries PROFINET DCP, S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, OPC UA, and
-optional SNMP. Windows uses native IP Helper for active ARP, Win10Pcap for active PROFINET DCP, and
-Microsoft pktmon as a passive fallback. Linux uses native raw sockets. No TAP adapter or Windows
-Network Bridge is used or modified.
+### Read-only OT discovery CLI and GUI for the [OTserver inventory](https://github.com/ruveydac/OTserver)
 
-The 64-bit Windows release embeds the unmodified, signed Win10Pcap 10.2.5002 MSI under GPLv2 and can
-install it only when explicitly requested from the elevated GUI or with
-`otserver-otter install-win10pcap`. Driver installation does not disrupt networking. The scanner
-dynamically loads the installed `Packet.dll` from the Windows system directory, matches the selected
-physical interface by GUID, transmits DCP Identify, and captures only PROFINET Ethernet frames. The
-corresponding Win10Pcap project information is at <https://www.win10pcap.org/>.
+Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Fox · OPC UA · SNMP · LLDP
 
-The Windows executable exposes its Cargo package version in Explorer file properties and in the GUI.
-Starting the GUI detaches its console window; CLI commands keep normal terminal input and output.
+[![Website](https://img.shields.io/badge/otserver.org-111111?logo=firefoxbrowser&logoColor=white)](https://otserver.org)
+[![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Platforms](https://img.shields.io/badge/Windows_%7C_Linux-0078D6?logo=windows&logoColor=white)](#quick-start)
+[![OTserver](https://img.shields.io/badge/OTserver-Next.js-000000?logo=nextdotjs&logoColor=white)](https://github.com/ruveydac/OTserver)
+[![AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENCE.md)
 
-Active DCP verifies that the configured source MAC belongs to the selected physical interface before
-opening the selected Win10Pcap adapter. Identify-All is sent once with an engineering-tool response
-delay factor so device replies are spread over the capture window instead of creating a synchronized
-response burst.
+[Quick start](#quick-start) · [Protocols](#protocols-and-safety) · [Configuration](#configuration-and-direct-import) · [Lab](#virtual-ot-lab) · [Development](#development)
 
-## Linux
+</div>
+
+---
+
+OTserver Otter is a cross-platform Rust CLI (with an optional GUI) built specifically for identifying
+industrial devices through fixed, read-only protocol requests. It discovers IPv4/MAC pairs with ARP
+and directly queries PROFINET DCP, S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, OPC UA, and
+optional SNMP/LLDP. It collects structured evidence—not just a flat host list—and exports
+observations, interfaces, ports, and topology through the schema-version-2 `otserver-scan` contract
+understood directly by [OTserver](https://github.com/ruveydac/OTserver).
+
+Windows uses native IP Helper for active ARP, Win10Pcap for active PROFINET DCP, and Microsoft pktmon
+as a passive fallback. Linux uses native `AF_PACKET` raw sockets. No TAP adapter or Windows Network
+Bridge is used or modified.
+
+## What you get
+
+- **Native protocol identity** — Fixed queries designed to retrieve device identity without
+  configuration changes, vulnerability scripts, or exploit behavior.
+- **Evidence-preserving output** — Per-protocol observations and raw source data alongside
+  normalized devices, instead of collapsing a scan into one guessed record.
+- **Topology-aware collection** — LLDP, SNMP, and PROFINET link evidence, network interfaces, and
+  ports in a validated JSON export.
+- **Quality-aware by design** — Each observation reaches the importer with its source quality, so
+  stronger evidence improves the inventory without overwriting human edits.
+- **Predictable failure handling** — Valid partial results with warnings when individual probes
+  fail; malformed and unsolicited responses are rejected.
+- **Direct import** — Send a completed scan straight to OTserver's REST importer with your site
+  permissions, keeping the local JSON file.
+
+## Quick start
+
+Otter requires `--ack-authorized` before every scan. Only scan networks you own or are authorized
+to assess.
+
+### Linux
 
 ```bash
 cargo build --release
@@ -38,7 +66,7 @@ sudo ./target/release/otserver-otter scan \
 Linux Ethernet discovery uses a native `AF_PACKET` raw socket and therefore needs root or
 `CAP_NET_RAW`.
 
-### Raspberry Pi
+#### Raspberry Pi
 
 Tagged releases include `otserver-otter-linux-aarch64.tar.gz` for Raspberry Pi 3, 4, 5, and
 Zero 2 W running 64-bit Raspberry Pi OS Bookworm or newer. This headless build omits the GUI; run a
@@ -51,7 +79,7 @@ To build the headless scanner natively instead:
 cargo build --locked --release --no-default-features
 ```
 
-## Windows
+### Windows
 
 ```powershell
 cargo build --release --target x86_64-pc-windows-msvc
@@ -66,38 +94,48 @@ cargo build --release --target x86_64-pc-windows-msvc
   --ack-authorized
 ```
 
-Only scan networks you own or are authorized to assess. The scanner sends PROFINET DCP Identify,
-read-only SNMP requests, and fixed read-only identity requests for S7, EtherNet/IP, BACnet, Omron
-FINS, Niagara Fox, and OPC UA. It never runs SNMP SET, DCP Set, brute-force, exploit, vulnerability, or
-Modbus requests.
+Windows ARP discovery needs no additional driver. Active PROFINET discovery requires Win10Pcap
+(GPLv2) and Administrator rights; install the bundled package explicitly from the GUI or by running
+`otserver-otter install-win10pcap` in an elevated terminal. If Win10Pcap is unavailable, the scanner
+uses built-in pktmon as a passive fallback. Pktmon requires Administrator rights and cannot transmit
+DCP Identify frames.
+
+The 64-bit Windows release embeds the unmodified, signed Win10Pcap 10.2.5002 MSI under GPLv2 and can
+install it only when explicitly requested. Driver installation does not disrupt networking. The
+scanner dynamically loads the installed `Packet.dll` from the Windows system directory, matches the
+selected physical interface by GUID, transmits DCP Identify, and captures only PROFINET Ethernet
+frames. The corresponding Win10Pcap project information is at <https://www.win10pcap.org/>.
+
+Active DCP verifies that the configured source MAC belongs to the selected physical interface before
+opening the selected Win10Pcap adapter. Identify-All is sent once with an engineering-tool response
+delay factor so device replies are spread over the capture window instead of creating a synchronized
+response burst.
+
+The Windows executable exposes its Cargo package version in Explorer file properties and in the GUI.
+Starting the GUI detaches its console window; CLI commands keep normal terminal input and output.
+
+Validate an export before uploading it:
+
+```powershell
+.\otserver-otter.exe validate .\scan.otserver.json
+```
+
+## Protocols and safety
+
+The scanner sends PROFINET DCP Identify, read-only SNMP requests, and fixed read-only identity
+requests for S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, and OPC UA. It never runs SNMP SET,
+DCP Set, brute-force, exploit, vulnerability, or Modbus requests.
 
 All discovery protocols are enabled by default. Disable individual protocols on the CLI with
-`--no-arp`, `--no-profinet`, `--no-s7`, `--no-enip`, `--no-bacnet`, `--no-fins`, `--no-fox`, `--no-opcua`, or
-`--no-snmp` and `--no-lldp`. SNMP inventory and LLDP topology queries share the same SNMP settings
-but can be enabled independently. The GUI exposes the same choices as highlighted on/off toggle
-buttons. The scan log records one entry per probed IP and protocol, for example
-`[12:43] 192.168.1.10 Protocol snmp Success`. Every log line is timestamped. SNMP attempts also show
-the version and sanitized security choices, such as
-`[12:43] 192.168.1.10 SNMP attempt version=3 security=authPriv authentication=SHA-256 encryption=AES-128 Success`.
+`--no-arp`, `--no-profinet`, `--no-s7`, `--no-enip`, `--no-bacnet`, `--no-fins`, `--no-fox`,
+`--no-opcua`, or `--no-snmp` and `--no-lldp`. SNMP inventory and LLDP topology queries share the
+same SNMP settings but can be enabled independently. The GUI exposes the same choices as
+highlighted on/off toggle buttons.
 
-The GUI keeps a selectable, auto-scrolling log panel to the right of its configuration, with an
-always-visible clear action, scan status, and configuration-save result. The output field accepts a
-filename directly or opens the native save-file picker. Stopping a running scan writes a valid
-partial export containing all results collected before cancellation. When `otter.json` contains
-multiple configurations, the GUI can run the selected configuration or run all configurations
-sequentially. A stopped batch skips its remaining configurations.
-
-SNMP settings and credentials live in the `snmp` block of `otter.json` and are fully editable
-in the GUI. The `snmp` value is a single credential object or a list of credentials; a list is tried
-in order per target until one succeeds, so one configuration can combine an SNMPv3 user with several
-SNMPv1/v2c communities. Without any settings, SNMPv2c with the community `public` is used, so SNMP
-never blocks a scan. Set `version` to `1` for a legacy SNMPv1 agent. For SNMPv3 set `version` to `3`
-plus `username`, optional `contextName`, and the
-`authProtocol`/`authPassword` and `privacyProtocol`/`privacyPassword` pairs. Credentials are stored
-in plaintext in `otter.json`; keep the file out of source control and restrict its permissions.
-Credentials are never written to logs or scan exports. Set `version` to `auto` to opt into fallback:
-the scanner tries SNMPv3 first when a username is configured, then SNMPv2c, then SNMPv1, stopping at
-the first successful version. Explicit `1`, `2c`, and `3` selections never fall back.
+Exit code `0` means every scan completed, `2` means at least one valid output contains partial
+failures, and `1` means a configuration, scan, or upload failed. A multi-configuration run continues
+after failures and reports exit code `1` after attempting the remaining configurations. Stopping a
+running scan writes a valid partial export containing all results collected before cancellation.
 
 SNMP uses bounded, read-only queries covering MIB-II (RFC 1213) system and interface identity,
 LLDP-MIB topology (IEEE 802.1AB) with the LLDP-EXT-DOT1, LLDP-EXT-DOT3, and LLDP-EXT-PNO
@@ -109,32 +147,50 @@ bridge, or LLDP chassis identity. Forwarding-table MACs are port evidence only a
 identities.
 
 OPC UA discovery connects to ports 4840, 4841, and 48400 by default (configurable via `opcuaPorts`).
-The scanner prefers anonymous authentication; if the server requires username authentication, set
-`opcuaCredentials` in the config — a single `{ "username", "password" }` object or a list of them.
-Anonymous access is always tried first; the configured credentials are tried top to bottom only
-when it fails. The legacy single
+The scanner prefers anonymous authentication and reads only asset identification, health, and
+location variables; it never writes values or calls methods that modify server state.
+
+### GUI
+
+The GUI keeps a selectable, auto-scrolling log panel to the right of its configuration, with an
+always-visible clear action, scan status, and configuration-save result. The output field accepts a
+filename directly or opens the native save-file picker. When `otter.json` contains multiple
+configurations, the GUI can run the selected configuration or run all configurations sequentially;
+**Stop Scan** stops the current scan, writes its partial output when possible, and skips all pending
+entries.
+
+The scan log records one entry per probed IP and protocol, for example
+`[12:43] 192.168.1.10 Protocol snmp Success`. Every log line is timestamped. SNMP attempts also show
+the version and sanitized security choices, such as
+`[12:43] 192.168.1.10 SNMP attempt version=3 security=authPriv authentication=SHA-256 encryption=AES-128 Success`.
+
+### SNMP settings
+
+SNMP settings and credentials live in the `snmp` block of `otter.json` and are fully editable in the
+GUI. The `snmp` value is a single credential object or a list of credentials; a list is tried in
+order per target until one succeeds, so one configuration can combine an SNMPv3 user with several
+SNMPv1/v2c communities. Without any settings, SNMPv2c with the community `public` is used, so SNMP
+never blocks a scan. Set `version` to `1` for a legacy SNMPv1 agent. For SNMPv3 set `version` to `3`
+plus `username`, optional `contextName`, and the `authProtocol`/`authPassword` and
+`privacyProtocol`/`privacyPassword` pairs. Credentials are stored in plaintext in `otter.json`; keep
+the file out of source control and restrict its permissions. Credentials are never written to logs
+or scan exports. Set `version` to `auto` to opt into fallback: the scanner tries SNMPv3 first when a
+username is configured, then SNMPv2c, then SNMPv1, stopping at the first successful version.
+Explicit `1`, `2c`, and `3` selections never fall back. The GUI manages the list in a table of every
+active credential in try order, with **Remove**, **Add Credential**, and masked passwords.
+
+SNMPv3 settings may include an optional `contextName`. Most physical devices use the default empty
+context and can omit it; simulators and partitioned agents may require it.
+
+### OPC UA settings
+
+If an OPC UA server requires username authentication, set `opcuaCredentials` in the config — a single
+`{ "username", "password" }` object or a list of them. Anonymous access is always tried first; the
+configured credentials are tried top to bottom only when it fails. The legacy single
 `opcuaUsername`/`opcuaPassword` pair remains supported. The GUI shows the same credential table as
-for SNMP: rows in try order with **Remove**, **Add Credential**, and the edit fields below.
-Passwords travel unencrypted because the scanner uses SecurityPolicy None, and are never written to
-logs or scan exports.
-The scanner reads only asset identification, health, and location variables; it never writes values
-or calls methods that modify server state.
-
-Validate an export before uploading it:
-
-```powershell
-.\otserver-otter.exe validate .\scan.otserver.json
-```
-
-Exit code `0` means every scan completed, `2` means at least one valid output contains partial
-failures, and `1` means a configuration, scan, or upload failed. A multi-configuration run continues
-after failures and reports exit code `1` after attempting the remaining configurations. Windows ARP
-discovery needs no additional driver. Windows
-active PROFINET discovery requires Win10Pcap (GPLv2) and Administrator rights. Install the bundled
-package explicitly from the GUI or by running `otserver-otter install-win10pcap` in an elevated
-terminal. The scanner opens the selected physical adapter directly; no virtual adapter or bridge is
-required. If Win10Pcap is unavailable, the scanner uses built-in pktmon as a passive fallback.
-Pktmon requires Administrator rights and cannot transmit DCP Identify frames.
+for SNMP: rows in try order with **Remove**, **Add Credential**, and the edit fields below. Passwords
+travel unencrypted because the scanner uses SecurityPolicy None, and are never written to logs or
+scan exports.
 
 ## Configuration and direct import
 
@@ -177,14 +233,14 @@ The root can instead be an array of configurations. Every array entry requires a
 [
   {
     "name": "Line A",
-    "targets": ["192.168.10.0/24"],
+    "targets": ["192.168.1.0/24"],
     "interface": "eth0",
     "sourceMac": "00:11:22:33:44:55",
     "output": "line-a.otserver.json"
   },
   {
     "name": "Line B",
-    "targets": ["192.168.20.0/24"],
+    "targets": ["192.168.2.0/24"],
     "interface": "eth1",
     "sourceMac": "00:11:22:33:44:66",
     "output": "line-b.otserver.json"
@@ -195,9 +251,8 @@ The root can instead be an array of configurations. Every array entry requires a
 The GUI exposes **Add Configuration**, a configuration selector, **Run Selected**, and **Run All**.
 Adding a configuration clones the selected settings, assigns a unique name and output filename, and
 converts a single-object file to the array form when necessary. The CLI `scan` command runs array
-entries sequentially in file order. Both continue with later entries after a configuration, scan, or
-upload failure. In the GUI, **Stop Scan** stops the current scan, writes its partial output when
-possible, and skips all pending entries.
+entries sequentially in file order and continues with later entries after a configuration, scan, or
+upload failure.
 
 An SNMPv3 block looks like this instead:
 
@@ -232,10 +287,6 @@ duplicate entries are skipped:
   ]
 }
 ```
-
-The GUI manages this list in the SNMP settings: a table shows every active credential in try order
-with its version and community or SNMPv3 user, each with a **Remove** button. Selecting a row edits
-it in the fields below, where **Add Credential** appends a new entry; passwords stay masked.
 
 Command-line values override every selected file entry, and `OTSERVER_API_KEY` overrides every
 entry's `apiKey`. A shared `--output` override therefore cannot be used for a multi-entry run because
@@ -290,18 +341,34 @@ forwarded protocol responses belong to that one temporary identity; Docker's int
 MACs are not visible to the Windows host. The importable scan is deleted after validation and only a
 plain-text summary and Compose log are retained.
 
-This smoke test covers Windows ARP, S7, EtherNet/IP, BACnet, FINS, Fox, OPC UA, SNMP, and LLDP client paths.
-It does not verify distinct device MAC correlation. Docker Desktop also does not bridge raw Ethernet
-frames between its Linux bridge and a Windows capture driver, so the harness disables PROFINET DCP.
-Active Windows DCP and multi-device MAC discovery require physical Layer-2 test devices or a
-dedicated external Layer-2 test interface.
+This smoke test covers Windows ARP, S7, EtherNet/IP, BACnet, FINS, Fox, OPC UA, SNMP, and LLDP
+client paths. It does not verify distinct device MAC correlation. Docker Desktop also does not bridge
+raw Ethernet frames between its Linux bridge and a Windows capture driver, so the harness disables
+PROFINET DCP. Active Windows DCP and multi-device MAC discovery require physical Layer-2 test devices
+or a dedicated external Layer-2 test interface.
 
-Images use pinned Snap7 and SNMP Simulator packages plus checksum-pinned OpENer and BACnet Stack sources; the
-repository's small FINS and Fox responders implement only the fixed read-only identity requests sent
-by this scanner. The OPC UA responder uses the maintained asyncua (opcua-asyncio) Python stack.
+Images use pinned Snap7 and SNMP Simulator packages plus checksum-pinned OpENer and BACnet Stack
+sources; the repository's small FINS and Fox responders implement only the fixed read-only identity
+requests sent by this scanner. The OPC UA responder uses the maintained asyncua (opcua-asyncio)
+Python stack.
 
-SNMPv3 settings may include an optional `contextName`. Most physical devices use the default empty
-context and can omit it; simulators and partitioned agents may require it.
+## Development
+
+Run the checks before committing:
+
+```bash
+cargo fmt -- --check
+cargo check --locked
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo llvm-cov --lib --fail-under-lines 90 --summary-only -- --test-threads=1
+./lab/test.sh
+```
+
+Scanner branch, loop, and parser logic needs a focused Rust unit test. Protocol interoperability
+belongs in the Docker lab. The canonical wire contract is
+[`contracts/otserver-scan-v2.schema.json`](contracts/otserver-scan-v2.schema.json); a contract
+change requires coordinated updates in the [OTserver](https://github.com/ruveydac/OTserver) importer.
 
 ## License
 
