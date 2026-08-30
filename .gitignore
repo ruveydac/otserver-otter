@@ -1,0 +1,9 @@
+/target/
+/lab/artifacts/
+otter.json
+otscanner.json
+otserver-scan.json
+*.otserver.json
+__pycache__/
+coverage/
+pki/

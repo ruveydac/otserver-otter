@@ -1,4 +1,4 @@
-# OTserver Scanner
+# OTserver Otter
 
 Windows and Linux read-only discovery CLI for [OTserver](https://otserver.org). It discovers IPv4/MAC pairs
 with ARP and directly queries PROFINET DCP, S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, OPC UA, and
@@ -8,7 +8,7 @@ Network Bridge is used or modified.
 
 The 64-bit Windows release embeds the unmodified, signed Win10Pcap 10.2.5002 MSI under GPLv2 and can
 install it only when explicitly requested from the elevated GUI or with
-`otserver-scanner install-win10pcap`. Driver installation does not disrupt networking. The scanner
+`otserver-otter install-win10pcap`. Driver installation does not disrupt networking. The scanner
 dynamically loads the installed `Packet.dll` from the Windows system directory, matches the selected
 physical interface by GUID, transmits DCP Identify, and captures only PROFINET Ethernet frames. The
 corresponding Win10Pcap project information is at <https://www.win10pcap.org/>.
@@ -25,9 +25,9 @@ response burst.
 
 ```bash
 cargo build --release
-sudo ./target/release/otserver-scanner doctor
-sudo ./target/release/otserver-scanner interfaces
-sudo ./target/release/otserver-scanner scan \
+sudo ./target/release/otserver-otter doctor
+sudo ./target/release/otserver-otter interfaces
+sudo ./target/release/otserver-otter scan \
   --target 192.168.1.0/24 \
   --interface eth0 \
   --source-mac 00:11:22:33:44:55 \
@@ -40,7 +40,7 @@ Linux Ethernet discovery uses a native `AF_PACKET` raw socket and therefore need
 
 ### Raspberry Pi
 
-Tagged releases include `otserver-scanner-linux-aarch64.tar.gz` for Raspberry Pi 3, 4, 5, and
+Tagged releases include `otserver-otter-linux-aarch64.tar.gz` for Raspberry Pi 3, 4, 5, and
 Zero 2 W running 64-bit Raspberry Pi OS Bookworm or newer. This headless build omits the GUI; run a
 CLI subcommand such as `doctor`, `interfaces`, or `scan`. It requires the Raspberry Pi OS `libssl3`
 package and the same root or `CAP_NET_RAW` access as other Linux builds.
@@ -55,9 +55,9 @@ cargo build --locked --release --no-default-features
 
 ```powershell
 cargo build --release --target x86_64-pc-windows-msvc
-.\target\x86_64-pc-windows-msvc\release\otserver-scanner.exe doctor
-.\target\x86_64-pc-windows-msvc\release\otserver-scanner.exe interfaces
-.\target\x86_64-pc-windows-msvc\release\otserver-scanner.exe scan `
+.\target\x86_64-pc-windows-msvc\release\otserver-otter.exe doctor
+.\target\x86_64-pc-windows-msvc\release\otserver-otter.exe interfaces
+.\target\x86_64-pc-windows-msvc\release\otserver-otter.exe scan `
   --target 192.168.1.0/24 `
   --interface '<interface name or GUID>' `
   --source-mac 00:11:22:33:44:55 `
@@ -83,18 +83,18 @@ the version and sanitized security choices, such as
 The GUI keeps a selectable, auto-scrolling log panel to the right of its configuration, with an
 always-visible clear action, scan status, and configuration-save result. The output field accepts a
 filename directly or opens the native save-file picker. Stopping a running scan writes a valid
-partial export containing all results collected before cancellation. When `otscanner.json` contains
+partial export containing all results collected before cancellation. When `otter.json` contains
 multiple configurations, the GUI can run the selected configuration or run all configurations
 sequentially. A stopped batch skips its remaining configurations.
 
-SNMP settings and credentials live in the `snmp` block of `otscanner.json` and are fully editable
+SNMP settings and credentials live in the `snmp` block of `otter.json` and are fully editable
 in the GUI. The `snmp` value is a single credential object or a list of credentials; a list is tried
 in order per target until one succeeds, so one configuration can combine an SNMPv3 user with several
 SNMPv1/v2c communities. Without any settings, SNMPv2c with the community `public` is used, so SNMP
 never blocks a scan. Set `version` to `1` for a legacy SNMPv1 agent. For SNMPv3 set `version` to `3`
 plus `username`, optional `contextName`, and the
 `authProtocol`/`authPassword` and `privacyProtocol`/`privacyPassword` pairs. Credentials are stored
-in plaintext in `otscanner.json`; keep the file out of source control and restrict its permissions.
+in plaintext in `otter.json`; keep the file out of source control and restrict its permissions.
 Credentials are never written to logs or scan exports. Set `version` to `auto` to opt into fallback:
 the scanner tries SNMPv3 first when a username is configured, then SNMPv2c, then SNMPv1, stopping at
 the first successful version. Explicit `1`, `2c`, and `3` selections never fall back.
@@ -123,7 +123,7 @@ or calls methods that modify server state.
 Validate an export before uploading it:
 
 ```powershell
-.\otserver-scanner.exe validate .\scan.otserver.json
+.\otserver-otter.exe validate .\scan.otserver.json
 ```
 
 Exit code `0` means every scan completed, `2` means at least one valid output contains partial
@@ -131,15 +131,16 @@ failures, and `1` means a configuration, scan, or upload failed. A multi-configu
 after failures and reports exit code `1` after attempting the remaining configurations. Windows ARP
 discovery needs no additional driver. Windows
 active PROFINET discovery requires Win10Pcap (GPLv2) and Administrator rights. Install the bundled
-package explicitly from the GUI or by running `otserver-scanner install-win10pcap` in an elevated
+package explicitly from the GUI or by running `otserver-otter install-win10pcap` in an elevated
 terminal. The scanner opens the selected physical adapter directly; no virtual adapter or bridge is
 required. If Win10Pcap is unavailable, the scanner uses built-in pktmon as a passive fallback.
 Pktmon requires Administrator rights and cannot transmit DCP Identify frames.
 
 ## Configuration and direct import
 
-Place an optional `otscanner.json` beside the scanner executable to provide scan defaults and an
-OTserver destination. The existing single-object form remains supported:
+Place an optional `otter.json` beside the executable to provide scan defaults and an OTserver
+destination. Existing `otscanner.json` files are loaded when `otter.json` is absent. The existing
+single-object form remains supported:
 
 ```json
 {
@@ -240,7 +241,7 @@ Command-line values override every selected file entry, and `OTSERVER_API_KEY` o
 entry's `apiKey`. A shared `--output` override therefore cannot be used for a multi-entry run because
 the resolved paths would collide. Relative paths are resolved from the current working directory.
 The config contains credentials in plaintext; keep it out of source control and restrict its
-permissions (for example, `chmod 600 otscanner.json`). The safer automation setup omits `apiKey`
+permissions (for example, `chmod 600 otter.json`). The safer automation setup omits `apiKey`
 from the file and supplies `OTSERVER_API_KEY` through the process environment.
 
 When `serverUrl`, `site`, and an API key are present, `scan` writes and validates the local JSON and
@@ -249,7 +250,7 @@ must be its Payload document ID, and the API key user must have read/write acces
 flags can also select the destination:
 
 ```bash
-OTSERVER_API_KEY='...' otserver-scanner scan \
+OTSERVER_API_KEY='...' otserver-otter scan \
   --target 192.168.1.0/24 \
   --interface eth0 \
   --source-mac 00:11:22:33:44:55 \
@@ -304,8 +305,8 @@ context and can omit it; simulators and partitioned agents may require it.
 
 ## License
 
-OTserver Scanner is dual-licensed with OTserver: it is available under
-[GNU AGPLv3](../LICENCE.md), or under a commercial license for proprietary use
+OTserver Otter is dual-licensed with OTserver: it is available under
+[GNU AGPLv3](LICENCE.md), or under a commercial license for proprietary use
 without AGPLv3 copyleft obligations. For commercial licensing, enterprise
 features, or managed hosting, visit [otserver.org/enterprise](https://otserver.org/enterprise/).
 

@@ -3,10 +3,10 @@ pub mod gui;
 pub mod win10pcap_install;
 
 use clap::{ArgAction, Args, Parser, Subcommand};
-use otserver_scanner::contract::{
+use otserver_otter::contract::{
     Device, InterfaceRef, ScanExport, ScanInfo, ScannerInfo, Source, merge_devices, validate,
 };
-use otserver_scanner::{discovery, profinet, protocols, snmp};
+use otserver_otter::{discovery, profinet, protocols, snmp};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
@@ -32,7 +32,7 @@ impl LogOutput for StdoutLogger {
 
 #[derive(Parser)]
 #[command(
-    name = "otserver-scanner",
+    name = "otserver-otter",
     version,
     about = "Read-only OT discovery for OTserver — https://otserver.org"
 )]
@@ -138,7 +138,7 @@ pub struct ScannerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opcua_ports: Option<Vec<u16>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub opcua_credentials: Option<otserver_scanner::protocols::OpcuaCredentials>,
+    pub opcua_credentials: Option<otserver_otter::protocols::OpcuaCredentials>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opcua_username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -240,7 +240,7 @@ pub struct ScanOptions {
     pub output: PathBuf,
     pub protocols: ProtocolOptions,
     pub snmp: Vec<snmp::Settings>,
-    pub opcua: otserver_scanner::protocols::OpcuaSettings,
+    pub opcua: otserver_otter::protocols::OpcuaSettings,
     pub upload: Option<UploadOptions>,
 }
 
@@ -343,7 +343,7 @@ async fn run() -> Result<(), String> {
             .map_err(|error| error.to_string())?;
             if value["format"] != "otserver-scan" || value["schemaVersion"] != 2 {
                 return Err(
-                    "Unsupported scanner file. Expected otserver-scan schemaVersion 2. Run a new scan with OTserver Scanner."
+                    "Unsupported scanner file. Expected otserver-scan schemaVersion 2. Run a new scan with OTserver Otter."
                         .into(),
                 );
             }
@@ -385,20 +385,32 @@ async fn run() -> Result<(), String> {
         #[cfg(feature = "gui")]
         Some(Commands::Gui) | None => gui::run_gui(),
         #[cfg(not(feature = "gui"))]
-        None => Err("A command is required; run otserver-scanner --help.".into()),
+        None => Err("A command is required; run otserver-otter --help.".into()),
     }
 }
 
 pub fn get_config_path() -> Result<PathBuf, String> {
     if let Ok(exe) = std::env::current_exe() {
-        Ok(exe.with_file_name("otscanner.json"))
+        Ok(exe.with_file_name("otter.json"))
     } else {
-        Ok(PathBuf::from("otscanner.json"))
+        Ok(PathBuf::from("otter.json"))
+    }
+}
+
+fn config_load_path(path: &Path) -> PathBuf {
+    if path.exists() {
+        return path.to_owned();
+    }
+    let legacy = path.with_file_name("otscanner.json");
+    if legacy.exists() {
+        legacy
+    } else {
+        path.to_owned()
     }
 }
 
 pub fn load_config() -> Result<ScannerConfigs, String> {
-    let path = get_config_path()?;
+    let path = config_load_path(&get_config_path()?);
     match std::fs::read(&path) {
         Ok(data) => parse_config(&data)
             .map_err(|error| format!("Could not read {}: {error}", path.display())),
@@ -524,7 +536,7 @@ pub fn resolve_scan(
     })
 }
 
-fn opcua_probe_settings(config: &ScannerConfig) -> otserver_scanner::protocols::OpcuaSettings {
+fn opcua_probe_settings(config: &ScannerConfig) -> otserver_otter::protocols::OpcuaSettings {
     let config_value = |value: Option<&str>| {
         value
             .map(str::trim)
@@ -539,13 +551,13 @@ fn opcua_probe_settings(config: &ScannerConfig) -> otserver_scanner::protocols::
     if credentials.is_empty()
         && let Some(username) = config_value(config.opcua_username.as_deref())
     {
-        credentials.push(otserver_scanner::protocols::OpcuaCredential {
+        credentials.push(otserver_otter::protocols::OpcuaCredential {
             username: Some(username),
             password: config_value(config.opcua_password.as_deref()),
         });
     }
-    otserver_scanner::protocols::OpcuaSettings {
-        ports: otserver_scanner::protocols::OpcuaSettings::ports_or_default(
+    otserver_otter::protocols::OpcuaSettings {
+        ports: otserver_otter::protocols::OpcuaSettings::ports_or_default(
             config.opcua_ports.clone(),
         ),
         credentials,
@@ -631,7 +643,7 @@ pub async fn scan(
     logger: &dyn LogOutput,
     cancelled: &AtomicBool,
 ) -> Result<bool, String> {
-    let started_at = otserver_scanner::now();
+    let started_at = otserver_otter::now();
     let mut devices = Vec::new();
     let mut links = Vec::new();
     let mut unresolved = Vec::new();
@@ -783,19 +795,19 @@ pub async fn scan(
         format: "otserver-scan".into(),
         schema_version: 2,
         scanner: ScannerInfo {
-            name: "OTserver Scanner".into(),
+            name: "OTserver Otter".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             npcap_version: None,
         },
         scan: ScanInfo {
             id: Uuid::new_v4().to_string(),
             started_at,
-            finished_at: otserver_scanner::now(),
+            finished_at: otserver_otter::now(),
             targets: options.targets.clone(),
             interface: InterfaceRef {
                 id: options.interface.clone(),
                 name: options.interface.clone(),
-                mac_address: otserver_scanner::contract::normalize_mac(&options.source_mac),
+                mac_address: otserver_otter::contract::normalize_mac(&options.source_mac),
                 addresses: vec![],
             },
             partial: stopped || protocol_failed || !errors.is_empty(),
@@ -928,7 +940,7 @@ async fn send_import(
             "_payload",
             serde_json::json!({
                 "site": options.site,
-                "source": "otserver-scanner",
+                "source": "otserver-otter",
                 "sourceVersion": env!("CARGO_PKG_VERSION"),
                 "status": "pending"
             })
@@ -970,7 +982,7 @@ async fn discover(
     interface: &str,
     source_mac: &str,
     targets: &[Ipv4Addr],
-) -> Result<Vec<otserver_scanner::contract::Device>, String> {
+) -> Result<Vec<otserver_otter::contract::Device>, String> {
     let interface = interface.to_owned();
     let source_mac = source_mac.to_owned();
     let targets = targets.to_vec();
@@ -982,10 +994,10 @@ async fn discover(
 }
 
 async fn probe_protocols(
-    devices: &mut [otserver_scanner::contract::Device],
+    devices: &mut [otserver_otter::contract::Device],
     warnings: &mut Vec<String>,
     selection: protocols::Selection,
-    opcua: &otserver_scanner::protocols::OpcuaSettings,
+    opcua: &otserver_otter::protocols::OpcuaSettings,
     logger: &dyn LogOutput,
     cancelled: &AtomicBool,
 ) {
@@ -1025,8 +1037,8 @@ async fn probe_protocols(
 async fn probe_snmp(
     ips: BTreeSet<String>,
     devices: &mut Vec<Device>,
-    links: &mut Vec<otserver_scanner::contract::TopologyLink>,
-    unresolved: &mut Vec<otserver_scanner::contract::Observation>,
+    links: &mut Vec<otserver_otter::contract::TopologyLink>,
+    unresolved: &mut Vec<otserver_otter::contract::Observation>,
     warnings: &mut Vec<String>,
     settings: &[snmp::Settings],
     selection: snmp::QuerySelection,
@@ -1093,8 +1105,8 @@ async fn wait_for_cancellation(cancelled: &AtomicBool) {
 )]
 fn apply_snmp_probe(
     devices: &mut Vec<Device>,
-    links: &mut Vec<otserver_scanner::contract::TopologyLink>,
-    unresolved: &mut Vec<otserver_scanner::contract::Observation>,
+    links: &mut Vec<otserver_otter::contract::TopologyLink>,
+    unresolved: &mut Vec<otserver_otter::contract::Observation>,
     warnings: &mut Vec<String>,
     logger: &dyn LogOutput,
     selection: snmp::QuerySelection,
@@ -1170,7 +1182,7 @@ fn apply_snmp_probe(
 }
 
 fn apply_probe(
-    devices: &mut [otserver_scanner::contract::Device],
+    devices: &mut [otserver_otter::contract::Device],
     warnings: &mut Vec<String>,
     logger: &dyn LogOutput,
     result: Option<Result<(Ipv4Addr, String, protocols::ProbeResult), tokio::task::JoinError>>,
@@ -1190,9 +1202,7 @@ fn apply_probe(
     }
 }
 
-fn unique_ip_identities(
-    devices: &[otserver_scanner::contract::Device],
-) -> BTreeMap<String, String> {
+fn unique_ip_identities(devices: &[otserver_otter::contract::Device]) -> BTreeMap<String, String> {
     let mut values = BTreeMap::<String, Vec<String>>::new();
     for device in devices {
         for ip in &device.ip_addresses {
@@ -1463,7 +1473,7 @@ mod tests {
         let settings = opcua_probe_settings(&ScannerConfig::default());
         assert_eq!(
             settings.ports,
-            otserver_scanner::protocols::OPCUA_DEFAULT_PORTS
+            otserver_otter::protocols::OPCUA_DEFAULT_PORTS
         );
         assert!(settings.credentials.is_empty());
     }
@@ -1499,9 +1509,25 @@ mod tests {
     }
 
     #[test]
+    fn prefers_otter_config_and_falls_back_to_legacy_name() {
+        let directory = std::env::temp_dir().join(format!("otserver-otter-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let current = directory.join("otter.json");
+        let legacy = directory.join("otscanner.json");
+
+        assert_eq!(config_load_path(&current), current);
+        std::fs::write(&legacy, b"{}").unwrap();
+        assert_eq!(config_load_path(&current), legacy);
+        std::fs::write(&current, b"{}").unwrap();
+        assert_eq!(config_load_path(&current), current);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn cli_exposes_individual_protocol_disable_flags() {
         let cli = Cli::try_parse_from([
-            "otserver-scanner",
+            "otserver-otter",
             "scan",
             "--ack-authorized",
             "--no-arp",
@@ -1534,7 +1560,7 @@ mod tests {
     #[cfg(not(feature = "gui"))]
     #[test]
     fn cli_requires_subcommand_without_gui() {
-        assert!(Cli::try_parse_from(["otserver-scanner"]).is_err());
+        assert!(Cli::try_parse_from(["otserver-otter"]).is_err());
     }
 
     #[test]
@@ -1586,7 +1612,7 @@ mod tests {
         let mut links = vec![];
         let mut unresolved = vec![];
         let mut warnings = vec![];
-        let observation = otserver_scanner::contract::Observation {
+        let observation = otserver_otter::contract::Observation {
             source: Source::Snmp,
             observed_at: "2026-08-24T00:00:00Z".into(),
             ip_address: Some("192.0.2.10".into()),
@@ -1741,6 +1767,7 @@ mod tests {
             assert!(request.contains("users API-Key secret-key"));
             assert!(request.contains("name=\"_payload\""));
             assert!(request.contains("\"site\":\"site-1\""));
+            assert!(request.contains("\"source\":\"otserver-otter\""));
             assert!(request.contains("filename=\"scan.json\""));
 
             let body = r#"{"doc":{"id":"import-1","status":"completed","createdAssets":2,"updatedAssets":1,"skippedAssets":0}}"#;

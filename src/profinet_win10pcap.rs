@@ -207,7 +207,7 @@ impl Api {
         let names = parse_multistring(&buffer)?;
         if names.is_empty() || names.iter().any(|name| !is_win10pcap_name(name)) {
             return Err(
-                "The installed Packet.dll is not the Win10Pcap backend expected by OTserver Scanner. Install the bundled Win10Pcap package so its WTCAP driver owns Packet.dll."
+                "The installed Packet.dll is not the Win10Pcap backend expected by OTserver Otter. Install the bundled Win10Pcap package so its WTCAP driver owns Packet.dll."
                     .into(),
             );
         }
@@ -265,7 +265,7 @@ pub fn capture(interface: &str, request: &[u8], wait: Duration) -> Result<Vec<Ve
     let adapter = unsafe { (api.open_adapter)(device.as_ptr().cast_mut()) };
     if adapter.is_null() {
         return Err(format!(
-            "Win10Pcap could not open interface {interface}. Run OTserver Scanner as Administrator and verify that the Win10Pcap binding is enabled on that adapter."
+            "Win10Pcap could not open interface {interface}. Run OTserver Otter as Administrator and verify that the Win10Pcap binding is enabled on that adapter."
         ));
     }
     let adapter = AdapterHandle {
@@ -298,7 +298,7 @@ pub fn capture(interface: &str, request: &[u8], wait: Duration) -> Result<Vec<Ve
     let request_length = u32::try_from(request.len()).map_err(|_| "DCP request is too large.")?;
     if request.len() > std::mem::size_of::<Packet>() {
         return Err(format!(
-            "This Win10Pcap Packet.dll build provides only {} bytes for an owned transmit buffer; the DCP request needs {}. Use the 64-bit OTserver Scanner and 64-bit Win10Pcap package.",
+            "This Win10Pcap Packet.dll build provides only {} bytes for an owned transmit buffer; the DCP request needs {}. Use the 64-bit OTserver Otter and 64-bit Win10Pcap package.",
             std::mem::size_of::<Packet>(),
             request.len()
         ));

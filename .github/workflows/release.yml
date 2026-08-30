@@ -1,0 +1,63 @@
+name: Release Otter
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: cargo build --locked --release
+      - run: tar czf otserver-otter-linux-x86_64.tar.gz -C target/release otserver-otter
+      - uses: actions/upload-artifact@v7
+        with:
+          name: otserver-otter-linux-x86_64
+          path: otserver-otter-linux-x86_64.tar.gz
+
+  build-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    container: rust:1.89-bookworm
+    steps:
+      - uses: actions/checkout@v6
+      - run: cargo build --locked --release --no-default-features
+      - run: ./target/release/otserver-otter --version
+      - run: tar czf otserver-otter-linux-aarch64.tar.gz -C target/release otserver-otter
+      - uses: actions/upload-artifact@v7
+        with:
+          name: otserver-otter-linux-aarch64
+          path: otserver-otter-linux-aarch64.tar.gz
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: cargo build --locked --release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: otserver-otter-windows-x86_64
+          path: target/release/otserver-otter.exe
+
+  release:
+    needs: [build-linux, build-linux-arm64, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+      - run: |
+          mv artifacts/otserver-otter-linux-x86_64/otserver-otter-linux-x86_64.tar.gz .
+          mv artifacts/otserver-otter-linux-aarch64/otserver-otter-linux-aarch64.tar.gz .
+          mv artifacts/otserver-otter-windows-x86_64/otserver-otter.exe .
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            otserver-otter-linux-x86_64.tar.gz
+            otserver-otter-linux-aarch64.tar.gz
+            otserver-otter.exe
+          generate_release_notes: true

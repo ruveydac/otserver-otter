@@ -307,7 +307,7 @@ mod windows_capture {
             &output.stderr
         });
         Err(format!(
-            "{context}: {}. Run OTserver Scanner as Administrator and ensure no other pktmon capture is active.",
+            "{context}: {}. Run OTserver Otter as Administrator and ensure no other pktmon capture is active.",
             detail.trim()
         ))
     }

@@ -79,10 +79,10 @@ impl ProbeSettings {
 
 fn build_client() -> Result<Client, String> {
     ClientBuilder::new()
-        .application_name("OTserver Scanner")
+        .application_name("OTserver Otter")
         .application_uri("urn:otserver:scanner")
         .product_uri("urn:otserver:scanner:product")
-        .session_name("OTserver Scanner")
+        .session_name("OTserver Otter")
         .session_retry_limit(0)
         .request_timeout(Duration::from_secs(3))
         .client()

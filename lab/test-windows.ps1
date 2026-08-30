@@ -10,7 +10,7 @@ $scannerDirectory = Split-Path -Parent $labDirectory
 $artifactDirectory = Join-Path $labDirectory 'artifacts'
 $composeFile = Join-Path $labDirectory 'compose.yml'
 $windowsComposeFile = Join-Path $labDirectory 'compose.windows.yml'
-$projectName = "otserver-scanner-lab-windows-$PID"
+$projectName = "otserver-otter-lab-windows-$PID"
 
 if (-not $DockerPath) {
     $dockerCommand = Get-Command docker.exe -ErrorAction SilentlyContinue
@@ -28,7 +28,7 @@ $dockerBin = Split-Path -Parent $DockerPath
 $env:PATH = "$dockerBin;$env:PATH"
 
 if (-not $ScannerPath) {
-    $ScannerPath = Join-Path $scannerDirectory 'target\release\otserver-scanner.exe'
+    $ScannerPath = Join-Path $scannerDirectory 'target\release\otserver-otter.exe'
 }
 if (-not (Test-Path -LiteralPath $ScannerPath -PathType Leaf)) {
     Write-Host 'Building the Windows scanner...'
@@ -66,7 +66,7 @@ $sourceMac = $labAdapter.MacAddress.Replace('-', ':').ToUpperInvariant()
 $interfaceGuid = $labAdapter.InterfaceGuid.ToString().Trim('{', '}').ToUpperInvariant()
 $interfaceId = "{$interfaceGuid}"
 $env:OTSERVER_LAB_BIND_IP = $labAddress
-$configPath = Join-Path (Split-Path -Parent $ScannerPath) 'otscanner.json'
+$configPath = Join-Path (Split-Path -Parent $ScannerPath) 'otter.json'
 Set-Content -LiteralPath $configPath -Value '{"snmp":{"version":"2c","community":"lab-public"}}' -Encoding utf8
 New-Item -ItemType Directory -Force -Path $artifactDirectory | Out-Null
 $runId = [Guid]::NewGuid().ToString('N').Substring(0, 8)
@@ -121,7 +121,7 @@ try {
     }
 
     @(
-        'OTserver Scanner Windows Docker protocol smoke test passed.'
+        'OTserver Otter Windows Docker protocol smoke test passed.'
         "Windows adapter: $($labAdapter.Name)"
         "Adapter address: $labAddress"
         "Adapter MAC: $sourceMac"
@@ -129,7 +129,7 @@ try {
         'The temporary scan represented one Docker host endpoint and was deleted; do not import it as asset data.'
         'PROFINET DCP and distinct device MAC correlation were not tested.'
     ) | Out-File -LiteralPath $summaryPath -Encoding utf8
-    Write-Host "OTserver Scanner Windows Docker protocol smoke test passed. Summary: $summaryPath"
+    Write-Host "OTserver Otter Windows Docker protocol smoke test passed. Summary: $summaryPath"
 } finally {
     try {
         & $DockerPath @composeArguments logs --no-color |

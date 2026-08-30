@@ -5,10 +5,10 @@ use crate::{
     nonempty_opt, prepare_scans, run_scan_batch, save_config_sync,
 };
 use eframe::egui;
-use otserver_scanner::contract::normalize_mac;
-use otserver_scanner::profinet::{self, CaptureInterface};
-use otserver_scanner::protocols::{OpcuaCredential, OpcuaCredentials};
-use otserver_scanner::snmp::{Credentials as SnmpCredentials, Settings as SnmpSettings};
+use otserver_otter::contract::normalize_mac;
+use otserver_otter::profinet::{self, CaptureInterface};
+use otserver_otter::protocols::{OpcuaCredential, OpcuaCredentials};
+use otserver_otter::snmp::{Credentials as SnmpCredentials, Settings as SnmpSettings};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -180,7 +180,7 @@ fn opcua_credential_detail(credential: &OpcuaCredential) -> String {
 }
 
 fn snmp_credential_detail(settings: &SnmpSettings) -> String {
-    let version = otserver_scanner::snmp::resolved_version(settings);
+    let version = otserver_otter::snmp::resolved_version(settings);
     if version.eq_ignore_ascii_case("auto") {
         return "Fallback: v3 if configured, then v2c, then v1".into();
     }
@@ -311,7 +311,7 @@ impl GuiApp {
             api_key: String::new(),
             ack_authorized: false,
             interfaces,
-            log_text: format!("{}\n", format_log_line("OTserver Scanner GUI ready.")),
+            log_text: format!("{}\n", format_log_line("OTserver Otter GUI ready.")),
             status: "Ready".to_string(),
             config_save_result: None,
             is_scanning: false,
@@ -402,7 +402,7 @@ impl GuiApp {
 
     fn load_snmp_buffers(&mut self) {
         let snmp = self.snmp_credentials[self.selected_snmp].clone();
-        self.snmp_version = otserver_scanner::snmp::resolved_version(&snmp).to_string();
+        self.snmp_version = otserver_otter::snmp::resolved_version(&snmp).to_string();
         self.snmp_community = snmp.community.unwrap_or_default();
         self.snmp_username = snmp.username.unwrap_or_default();
         self.snmp_context = snmp.context_name.unwrap_or_default();
@@ -529,9 +529,8 @@ impl GuiApp {
         match save_config_sync(&configs) {
             Ok(_) => {
                 self.configs = configs;
-                self.config_save_result = Some(Ok(format_log_line(
-                    "Configuration saved to otscanner.json.",
-                )));
+                self.config_save_result =
+                    Some(Ok(format_log_line("Configuration saved to otter.json.")));
                 true
             }
             Err(err) => {
@@ -550,9 +549,8 @@ impl GuiApp {
         if self.persist_configs(configs) {
             self.selected_config = selected;
             self.apply_selected_config();
-            self.config_save_result = Some(Ok(format_log_line(
-                "Configuration added to otscanner.json.",
-            )));
+            self.config_save_result =
+                Some(Ok(format_log_line("Configuration added to otter.json.")));
         }
     }
 
@@ -696,7 +694,7 @@ impl eframe::App for GuiApp {
 
         egui::TopBottomPanel::top("app-header").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("OTserver Scanner");
+                ui.heading("OTserver Otter");
                 ui.weak(concat!("Version ", env!("CARGO_PKG_VERSION")));
             });
             ui.label("Read-only OT asset discovery tool");
@@ -1063,7 +1061,7 @@ impl eframe::App for GuiApp {
                     ui.set_min_width(ui.available_width());
                     ui.heading("SNMP Settings");
                     ui.small(
-                        "Stored in otscanner.json. Credentials are tried top to bottom until one succeeds. Without settings, SNMPv2c with community \"public\" is used.",
+                        "Stored in otter.json. Credentials are tried top to bottom until one succeeds. Without settings, SNMPv2c with community \"public\" is used.",
                     );
                     let entries = self.snmp_all_settings();
                     egui::Grid::new("snmp-credentials")
@@ -1078,7 +1076,7 @@ impl eframe::App for GuiApp {
                                             "{}. {}",
                                             index + 1,
                                             snmp_version_label(
-                                                otserver_scanner::snmp::resolved_version(entry)
+                                                otserver_otter::snmp::resolved_version(entry)
                                             )
                                         ),
                                     )
@@ -1225,7 +1223,7 @@ impl eframe::App for GuiApp {
                     ui.set_min_width(ui.available_width());
                     ui.heading("OPC UA Credentials");
                     ui.small(
-                        "Stored in otscanner.json. Anonymous access is tried first; credentials are tried top to bottom only if it fails. Passwords travel unencrypted because the scanner uses SecurityPolicy None.",
+                        "Stored in otter.json. Anonymous access is tried first; credentials are tried top to bottom only if it fails. Passwords travel unencrypted because the scanner uses SecurityPolicy None.",
                     );
                     let entries = self.opcua_all_credentials();
                     let labels = self.opcua_credential_row_labels();
@@ -1326,12 +1324,12 @@ pub fn run_gui() -> Result<(), String> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 760.0])
             .with_min_inner_size([500.0, 500.0])
-            .with_title(concat!("OTserver Scanner v", env!("CARGO_PKG_VERSION"))),
+            .with_title(concat!("OTserver Otter v", env!("CARGO_PKG_VERSION"))),
         ..Default::default()
     };
 
     eframe::run_native(
-        "OTserver Scanner",
+        "OTserver Otter",
         options,
         Box::new(move |_cc| Ok(Box::new(GuiApp::new(configs)))),
     )
@@ -1339,7 +1337,7 @@ pub fn run_gui() -> Result<(), String> {
         let message = format!("GUI error: {err}");
         rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Error)
-            .set_title("OTserver Scanner")
+            .set_title("OTserver Otter")
             .set_description(&message)
             .show();
         message
@@ -1354,7 +1352,7 @@ mod tests {
         snmp_credential_detail, snmp_version_label, with_added_configuration,
     };
     use crate::{ScannerConfig, ScannerConfigs};
-    use otserver_scanner::profinet::CaptureInterface;
+    use otserver_otter::profinet::CaptureInterface;
 
     #[test]
     fn displays_only_ip_addresses_for_the_selected_interface() {

@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  otter:
+    name: Otter
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+      - run: cargo fmt -- --check
+      - run: cargo check --locked
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo install cargo-llvm-cov --locked
+      - run: >-
+          cargo llvm-cov --lib --fail-under-lines 90
+          --summary-only -- --test-threads=1
+
+  otter-windows:
+    name: Otter Windows
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build Otter for Windows
+        run: cargo build --locked --release
+      - name: Verify Windows version metadata
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
+          $expected = ($metadata.packages | Where-Object { $_.name -eq 'otserver-otter' }).version
+          $binary = (Resolve-Path 'target/release/otserver-otter.exe').Path
+          $versionInfo = (Get-Item $binary).VersionInfo
+          if ($versionInfo.FileVersion -ne $expected -or $versionInfo.ProductVersion -ne $expected) {
+            throw "Expected Windows file/product version $expected, got $($versionInfo.FileVersion)/$($versionInfo.ProductVersion)"
+          }
+          if ((& $binary --version) -notmatch [regex]::Escape($expected)) {
+            throw 'Otter CLI version does not match Cargo.toml'
+          }
+      - name: Run Windows tests
+        run: cargo test --locked
+
+  otter-lab:
+    name: Otter lab
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run Docker interoperability lab
+        run: ./lab/test.sh
+      - name: Upload lab artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: otter-lab-artifacts
+          path: lab/artifacts/
+          if-no-files-found: ignore

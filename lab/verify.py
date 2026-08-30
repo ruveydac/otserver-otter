@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run OTserver Scanner against the lab and assert its public JSON contract."""
+"""Run OTserver Otter against the lab and assert its public JSON contract."""
 
 import json
 import os
@@ -7,8 +7,8 @@ import subprocess
 import uuid
 from pathlib import Path
 
-SCANNER = "/usr/local/bin/otserver-scanner"
-SCANNER_CONFIG = Path("/usr/local/bin/otscanner.json")
+SCANNER = "/usr/local/bin/otserver-otter"
+SCANNER_CONFIG = Path("/usr/local/bin/otter.json")
 ARTIFACTS = Path("/artifacts")
 SCANNER_MAC = "02:00:00:00:00:02"
 DEVICES = {
@@ -222,7 +222,7 @@ def main() -> None:
     )
     for artifact in (full_path, v3_path):
         os.chmod(artifact, 0o666)
-    print("OTserver Scanner virtual lab passed.", flush=True)
+    print("OTserver Otter virtual lab passed.", flush=True)
 
 
 if __name__ == "__main__":

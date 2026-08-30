@@ -336,7 +336,7 @@ mod tests {
             format: "otserver-scan".into(),
             schema_version: 2,
             scanner: ScannerInfo {
-                name: "OTserver Scanner".into(),
+                name: "OTserver Otter".into(),
                 version: "0.2.0".into(),
                 npcap_version: None,
             },

@@ -3333,7 +3333,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "otserver-scanner"
+name = "otserver-otter"
 version = "0.2.1"
 dependencies = [
  "async-opcua",

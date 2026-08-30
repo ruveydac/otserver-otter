@@ -2,7 +2,7 @@
 set -u
 
 LAB_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PROJECT_NAME="otserver-scanner-lab-${CI_JOB_ID:-$$}"
+PROJECT_NAME="otserver-otter-lab-${CI_JOB_ID:-$$}"
 COMPOSE="docker compose -p $PROJECT_NAME -f $LAB_DIR/compose.yml"
 
 mkdir -p "$LAB_DIR/artifacts"

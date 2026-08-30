@@ -18,13 +18,13 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[cfg(windows)]
 pub fn install() -> Result<String, String> {
-    if otserver_scanner::profinet::win10pcap_available() {
+    if otserver_otter::profinet::win10pcap_available() {
         return Ok("Win10Pcap is already installed and its packet backend is available.".into());
     }
     // SAFETY: IsUserAnAdmin inspects the current process token and takes no arguments.
     if unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() } == 0 {
         return Err(
-            "Administrator elevation is required. Close OTserver Scanner, right-click the executable, select 'Run as administrator', and choose Install Win10Pcap again."
+            "Administrator elevation is required. Close OTserver Otter, right-click the executable, select 'Run as administrator', and choose Install Win10Pcap again."
                 .into(),
         );
     }
@@ -51,7 +51,7 @@ fn install_from(directory: &Path) -> Result<String, String> {
     let installer = directory.join("Win10Pcap-v10.2-5002.msi");
     std::fs::write(&installer, INSTALLER)
         .map_err(|error| format!("Could not extract the Win10Pcap installer: {error}"))?;
-    let msiexec = otserver_scanner::profinet::win10pcap_system_directory()?.join("msiexec.exe");
+    let msiexec = otserver_otter::profinet::win10pcap_system_directory()?.join("msiexec.exe");
     let mut child = Command::new(msiexec)
         .args(["/i"])
         .arg(&installer)
@@ -88,12 +88,12 @@ fn install_from(directory: &Path) -> Result<String, String> {
     let code = status.code().unwrap_or(-1);
     if code != 0 && code != 3010 {
         return Err(format!(
-            "Win10Pcap installation failed with Windows Installer exit code {code}. Run OTserver Scanner as Administrator and check Event Viewer > Windows Logs > Application for MsiInstaller details."
+            "Win10Pcap installation failed with Windows Installer exit code {code}. Run OTserver Otter as Administrator and check Event Viewer > Windows Logs > Application for MsiInstaller details."
         ));
     }
 
     let detected = (0..40).any(|_| {
-        if otserver_scanner::profinet::win10pcap_available() {
+        if otserver_otter::profinet::win10pcap_available() {
             true
         } else {
             std::thread::sleep(Duration::from_millis(250));
