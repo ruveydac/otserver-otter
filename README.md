@@ -9,7 +9,7 @@ Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Fox · OPC 
 [![Website](https://img.shields.io/badge/otserver.org-111111?logo=firefoxbrowser&logoColor=white)](https://otserver.org)
 [![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/Windows_%7C_Linux-0078D6?logo=windows&logoColor=white)](#quick-start)
-[![OTserver](https://img.shields.io/badge/OTserver-Next.js-000000?logo=nextdotjs&logoColor=white)](https://github.com/ruveydac/OTserver)
+[![OTserver](https://img.shields.io/badge/OTserver-Next.js-000000?logo=javascript&logoColor=white)](https://github.com/ruveydac/OTserver)
 [![AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENCE.md)
 
 [Quick start](#quick-start) · [Protocols](#protocols-and-safety) · [Configuration](#configuration-and-direct-import) · [Lab](#virtual-ot-lab) · [Development](#development)
