@@ -2,7 +2,7 @@
 
 # OTserver Otter
 
-### Read-only OT discovery CLI and GUI for the [OTserver inventory](https://github.com/ruveydac/OTserver)
+### Read-only OT discovery for the [OTserver inventory](https://github.com/ruveydac/OTserver)
 
 Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Fox · OPC UA · SNMP · LLDP
 
