@@ -1,5 +1,3 @@
-#[cfg(windows)]
-use crate::win10pcap_install;
 use crate::{
     BatchResult, LogOutput, ScanArgs, ScannerConfig, ScannerConfigs, format_log_line, load_config,
     nonempty_opt, prepare_scans, run_scan_batch, save_config_sync,
@@ -261,19 +259,17 @@ pub struct GuiApp {
     is_scanning: bool,
     cancellation: Option<Arc<AtomicBool>>,
     log_rx: Option<Receiver<ScanMessage>>,
-    install_rx: Option<Receiver<Result<String, String>>>,
-    is_installing: bool,
     #[cfg(windows)]
-    win10pcap_available: bool,
+    npcap_available: bool,
     #[cfg(windows)]
-    win10pcap_interface_available: bool,
+    npcap_interface_available: bool,
 }
 
 impl GuiApp {
     pub fn new(configs: ScannerConfigs) -> Self {
         let interfaces = profinet::interfaces().unwrap_or_default();
         #[cfg(windows)]
-        let win10pcap_available = profinet::win10pcap_available();
+        let npcap_available = profinet::npcap_available();
         let mut app = Self {
             configs,
             selected_config: 0,
@@ -317,12 +313,10 @@ impl GuiApp {
             is_scanning: false,
             cancellation: None,
             log_rx: None,
-            install_rx: None,
-            is_installing: false,
             #[cfg(windows)]
-            win10pcap_available,
+            npcap_available,
             #[cfg(windows)]
-            win10pcap_interface_available: false,
+            npcap_interface_available: false,
         };
         app.apply_selected_config();
         app
@@ -397,7 +391,7 @@ impl GuiApp {
         self.site = config.site.unwrap_or_default();
         self.api_key = config.api_key.unwrap_or_default();
         #[cfg(windows)]
-        self.refresh_win10pcap();
+        self.refresh_npcap();
     }
 
     fn load_snmp_buffers(&mut self) {
@@ -560,10 +554,10 @@ impl GuiApp {
     }
 
     #[cfg(windows)]
-    fn refresh_win10pcap(&mut self) {
-        self.win10pcap_available = profinet::win10pcap_available();
-        self.win10pcap_interface_available =
-            self.win10pcap_available && profinet::win10pcap_interface_available(&self.interface);
+    fn refresh_npcap(&mut self) {
+        self.npcap_available = profinet::npcap_available();
+        self.npcap_interface_available =
+            self.npcap_available && profinet::npcap_interface_available(&self.interface);
     }
 
     fn start_scan(&mut self, run_all: bool) {
@@ -669,26 +663,7 @@ impl eframe::App for GuiApp {
             }
         }
 
-        let install_result = self.install_rx.as_ref().and_then(|rx| rx.try_recv().ok());
-        if let Some(result) = install_result {
-            self.install_rx = None;
-            self.is_installing = false;
-            match result {
-                Ok(message) => {
-                    self.append_log(&message);
-                    self.interfaces = profinet::interfaces().unwrap_or_default();
-                    #[cfg(windows)]
-                    self.refresh_win10pcap();
-                    self.status = "Win10Pcap installation completed.".into();
-                }
-                Err(error) => {
-                    self.append_log(&format!("Win10Pcap installation error: {error}"));
-                    self.status = "Win10Pcap installation failed.".into();
-                }
-            }
-        }
-
-        if self.is_scanning || self.is_installing {
+        if self.is_scanning {
             ctx.request_repaint();
         }
 
@@ -701,7 +676,7 @@ impl eframe::App for GuiApp {
         });
 
         egui::TopBottomPanel::bottom("app-controls").show(ctx, |ui| {
-            let controls_enabled = !self.is_scanning && !self.is_installing;
+            let controls_enabled = !self.is_scanning;
             ui.horizontal_wrapped(|ui| {
                 ui.add_enabled(
                     controls_enabled,
@@ -807,7 +782,7 @@ impl eframe::App for GuiApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.is_scanning || self.is_installing {
+            if self.is_scanning {
                 ui.disable();
             }
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -897,14 +872,14 @@ impl eframe::App for GuiApp {
                                         self.source_mac = mac;
                                     }
                                     #[cfg(windows)]
-                                    self.refresh_win10pcap();
+                                    self.refresh_npcap();
                                     self.save_config();
                                 }
                             });
                         if ui.button("Refresh").clicked() {
                             self.interfaces = profinet::interfaces().unwrap_or_default();
                             #[cfg(windows)]
-                            self.refresh_win10pcap();
+                            self.refresh_npcap();
                         }
                     });
 
@@ -924,7 +899,7 @@ impl eframe::App for GuiApp {
                         egui::TextEdit::singleline(&mut self.interface),
                     ) {
                         #[cfg(windows)]
-                        self.refresh_win10pcap();
+                        self.refresh_npcap();
                         self.save_config();
                     }
 
@@ -985,41 +960,23 @@ impl eframe::App for GuiApp {
                     }
 
                     #[cfg(windows)]
-                    if self.profinet_enabled && !self.win10pcap_available {
+                    if self.profinet_enabled && !self.npcap_available {
                         ui.separator();
                         ui.label(
-                            "Win10Pcap is not available. Windows will use passive pktmon PROFINET capture. Active DCP requires the GPLv2 Win10Pcap packet driver. Installation is explicit and never occurs during a scan.",
+                            "Npcap is not available. Windows will use passive pktmon PROFINET capture. Install Npcap explicitly to enable active DCP; driver installation never occurs during a scan.",
                         );
                         ui.hyperlink_to(
-                            "Win10Pcap project and GPLv2 source",
-                            "https://www.win10pcap.org/",
+                            "Download Npcap",
+                            "https://npcap.com/#download",
                         );
-                        if ui
-                            .add_enabled(
-                                !self.is_installing && !self.is_scanning,
-                                egui::Button::new("Install Win10Pcap (Administrator)"),
-                            )
-                            .clicked()
-                        {
-                            self.is_installing = true;
-                            self.status = "Installing Win10Pcap...".into();
-                            self.append_log(
-                                "Installing the bundled, signed Win10Pcap GPLv2 package...",
-                            );
-                            let (tx, rx) = mpsc::channel();
-                            self.install_rx = Some(rx);
-                            std::thread::spawn(move || {
-                                let _ = tx.send(win10pcap_install::install());
-                            });
-                        }
-                    } else if self.profinet_enabled && self.win10pcap_interface_available {
+                    } else if self.profinet_enabled && self.npcap_interface_available {
                         ui.label(
-                            "Active Windows PROFINET DCP is ready through Win10Pcap on the selected physical interface.",
+                            "Active Windows PROFINET DCP is ready through Npcap on the selected physical interface.",
                         );
                     } else if self.profinet_enabled {
                         ui.colored_label(
                             egui::Color32::YELLOW,
-                            "Win10Pcap is installed, but the selected interface is not usable for direct DCP. Remove any obsolete Windows Network Bridge, refresh, select the physical Ethernet adapter, and verify its Win10Pcap binding.",
+                            "Npcap is installed, but the selected interface is not usable for direct DCP. Remove any obsolete Windows Network Bridge, refresh, select the physical Ethernet adapter, and verify its Npcap binding.",
                         );
                     }
                 });
