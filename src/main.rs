@@ -1,7 +1,5 @@
 #[cfg(feature = "gui")]
 pub mod gui;
-pub mod win10pcap_install;
-
 use clap::{ArgAction, Args, Parser, Subcommand};
 use otserver_otter::contract::{
     Device, InterfaceRef, ScanExport, ScanInfo, ScannerInfo, Source, merge_devices, validate,
@@ -45,7 +43,6 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     Doctor,
-    InstallWin10pcap,
     Interfaces {
         #[arg(long)]
         json: bool,
@@ -315,10 +312,6 @@ async fn main() {
 async fn run() -> Result<(), String> {
     match Cli::parse().command {
         Some(Commands::Doctor) => doctor(),
-        Some(Commands::InstallWin10pcap) => {
-            println!("{}", win10pcap_install::install()?);
-            Ok(())
-        }
         Some(Commands::Interfaces { json }) => {
             let devices = profinet::interfaces()?;
             if json {
@@ -628,8 +621,8 @@ fn doctor() -> Result<(), String> {
     println!("Native ARP and OT protocol modules: available");
     #[cfg(windows)]
     println!(
-        "Win10Pcap active PROFINET backend: {}",
-        if profinet::win10pcap_available() {
+        "Npcap active PROFINET backend: {}",
+        if profinet::npcap_available() {
             "available"
         } else {
             "not available (pktmon passive fallback only)"
@@ -685,14 +678,14 @@ pub async fn scan(
 
     if options.protocols.profinet && !cancelled.load(Ordering::Relaxed) {
         #[cfg(windows)]
-        if profinet::win10pcap_available() {
+        if profinet::npcap_available() {
             logger.log(
-                "Using the installed Win10Pcap packet driver for active PROFINET DCP; the selected adapter will be bound directly by GUID."
+                "Using the installed Npcap packet driver for active PROFINET DCP; the selected adapter will be bound directly by GUID."
                     .into(),
             );
         } else {
             logger.log(
-                "Win10Pcap is not available. Windows will use passive pktmon PROFINET capture. Run the explicit Win10Pcap installer as Administrator to enable active DCP Identify. Driver installation is never a scan side effect."
+                "Npcap is not available. Windows will use passive pktmon PROFINET capture. Install Npcap explicitly from https://npcap.com/ to enable active DCP Identify. Driver installation is never a scan side effect."
                     .into(),
             );
         }

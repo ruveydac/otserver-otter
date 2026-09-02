@@ -30,10 +30,10 @@ The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
 ## Platform Rules
 
 - Linux raw Ethernet uses `AF_PACKET` and requires root or `CAP_NET_RAW`.
-- Windows ARP uses Win32 IP Helper. Active DCP dynamically loads installed Win10Pcap `Packet.dll`
-  and binds the selected physical adapter by GUID. Driver installation must remain explicit and
-  must never be a scan side effect.
-- If Win10Pcap is unavailable, passive Windows discovery uses Microsoft pktmon.
+- Windows ARP uses Win32 IP Helper. Active DCP dynamically loads installed Npcap `Packet.dll` from
+  its native System32 subdirectory and binds the selected physical adapter by GUID. Driver
+  installation must remain explicit and must never be a scan side effect.
+- If Npcap is unavailable, passive Windows discovery uses Microsoft pktmon.
 - Preserve the current OPC UA limits: SecurityPolicy None, no continuation points, batches of at
   most 64 reads, no certificate authentication, and default ports 4840, 4841, and 48400.
 

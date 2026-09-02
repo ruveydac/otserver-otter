@@ -25,7 +25,7 @@ optional SNMP/LLDP. It collects structured evidenceâ€”not just a flat host listâ
 observations, interfaces, ports, and topology through the schema-version-2 `otserver-scan` contract
 understood directly by [OTserver](https://github.com/ruveydac/OTserver).
 
-Windows uses native IP Helper for active ARP, Win10Pcap for active PROFINET DCP, and Microsoft pktmon
+Windows uses native IP Helper for active ARP, Npcap for active PROFINET DCP, and Microsoft pktmon
 as a passive fallback. Linux uses native `AF_PACKET` raw sockets. No TAP adapter or Windows Network
 Bridge is used or modified.
 
@@ -94,20 +94,19 @@ cargo build --release --target x86_64-pc-windows-msvc
   --ack-authorized
 ```
 
-Windows ARP discovery needs no additional driver. Active PROFINET discovery requires Win10Pcap
-(GPLv2) and Administrator rights; install the bundled package explicitly from the GUI or by running
-`otserver-otter install-win10pcap` in an elevated terminal. If Win10Pcap is unavailable, the scanner
-uses built-in pktmon as a passive fallback. Pktmon requires Administrator rights and cannot transmit
-DCP Identify frames.
+Windows ARP discovery needs no additional driver. Active PROFINET discovery requires a separately
+installed [Npcap](https://npcap.com/#download). If Npcap is unavailable, the scanner uses built-in
+pktmon as a passive fallback. Pktmon requires Administrator rights and cannot transmit DCP Identify
+frames.
 
-The 64-bit Windows release embeds the unmodified, signed Win10Pcap 10.2.5002 MSI under GPLv2 and can
-install it only when explicitly requested. Driver installation does not disrupt networking. The
-scanner dynamically loads the installed `Packet.dll` from the Windows system directory, matches the
-selected physical interface by GUID, transmits DCP Identify, and captures only PROFINET Ethernet
-frames. The corresponding Win10Pcap project information is at <https://www.win10pcap.org/>.
+Npcap installation is always an explicit user action and never occurs during a scan. The scanner
+loads `%SystemRoot%\System32\Npcap\Packet.dll` directly, matches the selected physical interface by
+GUID, transmits DCP Identify, and captures only PROFINET Ethernet frames. Npcap's free license permits
+up to five installations but not redistribution; larger or bundled deployments require an appropriate
+Npcap OEM license.
 
 Active DCP verifies that the configured source MAC belongs to the selected physical interface before
-opening the selected Win10Pcap adapter. Identify-All is sent once with an engineering-tool response
+opening the selected Npcap adapter. Identify-All is sent once with an engineering-tool response
 delay factor so device replies are spread over the capture window instead of creating a synchronized
 response burst.
 

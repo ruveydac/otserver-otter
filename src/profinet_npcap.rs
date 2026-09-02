@@ -1,8 +1,7 @@
-//! Active Windows PROFINET DCP through an independently installed Win10Pcap driver.
+//! Active Windows PROFINET DCP through an independently installed Npcap driver.
 //!
-//! Win10Pcap's own `Packet.dll` API is used directly. Its bundled legacy `wpcap.dll` emits allocator
-//! errors on modern 64-bit Windows when transmitting through `pcap_sendpacket`, while Packet.dll is
-//! the maintained front end for the Win10Pcap NDIS 6 driver and exposes the same raw packet path.
+//! Npcap's `Packet.dll` API is loaded directly from its native System32 subdirectory so an obsolete
+//! WinPcap-compatible DLL cannot take precedence.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_uchar, c_void};
 use std::os::windows::ffi::OsStrExt;
@@ -20,7 +19,7 @@ const MAX_CAPTURED_FRAMES: usize = 4_096;
 const BPF_HEADER_MINIMUM: usize = 18;
 const PACKET_ALIGNMENT: usize = 4;
 
-// Public bpf_insn/bpf_program layout from Win10Pcap's GPLv2 Packet32.h.
+// Public bpf_insn/bpf_program layout from the Npcap SDK's Packet32.h.
 #[repr(C)]
 struct BpfInsn {
     code: u16,
@@ -87,7 +86,7 @@ struct Overlapped {
     event: *mut c_void,
 }
 
-/// Public PACKET structure from Win10Pcap's GPLv2 Packet32.h.
+/// Public PACKET structure from the Npcap SDK's Packet32.h.
 #[repr(C)]
 struct Packet {
     event: *mut c_void,
@@ -99,7 +98,7 @@ struct Packet {
 }
 
 type GetAdapterNames = unsafe extern "C" fn(*mut c_char, *mut u32) -> c_uchar;
-type OpenAdapter = unsafe extern "C" fn(*mut c_char) -> *mut Adapter;
+type OpenAdapter = unsafe extern "C" fn(*const c_char) -> *mut Adapter;
 type CloseAdapter = unsafe extern "C" fn(*mut Adapter);
 type AllocatePacket = unsafe extern "C" fn() -> *mut Packet;
 type InitPacket = unsafe extern "C" fn(*mut Packet, *mut c_void, u32);
@@ -127,10 +126,10 @@ struct Api {
 
 impl Api {
     fn load() -> Result<Self, String> {
-        let dll = system_directory()?.join("Packet.dll");
+        let dll = system_directory()?.join("Npcap").join("Packet.dll");
         if !dll.is_file() {
             return Err(format!(
-                "Win10Pcap is not installed: {} is missing.",
+                "Npcap is not installed: {} is missing. Download and install Npcap from https://npcap.com/.",
                 dll.display()
             ));
         }
@@ -150,14 +149,14 @@ impl Api {
         };
         if module.is_null() {
             return Err(format!(
-                "Could not load the installed Win10Pcap Packet.dll: {}",
+                "Could not load the installed Npcap Packet.dll: {}",
                 std::io::Error::last_os_error()
             ));
         }
         let result = (|| {
             Ok(Self {
                 module,
-                // SAFETY: each symbol has the public Win10Pcap Packet32.h ABI declared above.
+                // SAFETY: each symbol has the public Npcap Packet32.h ABI declared above.
                 get_adapter_names: unsafe { symbol(module, b"PacketGetAdapterNames\0")? },
                 // SAFETY: see above.
                 open_adapter: unsafe { symbol(module, b"PacketOpenAdapter\0")? },
@@ -192,22 +191,21 @@ impl Api {
 
     fn device_names(&self) -> Result<Vec<String>, String> {
         let mut size = 0_u32;
+        // Npcap returns FALSE with ERROR_INSUFFICIENT_BUFFER for this successful size query.
         // SAFETY: a null first buffer is the documented size query for PacketGetAdapterNames.
-        if unsafe { (self.get_adapter_names)(null_mut(), &mut size) } == 0 || size == 0 {
-            return Err(
-                "Win10Pcap could not enumerate adapters. Verify that the Win10Pcap service is running."
-                    .into(),
-            );
-        }
-        let mut buffer = vec![0_i8; size as usize];
+        let probe_result = unsafe { (self.get_adapter_names)(null_mut(), &mut size) };
+        let mut buffer = vec![0_i8; adapter_buffer_size(probe_result, size)?];
         // SAFETY: buffer is writable for the in/out size supplied to PacketGetAdapterNames.
         if unsafe { (self.get_adapter_names)(buffer.as_mut_ptr(), &mut size) } == 0 {
-            return Err("Win10Pcap failed while reading its adapter list.".into());
+            return Err("Npcap failed while reading its adapter list.".into());
         }
-        let names = parse_multistring(&buffer)?;
-        if names.is_empty() || names.iter().any(|name| !is_win10pcap_name(name)) {
+        let names = parse_multistring(&buffer)?
+            .into_iter()
+            .filter(|name| is_npcap_name(name))
+            .collect::<Vec<_>>();
+        if names.is_empty() {
             return Err(
-                "The installed Packet.dll is not the Win10Pcap backend expected by OTserver Otter. Install the bundled Win10Pcap package so its WTCAP driver owns Packet.dll."
+                "Npcap did not report any physical NPF adapters. Verify that the Npcap service is running and bound to the selected Ethernet adapter."
                     .into(),
             );
         }
@@ -259,13 +257,12 @@ pub fn interface_available(interface: &str) -> bool {
 pub fn capture(interface: &str, request: &[u8], wait: Duration) -> Result<Vec<Vec<u8>>, String> {
     let api = Api::load()?;
     let device = CString::new(find_device(&api, interface)?)
-        .map_err(|_| "Win10Pcap returned an invalid adapter name.".to_string())?;
-    // PacketOpenAdapter has a historical mutable-char signature but does not modify the name.
+        .map_err(|_| "Npcap returned an invalid adapter name.".to_string())?;
     // SAFETY: device is NUL-terminated and remains alive throughout the call.
-    let adapter = unsafe { (api.open_adapter)(device.as_ptr().cast_mut()) };
+    let adapter = unsafe { (api.open_adapter)(device.as_ptr()) };
     if adapter.is_null() {
         return Err(format!(
-            "Win10Pcap could not open interface {interface}. Run OTserver Otter as Administrator and verify that the Win10Pcap binding is enabled on that adapter."
+            "Npcap could not open interface {interface}. Run OTserver Otter as Administrator and verify that Npcap is bound to that adapter."
         ));
     }
     let adapter = AdapterHandle {
@@ -277,7 +274,7 @@ pub fn capture(interface: &str, request: &[u8], wait: Duration) -> Result<Vec<Ve
         || unsafe { (api.set_min_to_copy)(adapter.handle, 1) } == 0
     {
         return Err(format!(
-            "Win10Pcap could not configure capture on interface {interface}."
+            "Npcap could not configure capture on interface {interface}."
         ));
     }
     // Best effort: restrict the driver to PROFINET frames so a busy segment does not
@@ -296,37 +293,24 @@ pub fn capture(interface: &str, request: &[u8], wait: Duration) -> Result<Vec<Ve
     let tx_packet = allocate_packet(&api)?;
     let rx_packet = allocate_packet(&api)?;
     let request_length = u32::try_from(request.len()).map_err(|_| "DCP request is too large.")?;
-    if request.len() > std::mem::size_of::<Packet>() {
-        return Err(format!(
-            "This Win10Pcap Packet.dll build provides only {} bytes for an owned transmit buffer; the DCP request needs {}. Use the 64-bit OTserver Otter and 64-bit Win10Pcap package.",
-            std::mem::size_of::<Packet>(),
-            request.len()
-        ));
-    }
     let mut receive_buffer = vec![0_u8; RECEIVE_BUFFER_SIZE];
     let receive_length = u32::try_from(receive_buffer.len()).expect("bounded receive buffer");
 
     // Send one Identify-All request. Its standards-compliant response delay factor spreads
     // replies across the capture window; repeating it would multiply traffic on a busy OT cell.
-    // Win10Pcap 10.2's PacketSendPacket consumes the supplied data pointer through SeFree, so use
-    // a spare allocation from Packet.dll rather than crossing allocators with a Rust buffer.
-    // SAFETY: PacketAllocatePacket returns at least size_of::<Packet>() owned bytes.
-    let send_buffer = unsafe { (api.allocate_packet)() };
-    if send_buffer.is_null() {
-        return Err("Win10Pcap could not allocate the DCP transmit buffer.".into());
-    }
-    // SAFETY: the size guard above proves the allocation can hold request.len() bytes and the
-    // source and destination do not overlap.
+    // SAFETY: Npcap does not mutate or retain the caller-owned buffer, which outlives the
+    // synchronous PacketSendPacket call.
     unsafe {
-        std::ptr::copy_nonoverlapping(request.as_ptr(), send_buffer.cast::<u8>(), request.len())
+        (api.init_packet)(
+            tx_packet.packet,
+            request.as_ptr().cast_mut().cast(),
+            request_length,
+        )
     };
-    // SAFETY: tx_packet is a descriptor owned by Packet.dll and send_buffer is readable for
-    // request_length. PacketSendPacket consumes send_buffer through SeFree.
-    unsafe { (api.init_packet)(tx_packet.packet, send_buffer.cast(), request_length) };
     // SAFETY: adapter and packet remain valid; synchronous send completes before returning.
     if unsafe { (api.send_packet)(adapter.handle, tx_packet.packet, 1) } == 0 {
         return Err(format!(
-            "Win10Pcap could not transmit DCP Identify on {interface}."
+            "Npcap could not transmit DCP Identify on {interface}."
         ));
     }
 
@@ -343,16 +327,16 @@ pub fn capture(interface: &str, request: &[u8], wait: Duration) -> Result<Vec<Ve
         };
         // SAFETY: adapter and packet remain valid; synchronous receive respects the 100 ms timeout.
         if unsafe { (api.receive_packet)(adapter.handle, rx_packet.packet, 1) } == 0 {
-            return Err(format!("Win10Pcap capture failed on {interface}."));
+            return Err(format!("Npcap capture failed on {interface}."));
         }
         // SAFETY: rx_packet points to the public PACKET layout initialized by Packet.dll.
         let valid = unsafe { (*rx_packet.packet).bytes_received as usize };
         if valid > receive_buffer.len() {
-            return Err("Win10Pcap returned an oversized capture buffer.".into());
+            return Err("Npcap returned an oversized capture buffer.".into());
         }
         parse_bpf_records(&receive_buffer[..valid], &mut frames)?;
         if frames.len() > MAX_CAPTURED_FRAMES {
-            return Err("Win10Pcap capture exceeded the bounded packet limit.".into());
+            return Err("Npcap capture exceeded the bounded packet limit.".into());
         }
     }
     Ok(frames)
@@ -362,7 +346,7 @@ fn allocate_packet(api: &Api) -> Result<PacketHandle, String> {
     // SAFETY: PacketAllocatePacket takes no arguments and returns an owned Packet.dll allocation.
     let packet = unsafe { (api.allocate_packet)() };
     if packet.is_null() {
-        return Err("Win10Pcap could not allocate a packet descriptor.".into());
+        return Err("Npcap could not allocate a packet descriptor.".into());
     }
     Ok(PacketHandle {
         packet,
@@ -379,7 +363,7 @@ fn find_device(api: &Api, interface: &str) -> Result<String, String> {
         .cloned()
         .ok_or_else(|| {
             format!(
-                "Win10Pcap is installed, but interface {interface} is not bound to it. Disable any obsolete Windows Network Bridge and enable the Win10Pcap binding on the selected physical Ethernet adapter. Driver-visible adapters: {}",
+                "Npcap is installed, but interface {interface} is not bound to it. Disable any obsolete Windows Network Bridge and verify the Npcap binding on the selected physical Ethernet adapter. Driver-visible adapters: {}",
                 if names.is_empty() {
                     "none".into()
                 } else {
@@ -398,11 +382,14 @@ fn canonical_adapter_name(value: &str) -> String {
         .to_ascii_uppercase()
 }
 
-fn is_win10pcap_name(value: &str) -> bool {
+fn is_npcap_name(value: &str) -> bool {
     let trimmed = value.trim();
+    let Some(guid) = trimmed.strip_prefix(r"\Device\NPF_") else {
+        return false;
+    };
     let canonical = canonical_adapter_name(trimmed);
-    trimmed.starts_with('{')
-        && trimmed.ends_with('}')
+    guid.starts_with('{')
+        && guid.ends_with('}')
         && canonical.len() == 36
         && [8, 13, 18, 23]
             .into_iter()
@@ -413,12 +400,21 @@ fn is_win10pcap_name(value: &str) -> bool {
             .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
 }
 
+fn adapter_buffer_size(_: c_uchar, size: u32) -> Result<usize, String> {
+    if size == 0 {
+        return Err(
+            "Npcap could not enumerate adapters. Verify that the Npcap service is running.".into(),
+        );
+    }
+    Ok(size as usize)
+}
+
 fn parse_multistring(buffer: &[i8]) -> Result<Vec<String>, String> {
     let mut names = Vec::new();
     let mut offset = 0;
     while offset < buffer.len() && buffer[offset] != 0 {
         let Some(relative_end) = buffer[offset..].iter().position(|byte| *byte == 0) else {
-            return Err("Win10Pcap returned a malformed adapter list.".into());
+            return Err("Npcap returned a malformed adapter list.".into());
         };
         // SAFETY: relative_end locates a terminating NUL within buffer.
         names.push(
@@ -435,7 +431,7 @@ fn parse_bpf_records(buffer: &[u8], frames: &mut Vec<Vec<u8>>) -> Result<(), Str
     let mut offset = 0;
     while offset < buffer.len() {
         if buffer.len() - offset < BPF_HEADER_MINIMUM {
-            return Err("Win10Pcap returned a truncated BPF packet header.".into());
+            return Err("Npcap returned a truncated BPF packet header.".into());
         }
         let caplen = u32::from_ne_bytes(
             buffer[offset + 8..offset + 12]
@@ -453,22 +449,22 @@ fn parse_bpf_records(buffer: &[u8], frames: &mut Vec<Vec<u8>>) -> Result<(), Str
                 .expect("two-byte BPF header length"),
         ) as usize;
         if header_length < BPF_HEADER_MINIMUM || caplen > datalen {
-            return Err("Win10Pcap returned an invalid BPF packet header.".into());
+            return Err("Npcap returned an invalid BPF packet header.".into());
         }
         let data_start = offset
             .checked_add(header_length)
-            .ok_or_else(|| "Win10Pcap BPF packet offset overflowed.".to_string())?;
+            .ok_or_else(|| "Npcap BPF packet offset overflowed.".to_string())?;
         let data_end = data_start
             .checked_add(caplen)
             .filter(|end| *end <= buffer.len())
-            .ok_or_else(|| "Win10Pcap returned a truncated BPF packet.".to_string())?;
+            .ok_or_else(|| "Npcap returned a truncated BPF packet.".to_string())?;
         let frame = &buffer[data_start..data_end];
         if frame.len() >= 14 && frame[12..14] == [0x88, 0x92] {
             frames.push(frame.to_vec());
         }
         let record_length = align_packet(header_length + caplen);
         if record_length == 0 || offset + record_length > buffer.len() {
-            return Err("Win10Pcap returned an invalid aligned BPF packet size.".into());
+            return Err("Npcap returned an invalid aligned BPF packet size.".into());
         }
         offset += record_length;
     }
@@ -479,7 +475,7 @@ fn align_packet(length: usize) -> usize {
     (length + PACKET_ALIGNMENT - 1) & !(PACKET_ALIGNMENT - 1)
 }
 
-pub(crate) fn system_directory() -> Result<PathBuf, String> {
+fn system_directory() -> Result<PathBuf, String> {
     let mut buffer = [0_u16; 32_768];
     // SAFETY: buffer is writable for the supplied element count.
     let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
@@ -507,10 +503,10 @@ fn symbol_name(name: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_adapter_name, is_win10pcap_name, parse_bpf_records};
+    use super::{adapter_buffer_size, canonical_adapter_name, is_npcap_name, parse_bpf_records};
 
     #[test]
-    fn canonicalizes_winpcap_and_windows_adapter_names() {
+    fn canonicalizes_npf_and_windows_adapter_names() {
         assert_eq!(
             canonical_adapter_name(r"\Device\NPF_{8d11417d-4d16-4d5b-9917-c30cf60df212}"),
             "8D11417D-4D16-4D5B-9917-C30CF60DF212"
@@ -519,10 +515,15 @@ mod tests {
             canonical_adapter_name("{8D11417D-4D16-4D5B-9917-C30CF60DF212}"),
             "8D11417D-4D16-4D5B-9917-C30CF60DF212"
         );
-        assert!(is_win10pcap_name("{8D11417D-4D16-4D5B-9917-C30CF60DF212}"));
-        assert!(!is_win10pcap_name(
+        assert!(is_npcap_name(
             r"\Device\NPF_{8D11417D-4D16-4D5B-9917-C30CF60DF212}"
         ));
+        assert!(!is_npcap_name("{8D11417D-4D16-4D5B-9917-C30CF60DF212}"));
+    }
+
+    #[test]
+    fn accepts_npcap_failed_adapter_size_probe() {
+        assert_eq!(adapter_buffer_size(0, 4096).unwrap(), 4096);
     }
 
     #[test]

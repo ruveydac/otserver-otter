@@ -4,8 +4,8 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::time::Duration;
 #[cfg(windows)]
-#[path = "profinet_win10pcap.rs"]
-mod win10pcap;
+#[path = "profinet_npcap.rs"]
+mod npcap;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
 #[cfg(any(windows, target_os = "linux", test))]
@@ -184,10 +184,10 @@ pub fn scan(interface: &str, source_mac: &str, wait: Duration) -> Result<Vec<Dev
     let source = mac_bytes(source_mac)
         .ok_or_else(|| "A valid source MAC address is required.".to_string())?;
     let xid = new_xid();
-    if win10pcap::available() {
+    if npcap::available() {
         validate_source_mac(&selected, source_mac)?;
         let request = identify_request(source, xid);
-        let frames = win10pcap::capture(&selected.name, &request, wait)?;
+        let frames = npcap::capture(&selected.name, &request, wait)?;
         return Ok(parse_active_frames(frames, source, xid));
     }
     let mut devices = BTreeMap::new();
@@ -798,19 +798,14 @@ fn new_xid() -> u32 {
 }
 
 #[cfg(windows)]
-pub fn win10pcap_available() -> bool {
-    win10pcap::available()
+pub fn npcap_available() -> bool {
+    npcap::available()
 }
 
 #[cfg(windows)]
-pub fn win10pcap_interface_available(interface: &str) -> bool {
+pub fn npcap_interface_available(interface: &str) -> bool {
     windows_scan_interface(interface)
-        .is_ok_and(|selected| win10pcap::interface_available(&selected.name))
-}
-
-#[cfg(windows)]
-pub fn win10pcap_system_directory() -> Result<std::path::PathBuf, String> {
-    win10pcap::system_directory()
+        .is_ok_and(|selected| npcap::interface_available(&selected.name))
 }
 
 #[cfg(windows)]
@@ -824,7 +819,7 @@ fn windows_scan_interface(interface: &str) -> Result<CaptureInterface, String> {
         .ok_or_else(|| format!("Windows network interface {interface} was not found."))?;
     if is_obsolete_bridge(&selected) {
         return Err(
-            "The selected interface is the obsolete Windows Network Bridge left by the previous TAP backend. Remove that bridge, refresh interfaces, and select the physical Ethernet adapter; Win10Pcap does not require a bridge."
+            "The selected interface is the obsolete Windows Network Bridge left by the previous TAP backend. Remove that bridge, refresh interfaces, and select the physical Ethernet adapter; Npcap does not require a bridge."
                 .into(),
         );
     }
