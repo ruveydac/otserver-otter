@@ -21,7 +21,7 @@ Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Fox · OPC 
 OTserver Otter is a cross-platform Rust CLI (with an optional GUI) built specifically for identifying
 industrial devices through fixed, read-only protocol requests. It discovers IPv4/MAC pairs with ARP
 and directly queries PROFINET DCP, S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, OPC UA, and
-optional SNMP/LLDP. It collects structured evidence—not just a flat host list—and exports
+optional SNMP/LLDP. It collects structured evidence and exports
 observations, interfaces, ports, and topology through the schema-version-2 `otserver-scan` contract
 understood directly by [OTserver](https://github.com/ruveydac/OTserver).
 
