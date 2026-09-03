@@ -31,7 +31,7 @@ impl LogOutput for StdoutLogger {
 #[derive(Parser)]
 #[command(
     name = "otserver-otter",
-    version,
+    version = env!("OTTER_BUILD_VERSION"),
     about = "Read-only OT discovery for OTserver — https://otserver.org"
 )]
 #[cfg_attr(not(feature = "gui"), command(subcommand_required = true))]
@@ -797,7 +797,7 @@ pub async fn scan(
         schema_version: 2,
         scanner: ScannerInfo {
             name: "OTserver Otter".into(),
-            version: env!("CARGO_PKG_VERSION").into(),
+            version: otserver_otter::VERSION.into(),
             npcap_version,
         },
         scan: ScanInfo {
@@ -942,7 +942,7 @@ async fn send_import(
             serde_json::json!({
                 "site": options.site,
                 "source": "otserver-otter",
-                "sourceVersion": env!("CARGO_PKG_VERSION"),
+                "sourceVersion": otserver_otter::VERSION,
                 "status": "pending"
             })
             .to_string(),

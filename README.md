@@ -73,6 +73,11 @@ Zero 2 W running 64-bit Raspberry Pi OS Bookworm or newer. This headless build o
 CLI subcommand such as `doctor`, `interfaces`, or `scan`. It requires the Raspberry Pi OS `libssl3`
 package and the same root or `CAP_NET_RAW` access as other Linux builds.
 
+Release builds expose the triggering Git tag as their CLI, GUI, scan-export, and Windows Explorer
+version. Local builds use the nearest reachable Git tag; source archives without Git metadata fall
+back to the Cargo package version. `OTTER_BUILD_VERSION` can explicitly override this value for a
+reproducible external build.
+
 To build the headless scanner natively instead:
 
 ```bash
@@ -110,8 +115,14 @@ opening the selected Npcap adapter. Identify-All is sent once with an engineerin
 delay factor so device replies are spread over the capture window instead of creating a synchronized
 response burst.
 
-The Windows executable exposes its Cargo package version in Explorer file properties and in the GUI.
+The Windows executable exposes its build Git tag in Explorer file properties and in the GUI.
 Starting the GUI detaches its console window; CLI commands keep normal terminal input and output.
+
+Tagged GitHub releases also publish signed SLSA provenance covering the SHA-256 digest of every
+Linux archive and Windows executable. This lets consumers verify that an artifact was produced by
+this repository's release workflow and was not modified afterward. SLSA provenance is separate from
+Windows Authenticode signing; an Authenticode publisher signature still requires a trusted
+code-signing certificate or managed signing service.
 
 Validate an export before uploading it:
 

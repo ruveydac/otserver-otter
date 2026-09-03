@@ -4,6 +4,8 @@ pub mod profinet;
 pub mod protocols;
 pub mod snmp;
 
+pub const VERSION: &str = env!("OTTER_BUILD_VERSION");
+
 #[cfg(test)]
 pub(crate) async fn network_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
     static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

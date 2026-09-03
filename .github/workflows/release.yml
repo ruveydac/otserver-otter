@@ -11,9 +11,14 @@ permissions:
 jobs:
   build-linux:
     runs-on: ubuntu-latest
+    env:
+      OTTER_BUILD_VERSION: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - run: cargo build --locked --release
+      - run: ./target/release/otserver-otter --version
       - run: tar czf otserver-otter-linux-x86_64.tar.gz -C target/release otserver-otter
       - uses: actions/upload-artifact@v7
         with:
@@ -23,8 +28,12 @@ jobs:
   build-linux-arm64:
     runs-on: ubuntu-24.04-arm
     container: rust:1.89-bookworm
+    env:
+      OTTER_BUILD_VERSION: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - run: cargo build --locked --release --no-default-features
       - run: ./target/release/otserver-otter --version
       - run: tar czf otserver-otter-linux-aarch64.tar.gz -C target/release otserver-otter
@@ -35,13 +44,36 @@ jobs:
 
   build-windows:
     runs-on: windows-latest
+    env:
+      OTTER_BUILD_VERSION: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - run: cargo build --locked --release
+      - run: .\target\release\otserver-otter.exe --version
       - uses: actions/upload-artifact@v7
         with:
           name: otserver-otter-windows-x86_64
           path: target/release/otserver-otter.exe
+
+  provenance-subjects:
+    needs: [build-linux, build-linux-arm64, build-windows]
+    runs-on: ubuntu-latest
+    outputs:
+      hashes: ${{ steps.hashes.outputs.hashes }}
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+      - name: Hash release artifacts
+        id: hashes
+        run: |
+          set -euo pipefail
+          mv artifacts/otserver-otter-linux-x86_64/otserver-otter-linux-x86_64.tar.gz .
+          mv artifacts/otserver-otter-linux-aarch64/otserver-otter-linux-aarch64.tar.gz .
+          mv artifacts/otserver-otter-windows-x86_64/otserver-otter.exe .
+          echo "hashes=$(sha256sum otserver-otter-linux-x86_64.tar.gz otserver-otter-linux-aarch64.tar.gz otserver-otter.exe | base64 -w0)" >> "$GITHUB_OUTPUT"
 
   release:
     needs: [build-linux, build-linux-arm64, build-windows]
@@ -61,3 +93,15 @@ jobs:
             otserver-otter-linux-aarch64.tar.gz
             otserver-otter.exe
           generate_release_notes: true
+
+  provenance:
+    needs: [provenance-subjects, release]
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.provenance-subjects.outputs.hashes }}
+      upload-assets: true
+      upload-tag-name: ${{ github.ref_name }}

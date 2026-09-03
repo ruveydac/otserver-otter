@@ -677,7 +677,7 @@ impl eframe::App for GuiApp {
         egui::TopBottomPanel::top("app-header").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("OTserver Otter");
-                ui.weak(concat!("Version ", env!("CARGO_PKG_VERSION")));
+                ui.weak(format!("Version {}", otserver_otter::VERSION));
             });
             ui.label("Read-only OT asset discovery tool");
         });
@@ -1292,7 +1292,7 @@ pub fn run_gui() -> Result<(), String> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 760.0])
             .with_min_inner_size([500.0, 500.0])
-            .with_title(concat!("OTserver Otter v", env!("CARGO_PKG_VERSION"))),
+            .with_title(format!("OTserver Otter {}", otserver_otter::VERSION)),
         ..Default::default()
     };
 
