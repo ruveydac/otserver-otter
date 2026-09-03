@@ -802,6 +802,17 @@ pub fn npcap_available() -> bool {
     npcap::available()
 }
 
+pub fn npcap_version() -> Option<String> {
+    #[cfg(windows)]
+    {
+        npcap::version()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 #[cfg(windows)]
 pub fn npcap_interface_available(interface: &str) -> bool {
     windows_scan_interface(interface)

@@ -8,11 +8,15 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::ptr::null_mut;
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
+use windows_sys::Win32::Foundation::{
+    FreeLibrary, GetLastError, HANDLE, HMODULE, SetLastError, WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
+};
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 const RECEIVE_BUFFER_SIZE: usize = 1024 * 1024;
 const MAX_CAPTURED_FRAMES: usize = 4_096;
@@ -98,6 +102,7 @@ struct Packet {
 }
 
 type GetAdapterNames = unsafe extern "C" fn(*mut c_char, *mut u32) -> c_uchar;
+type GetVersion = unsafe extern "C" fn() -> *const c_char;
 type OpenAdapter = unsafe extern "C" fn(*const c_char) -> *mut Adapter;
 type CloseAdapter = unsafe extern "C" fn(*mut Adapter);
 type AllocatePacket = unsafe extern "C" fn() -> *mut Packet;
@@ -108,10 +113,12 @@ type ReceivePacket = unsafe extern "C" fn(*mut Adapter, *mut Packet, c_uchar) ->
 type SetReadTimeout = unsafe extern "C" fn(*mut Adapter, c_int) -> c_uchar;
 type SetMinToCopy = unsafe extern "C" fn(*mut Adapter, c_int) -> c_uchar;
 type SetBpf = unsafe extern "C" fn(*mut Adapter, *mut BpfProgram) -> c_uchar;
+type GetReadEvent = unsafe extern "C" fn(*mut Adapter) -> HANDLE;
 
 struct Api {
     module: HMODULE,
     get_adapter_names: GetAdapterNames,
+    get_version: GetVersion,
     open_adapter: OpenAdapter,
     close_adapter: CloseAdapter,
     allocate_packet: AllocatePacket,
@@ -122,6 +129,7 @@ struct Api {
     set_read_timeout: SetReadTimeout,
     set_min_to_copy: SetMinToCopy,
     set_bpf: Option<SetBpf>,
+    get_read_event: GetReadEvent,
 }
 
 impl Api {
@@ -159,6 +167,8 @@ impl Api {
                 // SAFETY: each symbol has the public Npcap Packet32.h ABI declared above.
                 get_adapter_names: unsafe { symbol(module, b"PacketGetAdapterNames\0")? },
                 // SAFETY: see above.
+                get_version: unsafe { symbol(module, b"PacketGetVersion\0")? },
+                // SAFETY: see above.
                 open_adapter: unsafe { symbol(module, b"PacketOpenAdapter\0")? },
                 // SAFETY: see above.
                 close_adapter: unsafe { symbol(module, b"PacketCloseAdapter\0")? },
@@ -180,6 +190,8 @@ impl Api {
                 // stays unfiltered and frames are filtered in user space as before.
                 // SAFETY: see above.
                 set_bpf: unsafe { symbol(module, b"PacketSetBpf\0").ok() },
+                // SAFETY: see above.
+                get_read_event: unsafe { symbol(module, b"PacketGetReadEvent\0")? },
             })
         })();
         if result.is_err() {
@@ -187,6 +199,20 @@ impl Api {
             unsafe { FreeLibrary(module) };
         }
         result
+    }
+
+    fn version(&self) -> Result<String, String> {
+        // SAFETY: PacketGetVersion returns a library-owned, NUL-terminated string.
+        let version = unsafe { (self.get_version)() };
+        if version.is_null() {
+            return Err("Npcap PacketGetVersion returned a null pointer.".into());
+        }
+        // SAFETY: the non-null pointer follows PacketGetVersion's documented contract.
+        normalize_version(
+            unsafe { CStr::from_ptr(version) }
+                .to_string_lossy()
+                .as_ref(),
+        )
     }
 
     fn device_names(&self) -> Result<Vec<String>, String> {
@@ -248,6 +274,10 @@ pub fn available() -> bool {
     Api::load().and_then(|api| api.device_names()).is_ok()
 }
 
+pub fn version() -> Option<String> {
+    Api::load().and_then(|api| api.version()).ok()
+}
+
 pub fn interface_available(interface: &str) -> bool {
     Api::load()
         .and_then(|api| find_device(&api, interface))
@@ -269,12 +299,33 @@ pub fn capture(interface: &str, request: &[u8], wait: Duration) -> Result<Vec<Ve
         handle: adapter,
         close: api.close_adapter,
     };
-    // SAFETY: adapter is open; these calls configure a bounded blocking read.
-    if unsafe { (api.set_read_timeout)(adapter.handle, 100) } == 0
-        || unsafe { (api.set_min_to_copy)(adapter.handle, 1) } == 0
-    {
-        return Err(format!(
-            "Npcap could not configure capture on interface {interface}."
+    // Immediate reads are issued only after Npcap's read event is signalled. This avoids treating
+    // an ordinary quiet-network timeout as a failed capture and keeps the overall wait bounded.
+    // SAFETY: adapter is open and both calls only configure this handle.
+    unsafe { SetLastError(0) };
+    if unsafe { (api.set_read_timeout)(adapter.handle, -1) } == 0 {
+        return Err(npcap_error(
+            &format!("Npcap could not configure immediate reads on interface {interface}"),
+            // SAFETY: read immediately after the failed Win32 API call.
+            unsafe { GetLastError() },
+        ));
+    }
+    // SAFETY: adapter is open and the call only configures this handle.
+    unsafe { SetLastError(0) };
+    if unsafe { (api.set_min_to_copy)(adapter.handle, 1) } == 0 {
+        return Err(npcap_error(
+            &format!("Npcap could not configure capture latency on interface {interface}"),
+            // SAFETY: read immediately after the failed Win32 API call.
+            unsafe { GetLastError() },
+        ));
+    }
+    // SAFETY: adapter is open; Npcap owns the returned event for the lifetime of the adapter.
+    let read_event = unsafe { (api.get_read_event)(adapter.handle) };
+    if read_event.is_null() {
+        return Err(npcap_error(
+            &format!("Npcap did not provide a capture event for interface {interface}"),
+            // SAFETY: read immediately after the failed Win32 API call.
+            unsafe { GetLastError() },
         ));
     }
     // Best effort: restrict the driver to PROFINET frames so a busy segment does not
@@ -317,6 +368,25 @@ pub fn capture(interface: &str, request: &[u8], wait: Duration) -> Result<Vec<Ve
     let started = Instant::now();
     let mut frames = Vec::new();
     while started.elapsed() < wait {
+        let remaining = wait.saturating_sub(started.elapsed());
+        // SAFETY: read_event belongs to the still-open adapter and remains valid for this call.
+        let wait_result = unsafe { WaitForSingleObject(read_event, wait_millis(remaining)) };
+        match wait_result {
+            WAIT_TIMEOUT => break,
+            WAIT_OBJECT_0 => {}
+            WAIT_FAILED => {
+                return Err(npcap_error(
+                    &format!("Npcap capture wait failed on interface {interface}"),
+                    // SAFETY: read immediately after the failed Win32 API call.
+                    unsafe { GetLastError() },
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "Npcap returned unexpected capture wait status 0x{other:08X} on interface {interface}."
+                ));
+            }
+        }
         // SAFETY: packet is allocated by Packet.dll and buffer is writable for receive_length.
         unsafe {
             (api.init_packet)(
@@ -325,9 +395,15 @@ pub fn capture(interface: &str, request: &[u8], wait: Duration) -> Result<Vec<Ve
                 receive_length,
             )
         };
-        // SAFETY: adapter and packet remain valid; synchronous receive respects the 100 ms timeout.
+        // SAFETY: adapter and packet remain valid; the signalled event makes this immediate read
+        // non-blocking while the synchronous call fills the caller-owned buffer.
+        unsafe { SetLastError(0) };
         if unsafe { (api.receive_packet)(adapter.handle, rx_packet.packet, 1) } == 0 {
-            return Err(format!("Npcap capture failed on {interface}."));
+            return Err(npcap_error(
+                &format!("Npcap capture read failed on interface {interface}"),
+                // SAFETY: read immediately after the failed Win32 API call.
+                unsafe { GetLastError() },
+            ));
         }
         // SAFETY: rx_packet points to the public PACKET layout initialized by Packet.dll.
         let valid = unsafe { (*rx_packet.packet).bytes_received as usize };
@@ -475,6 +551,30 @@ fn align_packet(length: usize) -> usize {
     (length + PACKET_ALIGNMENT - 1) & !(PACKET_ALIGNMENT - 1)
 }
 
+fn wait_millis(duration: Duration) -> u32 {
+    duration.as_millis().clamp(1, (u32::MAX - 1) as u128) as u32
+}
+
+fn normalize_version(version: &str) -> Result<String, String> {
+    let version = version.trim();
+    if version.is_empty() {
+        Err("Npcap PacketGetVersion returned an empty version.".into())
+    } else {
+        Ok(version.to_string())
+    }
+}
+
+fn npcap_error(context: &str, error: u32) -> String {
+    if error == 0 {
+        format!("{context}; Npcap did not provide a Windows error code.")
+    } else {
+        format!(
+            "{context}: {}",
+            std::io::Error::from_raw_os_error(error as i32)
+        )
+    }
+}
+
 fn system_directory() -> Result<PathBuf, String> {
     let mut buffer = [0_u16; 32_768];
     // SAFETY: buffer is writable for the supplied element count.
@@ -503,7 +603,11 @@ fn symbol_name(name: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{adapter_buffer_size, canonical_adapter_name, is_npcap_name, parse_bpf_records};
+    use super::{
+        adapter_buffer_size, canonical_adapter_name, is_npcap_name, normalize_version,
+        parse_bpf_records, wait_millis,
+    };
+    use std::time::Duration;
 
     #[test]
     fn canonicalizes_npf_and_windows_adapter_names() {
@@ -524,6 +628,19 @@ mod tests {
     #[test]
     fn accepts_npcap_failed_adapter_size_probe() {
         assert_eq!(adapter_buffer_size(0, 4096).unwrap(), 4096);
+    }
+
+    #[test]
+    fn normalizes_runtime_version_and_rejects_empty_values() {
+        assert_eq!(normalize_version(" 1.88 \r\n").unwrap(), "1.88");
+        assert!(normalize_version("  ").is_err());
+    }
+
+    #[test]
+    fn capture_wait_is_bounded_and_never_becomes_immediate() {
+        assert_eq!(wait_millis(Duration::ZERO), 1);
+        assert_eq!(wait_millis(Duration::from_millis(250)), 250);
+        assert_eq!(wait_millis(Duration::MAX), u32::MAX - 1);
     }
 
     #[test]

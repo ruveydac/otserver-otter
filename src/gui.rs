@@ -262,6 +262,8 @@ pub struct GuiApp {
     #[cfg(windows)]
     npcap_available: bool,
     #[cfg(windows)]
+    npcap_version: Option<String>,
+    #[cfg(windows)]
     npcap_interface_available: bool,
 }
 
@@ -270,6 +272,8 @@ impl GuiApp {
         let interfaces = profinet::interfaces().unwrap_or_default();
         #[cfg(windows)]
         let npcap_available = profinet::npcap_available();
+        #[cfg(windows)]
+        let npcap_version = profinet::npcap_version();
         let mut app = Self {
             configs,
             selected_config: 0,
@@ -315,6 +319,8 @@ impl GuiApp {
             log_rx: None,
             #[cfg(windows)]
             npcap_available,
+            #[cfg(windows)]
+            npcap_version,
             #[cfg(windows)]
             npcap_interface_available: false,
         };
@@ -556,6 +562,7 @@ impl GuiApp {
     #[cfg(windows)]
     fn refresh_npcap(&mut self) {
         self.npcap_available = profinet::npcap_available();
+        self.npcap_version = profinet::npcap_version();
         self.npcap_interface_available =
             self.npcap_available && profinet::npcap_interface_available(&self.interface);
     }
@@ -970,13 +977,17 @@ impl eframe::App for GuiApp {
                             "https://npcap.com/#download",
                         );
                     } else if self.profinet_enabled && self.npcap_interface_available {
-                        ui.label(
-                            "Active Windows PROFINET DCP is ready through Npcap on the selected physical interface.",
-                        );
+                        ui.label(format!(
+                            "Active Windows PROFINET DCP is ready through Npcap {} on the selected physical interface.",
+                            self.npcap_version.as_deref().unwrap_or("(version unavailable)")
+                        ));
                     } else if self.profinet_enabled {
                         ui.colored_label(
                             egui::Color32::YELLOW,
-                            "Npcap is installed, but the selected interface is not usable for direct DCP. Remove any obsolete Windows Network Bridge, refresh, select the physical Ethernet adapter, and verify its Npcap binding.",
+                            format!(
+                                "Npcap {} is installed, but the selected interface is not usable for direct DCP. Remove any obsolete Windows Network Bridge, refresh, select the physical Ethernet adapter, and verify its Npcap binding.",
+                                self.npcap_version.as_deref().unwrap_or("(version unavailable)")
+                            ),
                         );
                     }
                 });

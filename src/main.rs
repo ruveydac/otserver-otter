@@ -620,14 +620,16 @@ fn doctor() -> Result<(), String> {
     println!("Capture interfaces: {}", profinet::interfaces()?.len());
     println!("Native ARP and OT protocol modules: available");
     #[cfg(windows)]
-    println!(
-        "Npcap active PROFINET backend: {}",
-        if profinet::npcap_available() {
-            "available"
-        } else {
-            "not available (pktmon passive fallback only)"
-        }
-    );
+    if profinet::npcap_available() {
+        println!(
+            "Npcap active PROFINET backend: available (version {})",
+            profinet::npcap_version()
+                .as_deref()
+                .unwrap_or("unavailable")
+        );
+    } else {
+        println!("Npcap active PROFINET backend: not available (pktmon passive fallback only)");
+    }
     Ok(())
 }
 
@@ -637,6 +639,12 @@ pub async fn scan(
     cancelled: &AtomicBool,
 ) -> Result<bool, String> {
     let started_at = otserver_otter::now();
+    #[cfg(windows)]
+    let npcap_active = options.protocols.profinet && profinet::npcap_available();
+    #[cfg(windows)]
+    let npcap_version = npcap_active.then(profinet::npcap_version).flatten();
+    #[cfg(not(windows))]
+    let npcap_version = None;
     let mut devices = Vec::new();
     let mut links = Vec::new();
     let mut unresolved = Vec::new();
@@ -678,11 +686,11 @@ pub async fn scan(
 
     if options.protocols.profinet && !cancelled.load(Ordering::Relaxed) {
         #[cfg(windows)]
-        if profinet::npcap_available() {
-            logger.log(
-                "Using the installed Npcap packet driver for active PROFINET DCP; the selected adapter will be bound directly by GUID."
-                    .into(),
-            );
+        if npcap_active {
+            logger.log(format!(
+                "Using Npcap {} for active PROFINET DCP; the selected adapter will be bound directly by GUID.",
+                npcap_version.as_deref().unwrap_or("(version unavailable)")
+            ));
         } else {
             logger.log(
                 "Npcap is not available. Windows will use passive pktmon PROFINET capture. Install Npcap explicitly from https://npcap.com/ to enable active DCP Identify. Driver installation is never a scan side effect."
@@ -790,7 +798,7 @@ pub async fn scan(
         scanner: ScannerInfo {
             name: "OTserver Otter".into(),
             version: env!("CARGO_PKG_VERSION").into(),
-            npcap_version: None,
+            npcap_version,
         },
         scan: ScanInfo {
             id: Uuid::new_v4().to_string(),
