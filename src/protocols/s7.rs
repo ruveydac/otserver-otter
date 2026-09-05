@@ -57,6 +57,7 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
     // connection (RST, FIN, or silence), so every TSAP pairing gets its own connection.
     for (src_tsap, dst_tsap) in TSAP_PAIRS {
         let request = connect_request(src_tsap, dst_tsap);
+        crate::traffic::wait().await;
         let mut stream = match timeout(
             TIMEOUT,
             TcpStream::connect(SocketAddr::new(IpAddr::V4(target), CONNECT_PORT)),
@@ -123,6 +124,7 @@ async fn read_szl(stream: &mut TcpStream, request: &[u8]) -> Result<Vec<u8>, Str
 }
 
 async fn write(stream: &mut TcpStream, value: &[u8]) -> Result<(), String> {
+    crate::traffic::wait().await;
     timeout(TIMEOUT, stream.write_all(value))
         .await
         .map_err(|_| "write timed out".to_string())?

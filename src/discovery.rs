@@ -2,6 +2,9 @@ use crate::contract::{Device, Observation, Source, format_mac, mac_bytes};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
+#[cfg(any(target_os = "linux", test))]
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 #[cfg(any(target_os = "linux", test))]
 use std::time::Instant;
@@ -71,11 +74,15 @@ pub fn scan(
     source_mac: &str,
     targets: &[Ipv4Addr],
     wait: Duration,
+    cancelled: &AtomicBool,
 ) -> Result<Vec<Device>, String> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(Vec::new());
+    }
     let source_mac = mac_bytes(source_mac)
         .ok_or_else(|| "A valid source MAC address is required.".to_string())?;
     let source_ip = source_ipv4(interface)?;
-    let replies = platform_scan(interface, source_mac, source_ip, targets, wait)?;
+    let replies = platform_scan(interface, source_mac, source_ip, targets, wait, cancelled)?;
     Ok(replies
         .into_iter()
         .map(|(ip, (mac, fingerprint))| device(ip, mac, fingerprint))
@@ -249,6 +256,7 @@ fn platform_scan(
     source_ip: Ipv4Addr,
     targets: &[Ipv4Addr],
     _wait: Duration,
+    cancelled: &AtomicBool,
 ) -> Result<DiscoveryResults, String> {
     use windows_sys::Win32::NetworkManagement::IpHelper::SendARP;
 
@@ -256,35 +264,41 @@ fn platform_scan(
     // transmit each ARP request on the adapter owning source_ip and return the resolved MAC.
     // SendARP expects IPAddr values in the same byte layout as inet_addr/SOCKADDR_IN.
     let source = u32::from_ne_bytes(source_ip.octets());
-    let mut replies = BTreeMap::new();
-    for batch in targets.chunks(32) {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
-            for target in batch.iter().copied() {
-                let sender = sender.clone();
-                scope.spawn(move || {
-                    let destination = u32::from_ne_bytes(target.octets());
-                    let mut mac = [0_u8; 8];
-                    let mut length = mac.len() as u32;
-                    // SAFETY: mac is writable for length bytes and length remains valid for the call.
-                    let status = unsafe {
-                        SendARP(destination, source, mac.as_mut_ptr().cast(), &mut length)
-                    };
-                    if status == 0 && length >= 6 {
-                        let value: [u8; 6] = mac[..6].try_into().expect("six-byte slice");
-                        if value != [0; 6] && value != BROADCAST {
-                            let _ = sender.send((target, value));
-                        }
-                    }
-                });
+    Ok(resolve_arp(targets, cancelled, |target| {
+        let destination = u32::from_ne_bytes(target.octets());
+        let mut mac = [0_u8; 8];
+        let mut length = mac.len() as u32;
+        crate::traffic::send_blocking(crate::traffic::Kind::Arp, || {
+            if cancelled.load(Ordering::Relaxed) {
+                return None;
             }
-        });
-        drop(sender);
-        for (target, mac) in receiver {
+            // SAFETY: mac is writable for length bytes and length remains valid for the call.
+            let status =
+                unsafe { SendARP(destination, source, mac.as_mut_ptr().cast(), &mut length) };
+            (status == 0 && length >= 6).then(|| mac[..6].try_into().expect("six-byte slice"))
+        })
+    }))
+}
+
+#[cfg(any(windows, test))]
+fn resolve_arp(
+    targets: &[Ipv4Addr],
+    cancelled: &AtomicBool,
+    mut resolve: impl FnMut(Ipv4Addr) -> Option<[u8; 6]>,
+) -> DiscoveryResults {
+    let mut replies = BTreeMap::new();
+    for &target in targets {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        if let Some(mac) = resolve(target)
+            && mac != [0; 6]
+            && mac != BROADCAST
+        {
             replies.insert(target, (mac, None));
         }
     }
-    Ok(replies)
+    replies
 }
 
 #[cfg(target_os = "linux")]
@@ -294,6 +308,7 @@ fn platform_scan(
     source_ip: Ipv4Addr,
     targets: &[Ipv4Addr],
     wait: Duration,
+    cancelled: &AtomicBool,
 ) -> Result<DiscoveryResults, String> {
     use std::ffi::CString;
     use std::mem::{size_of, zeroed};
@@ -330,34 +345,57 @@ fn platform_scan(
     address.sll_ifindex = index as i32;
     address.sll_halen = 6;
     address.sll_addr[..6].copy_from_slice(&BROADCAST);
-    let mut send = |frame: &[u8], destination: [u8; 6]| -> Result<(), String> {
+    let mut send = |frame: &[u8],
+                    destination: [u8; 6],
+                    stopped: &AtomicBool,
+                    requested: &Mutex<bool>|
+     -> Result<(), String> {
         address.sll_addr[..6].copy_from_slice(&destination);
-        // SAFETY: pointers and lengths refer to live values for the duration of sendto.
-        let sent = unsafe {
-            libc::sendto(
-                fd.as_raw_fd(),
-                frame.as_ptr().cast(),
-                frame.len(),
-                0,
-                (&raw const address).cast(),
-                size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-            )
-        };
-        if sent == frame.len() as isize {
-            Ok(())
-        } else {
-            Err(format!(
-                "Could not send complete discovery request: {}",
-                std::io::Error::last_os_error()
-            ))
-        }
+        send_with_retry(|| {
+            if cancelled.load(Ordering::Relaxed) || stopped.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let kind = if frame[12..14] == ARP_ETHERTYPE {
+                crate::traffic::Kind::Arp
+            } else {
+                crate::traffic::Kind::Other
+            };
+            crate::traffic::send_blocking(kind, || {
+                // Enroll while holding the lock across sendto so an immediate reply is accepted.
+                let mut requested = requested
+                    .lock()
+                    .map_err(|_| std::io::Error::other("Discovery request state was poisoned."))?;
+                if cancelled.load(Ordering::Relaxed) || stopped.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                // SAFETY: pointers and lengths refer to live values for the duration of sendto.
+                let sent = unsafe {
+                    libc::sendto(
+                        fd.as_raw_fd(),
+                        frame.as_ptr().cast(),
+                        frame.len(),
+                        0,
+                        (&raw const address).cast(),
+                        size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+                    )
+                };
+                if sent == frame.len() as isize {
+                    *requested = true;
+                    Ok(())
+                } else if sent < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "short discovery frame send",
+                    ))
+                }
+            })
+        })
+        .map_err(|error| format!("Could not send complete discovery request: {error}"))
     };
-    for target in targets {
-        let frame = request(source_mac, source_ip, *target);
-        send(&frame, BROADCAST)?;
-    }
     let mut buffer = [0_u8; 2048];
-    let replies = collect_replies(targets, source_mac, source_ip, wait, || {
+    let mut receive = || {
         // SAFETY: buffer is writable and fd remains owned.
         let received =
             unsafe { libc::recv(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len(), 0) };
@@ -365,38 +403,46 @@ fn platform_scan(
             Ok(Some(buffer[..received as usize].to_vec()))
         } else {
             let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::WouldBlock {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) {
                 std::thread::sleep(Duration::from_millis(10));
                 Ok(None)
             } else {
-                Err(format!("ARP capture failed: {error}"))
+                Err(format!("Discovery capture failed: {error}"))
             }
         }
-    })?;
-    for (ip, mac) in &replies {
-        send(&icmp_request(source_mac, source_ip, *mac, *ip), *mac)?;
-    }
-    let fingerprints = collect_fingerprints(
-        &replies,
-        source_mac,
-        source_ip,
-        Duration::from_secs(2),
-        || {
-            // SAFETY: buffer is writable and fd remains owned.
-            let received =
-                unsafe { libc::recv(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len(), 0) };
-            if received > 0 {
-                Ok(Some(buffer[..received as usize].to_vec()))
-            } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
-                std::thread::sleep(Duration::from_millis(10));
-                Ok(None)
-            } else {
-                Err(format!(
-                    "OS fingerprint capture failed: {}",
-                    std::io::Error::last_os_error()
-                ))
-            }
+    };
+    let wanted = targets.iter().copied().collect();
+    let replies = collect_replies(
+        targets,
+        wait,
+        cancelled,
+        |ip, stopped, requested| {
+            send(
+                &request(source_mac, source_ip, ip),
+                BROADCAST,
+                stopped,
+                requested,
+            )
         },
+        || Ok(receive()?.and_then(|frame| reply(&frame, &wanted, source_mac, source_ip))),
+    )?;
+    let fingerprints = collect_replies(
+        &replies.keys().copied().collect::<Vec<_>>(),
+        Duration::from_secs(2),
+        cancelled,
+        |ip, stopped, requested| {
+            let mac = replies[&ip];
+            send(
+                &icmp_request(source_mac, source_ip, mac, ip),
+                mac,
+                stopped,
+                requested,
+            )
+        },
+        || Ok(receive()?.and_then(|frame| fingerprint(&frame, &replies, source_mac, source_ip))),
     )?;
     Ok(replies
         .into_iter()
@@ -411,29 +457,91 @@ fn platform_scan(
     _source_ip: Ipv4Addr,
     _targets: &[Ipv4Addr],
     _wait: Duration,
+    _cancelled: &AtomicBool,
 ) -> Result<DiscoveryResults, String> {
     Err("Native discovery is supported on Windows and Linux.".into())
 }
 
+// Bound transient nonblocking send failures; callers also pace every syscall attempt.
 #[cfg(any(target_os = "linux", test))]
-fn collect_replies(
-    targets: &[Ipv4Addr],
-    source_mac: [u8; 6],
-    source_ip: Ipv4Addr,
-    wait: Duration,
-    mut receive: impl FnMut() -> Result<Option<Vec<u8>>, String>,
-) -> Result<BTreeMap<Ipv4Addr, [u8; 6]>, String> {
-    let wanted = targets.iter().copied().collect::<BTreeSet<_>>();
-    let deadline = Instant::now() + wait;
-    let mut replies = BTreeMap::new();
-    while Instant::now() < deadline {
-        if let Some(frame) = receive()?
-            && let Some((ip, mac)) = reply(&frame, &wanted, source_mac, source_ip)
-        {
-            replies.insert(ip, mac);
+pub(crate) fn send_with_retry(
+    mut send_once: impl FnMut() -> Result<(), std::io::Error>,
+) -> Result<(), std::io::Error> {
+    for _ in 0..100 {
+        match send_once() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => return Err(error),
         }
     }
-    Ok(replies)
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "the send queue stayed full",
+    ))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn collect_replies<T>(
+    targets: &[Ipv4Addr],
+    wait: Duration,
+    cancelled: &AtomicBool,
+    mut send: impl FnMut(Ipv4Addr, &AtomicBool, &Mutex<bool>) -> Result<(), String> + Send,
+    mut receive: impl FnMut() -> Result<Option<(Ipv4Addr, T)>, String>,
+) -> Result<BTreeMap<Ipv4Addr, T>, String> {
+    if targets.is_empty() || cancelled.load(Ordering::Relaxed) {
+        return Ok(BTreeMap::new());
+    }
+    let requested = targets
+        .iter()
+        .map(|&ip| (ip, Mutex::new(false)))
+        .collect::<BTreeMap<_, _>>();
+    let stopped = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let sender = scope.spawn(|| {
+            for (&ip, sent) in &requested {
+                if cancelled.load(Ordering::Relaxed) || stopped.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Err(error) = send(ip, &stopped, sent) {
+                    stopped.store(true, Ordering::Relaxed);
+                    return Err(error);
+                }
+            }
+            Ok(())
+        });
+        let replies = (|| {
+            let mut replies = BTreeMap::new();
+            let mut finished = None;
+            while !cancelled.load(Ordering::Relaxed) && !stopped.load(Ordering::Relaxed) {
+                // The grace period starts after the whole sweep, not after each target or when
+                // capture starts. Keep draining the socket while the paced sender is running.
+                if sender.is_finished()
+                    && finished.get_or_insert_with(Instant::now).elapsed() >= wait
+                {
+                    break;
+                }
+                if let Some((ip, value)) = receive()?
+                    && let Some(sent) = requested.get(&ip)
+                    && *sent
+                        .lock()
+                        .map_err(|_| "Discovery request state was poisoned.".to_string())?
+                {
+                    replies.insert(ip, value);
+                }
+            }
+            Ok(replies)
+        })();
+        stopped.store(true, Ordering::Relaxed);
+        sender
+            .join()
+            .map_err(|_| "Discovery sender panicked.".to_string())??;
+        replies
+    })
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -499,26 +607,6 @@ fn fingerprint(
             dont_fragment: frame[20] & 0x40 != 0,
         },
     ))
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn collect_fingerprints(
-    targets: &BTreeMap<Ipv4Addr, [u8; 6]>,
-    source_mac: [u8; 6],
-    source_ip: Ipv4Addr,
-    wait: Duration,
-    mut receive: impl FnMut() -> Result<Option<Vec<u8>>, String>,
-) -> Result<BTreeMap<Ipv4Addr, Fingerprint>, String> {
-    let deadline = Instant::now() + wait;
-    let mut fingerprints = BTreeMap::new();
-    while Instant::now() < deadline {
-        if let Some(frame) = receive()?
-            && let Some((ip, value)) = fingerprint(&frame, targets, source_mac, source_ip)
-        {
-            fingerprints.insert(ip, value);
-        }
-    }
-    Ok(fingerprints)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -638,14 +726,15 @@ mod tests {
 
     #[test]
     fn exercises_target_edges_device_evidence_and_local_interface_errors() {
+        let cancelled = AtomicBool::new(false);
         assert_eq!(expand_targets(&["192.0.2.1/32".into()]).unwrap().len(), 1);
         assert_eq!(expand_targets(&["192.0.2.0/31".into()]).unwrap().len(), 2);
         assert!(expand_targets(&["bad/24".into()]).is_err());
         assert!(expand_targets(&["192.0.2.1/33".into()]).is_err());
-        assert!(scan("lo", "invalid", &[], Duration::ZERO).is_err());
+        assert!(scan("lo", "invalid", &[], Duration::ZERO, &cancelled).is_err());
         #[cfg(target_os = "linux")]
         {
-            let _ = scan("lo", "00:11:22:33:44:55", &[], Duration::ZERO);
+            let _ = scan("lo", "00:11:22:33:44:55", &[], Duration::ZERO, &cancelled);
         }
         assert!(source_ipv4("missing-otserver-interface").is_err());
         #[cfg(target_os = "linux")]
@@ -656,6 +745,7 @@ mod tests {
                 Ipv4Addr::LOCALHOST,
                 &[],
                 Duration::ZERO,
+                &cancelled,
             )
             .is_err()
         );
@@ -695,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn collection_helpers_accept_replies_and_propagate_errors() {
+    fn collection_accepts_arp_and_icmp_replies() {
         let source_mac = [0, 1, 2, 3, 4, 5];
         let target_mac = [0, 17, 34, 51, 68, 85];
         let source_ip = Ipv4Addr::new(192, 0, 2, 10);
@@ -708,26 +798,25 @@ mod tests {
         arp[28..32].copy_from_slice(&target_ip.octets());
         arp[32..38].copy_from_slice(&source_mac);
         arp[38..42].copy_from_slice(&source_ip.octets());
-        let mut frames = vec![arp.to_vec()];
+        let cancelled = AtomicBool::new(false);
+        let (sent, received) = std::sync::mpsc::channel();
         let replies = collect_replies(
             &[target_ip],
-            source_mac,
-            source_ip,
-            Duration::from_millis(1),
-            || Ok(frames.pop()),
+            Duration::from_secs(3600),
+            &cancelled,
+            |_, _, requested| {
+                *requested.lock().unwrap() = true;
+                sent.send(()).unwrap();
+                Ok(())
+            },
+            || {
+                received.recv_timeout(Duration::from_secs(2)).unwrap();
+                cancelled.store(true, Ordering::Relaxed);
+                Ok(reply(&arp, &[target_ip].into(), source_mac, source_ip))
+            },
         )
         .unwrap();
         assert_eq!(replies[&target_ip], target_mac);
-        assert!(
-            collect_replies(
-                &[],
-                source_mac,
-                source_ip,
-                Duration::from_millis(1),
-                || Err("failed".into())
-            )
-            .is_err()
-        );
 
         let mut response = icmp_request(source_mac, source_ip, target_mac, target_ip);
         response[..6].copy_from_slice(&source_mac);
@@ -741,26 +830,213 @@ mod tests {
         response[36..38].fill(0);
         let value = checksum(&response[34..42]);
         response[36..38].copy_from_slice(&value.to_be_bytes());
-        let mut frames = vec![response.to_vec()];
-        let fingerprints = collect_fingerprints(
-            &BTreeMap::from([(target_ip, target_mac)]),
-            source_mac,
-            source_ip,
-            Duration::from_millis(1),
-            || Ok(frames.pop()),
+        cancelled.store(false, Ordering::Relaxed);
+        let fingerprints = collect_replies(
+            &[target_ip],
+            Duration::from_secs(3600),
+            &cancelled,
+            |_, _, requested| {
+                *requested.lock().unwrap() = true;
+                sent.send(()).unwrap();
+                Ok(())
+            },
+            || {
+                received.recv_timeout(Duration::from_secs(2)).unwrap();
+                cancelled.store(true, Ordering::Relaxed);
+                Ok(fingerprint(
+                    &response,
+                    &BTreeMap::from([(target_ip, target_mac)]),
+                    source_mac,
+                    source_ip,
+                ))
+            },
         )
         .unwrap();
         assert!(fingerprints.contains_key(&target_ip));
+    }
+
+    #[test]
+    fn collection_receives_during_sending_and_keeps_replies_on_cancellation() {
+        let targets = [
+            Ipv4Addr::new(192, 0, 2, 1),
+            Ipv4Addr::new(192, 0, 2, 2),
+            Ipv4Addr::new(192, 0, 2, 3),
+        ];
+        let cancelled = AtomicBool::new(false);
+        let (sent, received) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        let mut reads = 0;
+        let replies = collect_replies(
+            &targets,
+            Duration::ZERO,
+            &cancelled,
+            move |ip, _, requested| {
+                assert_ne!(ip, targets[2], "cancellation must stop the sweep");
+                *requested.lock().unwrap() = true;
+                sent.send(ip).unwrap();
+                // Sending cannot advance until the collector has drained the earlier reply.
+                resumed.recv_timeout(Duration::from_secs(2)).unwrap();
+                Ok(())
+            },
+            || {
+                reads += 1;
+                match reads {
+                    1 => {
+                        assert_eq!(
+                            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+                            targets[0]
+                        );
+                        Ok(Some((targets[2], 99))) // In range, but not sent yet.
+                    }
+                    2 => Ok(Some((Ipv4Addr::new(192, 0, 2, 99), 99))),
+                    3 => Ok(Some((targets[0], 1))),
+                    4 => {
+                        resume.send(()).unwrap();
+                        assert_eq!(
+                            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+                            targets[1]
+                        );
+                        cancelled.store(true, Ordering::Relaxed);
+                        resume.send(()).unwrap();
+                        Ok(Some((targets[1], 2)))
+                    }
+                    _ => panic!("capture must stop without waiting out the response grace"),
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(replies, BTreeMap::from([(targets[0], 1), (targets[1], 2)]));
+        assert_eq!(reads, 4);
+    }
+
+    #[test]
+    fn collection_skips_empty_and_cancelled_sweeps_and_ends_after_sending() {
+        let target = [Ipv4Addr::new(192, 0, 2, 1)];
+        for (targets, cancelled) in [(&[][..], false), (&target[..], true)] {
+            assert!(
+                collect_replies::<u8>(
+                    targets,
+                    Duration::from_secs(3600),
+                    &AtomicBool::new(cancelled),
+                    |_, _, _| panic!("must not send"),
+                    || panic!("must not receive"),
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+        let mut sends = 0;
         assert!(
-            collect_fingerprints(
-                &BTreeMap::new(),
-                source_mac,
-                source_ip,
-                Duration::from_millis(1),
-                || Err("failed".into())
+            collect_replies::<u8>(
+                &target,
+                Duration::ZERO,
+                &AtomicBool::new(false),
+                |_, _, _| {
+                    sends += 1;
+                    Ok(())
+                },
+                || Ok(None),
             )
-            .is_err()
+            .unwrap()
+            .is_empty()
         );
+        assert_eq!(sends, 1);
+        assert!(
+            scan(
+                "missing-otserver-interface",
+                "invalid",
+                &target,
+                Duration::from_secs(3600),
+                &AtomicBool::new(true),
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn collection_propagates_send_and_receive_errors() {
+        let target = [Ipv4Addr::new(192, 0, 2, 1)];
+        let cancelled = AtomicBool::new(false);
+        assert_eq!(
+            collect_replies::<u8>(
+                &target,
+                Duration::ZERO,
+                &cancelled,
+                |_, _, _| Err("send failed".into()),
+                || Ok(None),
+            ),
+            Err("send failed".into())
+        );
+        assert_eq!(
+            collect_replies::<u8>(
+                &target,
+                Duration::from_secs(3600),
+                &cancelled,
+                |_, _, _| Ok(()),
+                || Err("receive failed".into()),
+            ),
+            Err("receive failed".into())
+        );
+    }
+
+    #[test]
+    fn serial_arp_resolution_filters_invalid_macs_and_keeps_replies_on_cancel() {
+        let targets = (1..=5)
+            .map(|last| Ipv4Addr::new(192, 0, 2, last))
+            .collect::<Vec<_>>();
+        let mac = [0, 17, 34, 51, 68, 85];
+        let cancelled = AtomicBool::new(false);
+        let mut calls = 0;
+        let replies = resolve_arp(&targets, &cancelled, |ip| {
+            assert_eq!(ip, targets[calls]);
+            calls += 1;
+            match calls {
+                1 => None,
+                2 => Some([0; 6]),
+                3 => Some(BROADCAST),
+                4 => {
+                    cancelled.store(true, Ordering::Relaxed);
+                    Some(mac)
+                }
+                _ => panic!("must not start another SendARP after cancellation"),
+            }
+        });
+        assert_eq!(calls, 4);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[&targets[3]].0, mac);
+        assert!(resolve_arp(&targets, &cancelled, |_| panic!("must not resolve")).is_empty());
+    }
+
+    #[test]
+    fn send_with_retry_paces_temporary_failures_and_stays_bounded() {
+        let mut attempts = 0;
+        assert!(
+            send_with_retry(|| {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                } else {
+                    Ok(())
+                }
+            })
+            .is_ok()
+        );
+        assert_eq!(attempts, 3);
+
+        let error =
+            send_with_retry(|| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)))
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let mut attempts = 0;
+        let error = send_with_retry(|| {
+            attempts += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 100);
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[cfg(windows)]
@@ -773,6 +1049,7 @@ mod tests {
             Ipv4Addr::new(127, 0, 0, 1),
             &[],
             Duration::ZERO,
+            &AtomicBool::new(false),
         );
         assert_eq!(scan_res.unwrap().len(), 0);
     }

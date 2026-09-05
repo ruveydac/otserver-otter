@@ -359,7 +359,10 @@ pub fn capture(interface: &str, request: &[u8], wait: Duration) -> Result<Vec<Ve
         )
     };
     // SAFETY: adapter and packet remain valid; synchronous send completes before returning.
-    if unsafe { (api.send_packet)(adapter.handle, tx_packet.packet, 1) } == 0 {
+    if crate::traffic::send_blocking(crate::traffic::Kind::Other, || unsafe {
+        (api.send_packet)(adapter.handle, tx_packet.packet, 1)
+    }) == 0
+    {
         return Err(format!(
             "Npcap could not transmit DCP Identify on {interface}."
         ));

@@ -3,6 +3,7 @@ pub mod discovery;
 pub mod profinet;
 pub mod protocols;
 pub mod snmp;
+pub mod traffic;
 
 pub const VERSION: &str = env!("OTTER_BUILD_VERSION");
 

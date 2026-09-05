@@ -22,6 +22,13 @@ The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
   truncated, oversized, mismatched, or unsolicited responses.
 - Active DCP must verify that its source MAC belongs to the selected physical interface. Send
   Identify-All once with `ResponseDelayFactor` `0x0080`; never use zero or rapid retries.
+- Preserve process-wide `src/traffic.rs` pacing: 35 explicit ARP requests/s and approximately 350
+  aggregate discovery operations/s, 70% of the supplied site ceilings (50 and 500). Serialize raw
+  ARP sends and Windows `SendARP` calls through the blocking send gate, including syscall retries;
+  never accumulate catch-up bursts. IP-target starts consume the aggregate budget, not the strict
+  ARP budget, since TCP/UDP throughput need only stay roughly within limits. Receive during
+  paced sweeps and honor cancellation. These are application limits, not an on-wire guarantee for
+  OS-generated ARP/TCP or protocol-library traffic; do not label them universally safe.
 - Credentials belong in executable-adjacent `otter.json`. Load legacy `otscanner.json` only when
   `otter.json` is absent. Never write credentials to logs or scan exports.
 - Direct imports use OTserver's `asset-imports` REST API so authorization, validation, merging, and

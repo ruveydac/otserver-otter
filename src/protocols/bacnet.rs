@@ -74,6 +74,7 @@ async fn exchange(socket: &UdpSocket, property: u8, invoke: u8) -> Result<Option
     let query = [
         0x81, 0x0a, 0, 0x11, 1, 4, 0, 5, invoke, 0x0c, 0x0c, 0x02, 0x3f, 0xff, 0xff, 0x19, property,
     ];
+    crate::traffic::wait().await;
     socket
         .send(&query)
         .await

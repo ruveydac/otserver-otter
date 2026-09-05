@@ -53,6 +53,7 @@ async fn udp(target: Ipv4Addr) -> Result<Option<Vec<u8>>, String> {
         .connect((target, 9600))
         .await
         .map_err(|error| error.to_string())?;
+    crate::traffic::wait().await;
     socket
         .send(&UDP_REQUEST)
         .await
@@ -77,6 +78,7 @@ async fn udp(target: Ipv4Addr) -> Result<Option<Vec<u8>>, String> {
 }
 
 async fn tcp(target: Ipv4Addr) -> Result<Option<Vec<u8>>, String> {
+    crate::traffic::wait().await;
     let mut stream = match timeout(
         TIMEOUT,
         TcpStream::connect(SocketAddr::new(IpAddr::V4(target), 9600)),
@@ -107,6 +109,7 @@ async fn tcp(target: Ipv4Addr) -> Result<Option<Vec<u8>>, String> {
 }
 
 async fn write(stream: &mut TcpStream, value: &[u8]) -> Result<(), String> {
+    crate::traffic::wait().await;
     timeout(TIMEOUT, stream.write_all(value))
         .await
         .map_err(|_| "write timed out".to_string())?

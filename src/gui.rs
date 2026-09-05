@@ -3,7 +3,7 @@ use crate::{
     nonempty_opt, prepare_scans, run_scan_batch, save_config_sync,
 };
 use eframe::egui;
-use otserver_otter::contract::normalize_mac;
+use otserver_otter::contract::{Device, normalize_mac};
 use otserver_otter::profinet::{self, CaptureInterface};
 use otserver_otter::protocols::{OpcuaCredential, OpcuaCredentials};
 use otserver_otter::snmp::{Credentials as SnmpCredentials, Settings as SnmpSettings};
@@ -19,12 +19,17 @@ pub struct GuiLogger {
 
 enum ScanMessage {
     Log(String),
+    Devices(Vec<Device>),
     Finished(BatchResult),
 }
 
 impl LogOutput for GuiLogger {
     fn write(&self, msg: String) {
         let _ = self.sender.send(ScanMessage::Log(msg));
+    }
+
+    fn devices(&self, _configuration: &str, devices: &[Device]) {
+        let _ = self.sender.send(ScanMessage::Devices(devices.to_vec()));
     }
 }
 
@@ -259,6 +264,9 @@ pub struct GuiApp {
     is_scanning: bool,
     cancellation: Option<Arc<AtomicBool>>,
     log_rx: Option<Receiver<ScanMessage>>,
+    assets: Vec<Device>,
+    asset_window_open: bool,
+    selected_asset: Option<String>,
     #[cfg(windows)]
     npcap_available: bool,
     #[cfg(windows)]
@@ -317,6 +325,9 @@ impl GuiApp {
             is_scanning: false,
             cancellation: None,
             log_rx: None,
+            assets: Vec::new(),
+            asset_window_open: false,
+            selected_asset: None,
             #[cfg(windows)]
             npcap_available,
             #[cfg(windows)]
@@ -612,6 +623,9 @@ impl GuiApp {
         self.log_rx = Some(rx);
         self.cancellation = Some(Arc::clone(&cancellation));
         self.is_scanning = true;
+        self.assets.clear();
+        self.selected_asset = None;
+        self.asset_window_open = true;
         self.status = format!("Running {scan_count} configuration(s)...");
         self.append_log(&format!("Starting {scan_count} configuration(s)."));
 
@@ -646,6 +660,17 @@ impl eframe::App for GuiApp {
                 ScanMessage::Log(message) => {
                     self.log_text.push_str(&message);
                     self.log_text.push('\n');
+                }
+                ScanMessage::Devices(devices) => {
+                    merge_assets(&mut self.assets, devices);
+                    if let Some(selected) = &self.selected_asset
+                        && !self
+                            .assets
+                            .iter()
+                            .any(|device| device.mac_address == *selected)
+                    {
+                        self.selected_asset = None;
+                    }
                 }
                 ScanMessage::Finished(result) => {
                     self.is_scanning = false;
@@ -734,6 +759,12 @@ impl eframe::App for GuiApp {
                     .clicked()
                 {
                     self.save_config();
+                }
+                if ui
+                    .button(format!("Show Assets ({})", self.assets.len()))
+                    .clicked()
+                {
+                    self.asset_window_open = true;
                 }
             });
             ui.horizontal_wrapped(|ui| {
@@ -1277,6 +1308,203 @@ impl eframe::App for GuiApp {
                 });
                 });
         });
+
+        if self.asset_window_open {
+            let assets = self.assets.clone();
+            let selected = self.selected_asset.clone();
+            let mut open = self.asset_window_open;
+            egui::Window::new(format!("Discovered Assets ({})", assets.len()))
+                .open(&mut open)
+                .default_size([1080.0, 600.0])
+                .min_size([560.0, 360.0])
+                .max_size([1140.0, 10_000.0])
+                .show(ctx, |ui| {
+                    if assets.is_empty() {
+                        ui.label(if self.is_scanning {
+                            "Scanning... no assets found yet."
+                        } else {
+                            "No assets discovered."
+                        });
+                        return;
+                    }
+                    let mut detail = None;
+                    let table_width = (ui.available_width() * 0.55).max(420.0);
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(table_width);
+                            egui::ScrollArea::both()
+                                .id_salt("asset-list")
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    egui::Grid::new("asset-table").striped(true).show(ui, |ui| {
+                                        ui.strong("MAC");
+                                        ui.strong("IP");
+                                        ui.strong("Manufacturer");
+                                        ui.strong("Model");
+                                        ui.strong("OS");
+                                        ui.strong("Protocols");
+                                        ui.end_row();
+                                        for device in &assets {
+                                            let is_selected =
+                                                selected.as_deref() == Some(&device.mac_address);
+                                            let mut row_clicked = false;
+                                            {
+                                                let mut cell = |ui: &mut egui::Ui, text| {
+                                                    row_clicked |= ui
+                                                        .selectable_label(is_selected, text)
+                                                        .clicked();
+                                                };
+                                                cell(ui, device.mac_address.clone());
+                                                cell(ui, device.ip_addresses.join(", "));
+                                                cell(ui, asset_field(device, MANUFACTURER_KEYS));
+                                                cell(ui, asset_field(device, MODEL_KEYS));
+                                                cell(ui, asset_field(device, OS_KEYS));
+                                                cell(ui, asset_protocols(device).join(", "));
+                                            }
+                                            ui.end_row();
+                                            if row_clicked {
+                                                self.selected_asset =
+                                                    Some(device.mac_address.clone());
+                                                detail = Some(device.clone());
+                                            }
+                                            if is_selected && detail.is_none() {
+                                                detail = Some(device.clone());
+                                            }
+                                        }
+                                    });
+                                });
+                        });
+                        ui.separator();
+                        ui.vertical(|ui| {
+                            ui.set_width(ui.available_width());
+                            ui.set_min_height(ui.available_height());
+                            egui::ScrollArea::both()
+                                .id_salt("asset-detail")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| match detail {
+                                    Some(device) => show_asset_detail(ui, &device),
+                                    None => {
+                                        ui.weak(
+                                            "Select an asset in the table to see its full record.",
+                                        );
+                                    }
+                                });
+                        });
+                    });
+                });
+            self.asset_window_open = open;
+        }
+    }
+}
+
+fn asset_title(device: &Device) -> String {
+    device
+        .ip_addresses
+        .first()
+        .cloned()
+        .unwrap_or_else(|| device.mac_address.clone())
+}
+
+fn asset_protocols(device: &Device) -> Vec<&'static str> {
+    let mut labels = Vec::new();
+    for observation in &device.observations {
+        let label = observation.source.label();
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    labels
+}
+
+fn merge_assets(assets: &mut Vec<Device>, incoming: Vec<Device>) {
+    for device in incoming {
+        match assets
+            .iter_mut()
+            .find(|asset| asset.mac_address == device.mac_address)
+        {
+            Some(existing) => *existing = device,
+            None => assets.push(device),
+        }
+    }
+}
+
+const MANUFACTURER_KEYS: &[&str] = &["vendor", "manufacturer"];
+const MODEL_KEYS: &[&str] = &["model", "productName"];
+const OS_KEYS: &[&str] = &["operatingSystem"];
+
+fn asset_field(device: &Device, keys: &[&str]) -> String {
+    device
+        .observations
+        .iter()
+        .flat_map(|observation| observation.fields.iter())
+        .find(|(key, _)| keys.contains(&key.as_str()))
+        .map(|(_, value)| json_value_text(value))
+        .unwrap_or_default()
+}
+
+fn show_asset_detail(ui: &mut egui::Ui, device: &Device) {
+    let protocols = asset_protocols(device);
+    ui.heading(asset_title(device));
+    if !protocols.is_empty() {
+        ui.weak(format!("Discovered via: {}", protocols.join(", ")));
+    }
+    ui.separator();
+    match serde_json::to_value(device) {
+        Ok(serde_json::Value::Object(fields)) => {
+            for (key, value) in &fields {
+                show_json(ui, &format!("device.{key}"), key, value, 1);
+            }
+        }
+        Ok(value) => {
+            ui.code(value.to_string());
+        }
+        Err(error) => {
+            ui.colored_label(egui::Color32::LIGHT_RED, error.to_string());
+        }
+    }
+}
+
+fn show_json(ui: &mut egui::Ui, path: &str, key: &str, value: &serde_json::Value, depth: usize) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            egui::CollapsingHeader::new(egui::RichText::new(key).strong())
+                .id_salt(path)
+                .default_open(depth < 4)
+                .show(ui, |ui| {
+                    for (field, value) in fields {
+                        show_json(ui, &format!("{path}.{field}"), field, value, depth + 1);
+                    }
+                });
+        }
+        serde_json::Value::Array(items) => {
+            egui::CollapsingHeader::new(format!("{key} [{}]", items.len()))
+                .id_salt(path)
+                .default_open(depth < 4)
+                .show(ui, |ui| {
+                    for (index, value) in items.iter().enumerate() {
+                        show_json(
+                            ui,
+                            &format!("{path}[{index}]"),
+                            &index.to_string(),
+                            value,
+                            depth + 1,
+                        );
+                    }
+                });
+        }
+        scalar => {
+            ui.horizontal(|ui| {
+                ui.label(key);
+                ui.monospace(json_value_text(scalar));
+            });
+        }
+    }
+}
+
+fn json_value_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -1315,12 +1543,124 @@ pub fn run_gui() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GuiApp, OpcuaCredential, OpcuaCredentials, SnmpCredentials, SnmpSettings,
-        bound_ip_addresses, interface_mac, opcua_credential_detail, opcua_credential_label,
-        snmp_credential_detail, snmp_version_label, with_added_configuration,
+        GuiApp, MANUFACTURER_KEYS, MODEL_KEYS, OS_KEYS, OpcuaCredential, OpcuaCredentials,
+        SnmpCredentials, SnmpSettings, asset_field, asset_protocols, asset_title,
+        bound_ip_addresses, interface_mac, json_value_text, merge_assets, opcua_credential_detail,
+        opcua_credential_label, snmp_credential_detail, snmp_version_label,
+        with_added_configuration,
     };
     use crate::{ScannerConfig, ScannerConfigs};
+    use otserver_otter::contract::{Device, Observation, Source};
     use otserver_otter::profinet::CaptureInterface;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn asset_title_prefers_first_ip_and_falls_back_to_mac() {
+        let device = Device {
+            mac_address: "00:11:22:33:44:55".into(),
+            ip_addresses: vec!["192.0.2.10".into(), "192.0.2.11".into()],
+            ..Device::default()
+        };
+        assert_eq!(asset_title(&device), "192.0.2.10");
+
+        let device = Device {
+            mac_address: "00:11:22:33:44:55".into(),
+            ..Device::default()
+        };
+        assert_eq!(asset_title(&device), "00:11:22:33:44:55");
+    }
+
+    #[test]
+    fn asset_protocols_lists_each_source_once_in_first_seen_order() {
+        let observation = |source| Observation {
+            source,
+            observed_at: String::new(),
+            ip_address: None,
+            mac_address: None,
+            fields: BTreeMap::new(),
+            raw: serde_json::Value::Null,
+            warnings: Vec::new(),
+        };
+        let device = Device {
+            mac_address: "00:11:22:33:44:55".into(),
+            observations: vec![
+                observation(Source::Arp),
+                observation(Source::Snmp),
+                observation(Source::Arp),
+                observation(Source::Lldp),
+            ],
+            ..Device::default()
+        };
+        assert_eq!(asset_protocols(&device), ["arp", "snmp", "lldp"]);
+        assert!(asset_protocols(&Device::default()).is_empty());
+    }
+
+    #[test]
+    fn asset_field_reads_first_matching_observation_key() {
+        let observation = |source, fields| Observation {
+            source,
+            observed_at: String::new(),
+            ip_address: None,
+            mac_address: None,
+            fields,
+            raw: serde_json::Value::Null,
+            warnings: Vec::new(),
+        };
+        let device = Device {
+            mac_address: "00:11:22:33:44:55".into(),
+            observations: vec![
+                observation(
+                    Source::Arp,
+                    BTreeMap::from([("vendor".into(), serde_json::json!("Cisco"))]),
+                ),
+                observation(
+                    Source::S7,
+                    BTreeMap::from([
+                        ("model".into(), serde_json::json!("S7-1200")),
+                        ("vendor".into(), serde_json::json!("Siemens")),
+                    ]),
+                ),
+            ],
+            ..Device::default()
+        };
+        assert_eq!(asset_field(&device, MANUFACTURER_KEYS), "Cisco");
+        assert_eq!(asset_field(&device, MODEL_KEYS), "S7-1200");
+        assert_eq!(asset_field(&device, OS_KEYS), "");
+    }
+
+    #[test]
+    fn merge_assets_replaces_by_mac_and_appends_new() {
+        let mut assets = vec![Device {
+            mac_address: "00:11:22:33:44:55".into(),
+            ip_addresses: vec!["192.0.2.10".into()],
+            ..Device::default()
+        }];
+        merge_assets(
+            &mut assets,
+            vec![
+                Device {
+                    mac_address: "00:11:22:33:44:55".into(),
+                    ip_addresses: vec!["192.0.2.10".into(), "192.0.2.11".into()],
+                    ..Device::default()
+                },
+                Device {
+                    mac_address: "66:77:88:99:aa:bb".into(),
+                    ip_addresses: vec!["192.0.2.20".into()],
+                    ..Device::default()
+                },
+            ],
+        );
+        assert_eq!(assets.len(), 2);
+        assert_eq!(assets[0].ip_addresses.len(), 2);
+        assert_eq!(assets[1].mac_address, "66:77:88:99:aa:bb");
+    }
+
+    #[test]
+    fn json_value_text_keeps_strings_plain() {
+        assert_eq!(json_value_text(&serde_json::json!("PLC-1")), "PLC-1");
+        assert_eq!(json_value_text(&serde_json::json!(7)), "7");
+        assert_eq!(json_value_text(&serde_json::json!(null)), "null");
+    }
 
     #[test]
     fn displays_only_ip_addresses_for_the_selected_interface() {

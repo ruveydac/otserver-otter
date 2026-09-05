@@ -81,6 +81,9 @@ pub async fn scan(
     selection: Selection,
     opcua: &opcua::ProbeSettings,
 ) -> ProbeResult {
+    if selection.any() {
+        crate::traffic::wait().await;
+    }
     let (s7, enip, bacnet, fins, fox, ua) = tokio::join!(
         async {
             if selection.s7 {

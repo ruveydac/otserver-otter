@@ -19,7 +19,7 @@ const SNMP_PORT: u16 = 1_161;
 #[cfg(not(test))]
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
-const QUERY_TIMEOUT: Duration = Duration::from_millis(200);
+const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_TABLE_ROWS: usize = 512;
 const MAX_FDB_ROWS: usize = 4000;
 const MAX_V1_FDB_ROWS: usize = 128;
@@ -383,6 +383,7 @@ async fn query_inner(
     authentication: Auth,
     responded: &AtomicBool,
 ) -> Result<ResultData, String> {
+    crate::traffic::wait().await;
     let client = Client::builder((target, SNMP_PORT), authentication)
         .timeout(Duration::from_secs(3))
         .retry(Retry::fixed(1, Duration::ZERO))
@@ -401,6 +402,7 @@ async fn query_inner(
     let mut bridge_mac = None;
     let mut siemens = false;
     if selection.inventory {
+        crate::traffic::wait().await;
         let system = client
             .get_many(&[
                 Oid::parse("1.3.6.1.2.1.1.1.0").unwrap(),
@@ -451,6 +453,7 @@ async fn query_inner(
                 _ => {}
             }
         }
+        crate::traffic::wait().await;
         if let Ok(item) = client
             .get(&Oid::parse("1.3.6.1.2.1.17.1.1.0").unwrap())
             .await
@@ -463,6 +466,7 @@ async fn query_inner(
                 .filter(|value| value.len() == 6)
                 .map(format_mac);
         }
+        crate::traffic::wait().await;
         if let Ok(values) = client
             .get_many(&[
                 Oid::parse("1.3.6.1.2.1.25.1.1.0").unwrap(),
@@ -477,6 +481,7 @@ async fn query_inner(
             }
         }
         if siemens {
+            crate::traffic::wait().await;
             match client
                 .get_many(&[
                     Oid::parse("1.3.6.1.4.1.4329.6.3.2.1.1.2.0").unwrap(),
@@ -851,6 +856,7 @@ async fn query_inner(
     let mut lldp_chassis_mac = None;
     let mut local_system_name = None;
     if selection.lldp {
+        crate::traffic::wait().await;
         match client
             .get_many(&[
                 Oid::parse("1.0.8802.1.1.2.1.3.1.0").unwrap(),
@@ -1254,7 +1260,12 @@ async fn collect_walk<T: Transport + 'static>(
         .map_err(|error| error.to_string())?;
     let mut values = vec![];
     // All callers walk tables; avoid collect()'s scalar GET fallback for an empty table.
-    while let Some(value) = walk.next().await {
+    loop {
+        // Pace buffered bulk values too, conservatively counting more than wire requests.
+        crate::traffic::wait().await;
+        let Some(value) = walk.next().await else {
+            break;
+        };
         let value = value.map_err(|error| error.to_string())?;
         if values.len() == limit {
             return Err(format!("table exceeded safe limit of {limit} rows"));
@@ -2304,20 +2315,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_walk_paces_buffered_bulk_values() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::builder(socket.local_addr().unwrap(), Auth::v2c("public"))
+            .max_repetitions(10)
+            .connect()
+            .await
+            .unwrap();
+        let root = "1.3.6.1.2.1.2.2.1.2";
+        let (values, sent_at) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(collect_walk(&client, root, 10), async {
+                let mut buffer = [0; 4096];
+                let (length, peer) = socket.recv_from(&mut buffer).await.unwrap();
+                let message = CommunityMessage::decode(buffer[..length].to_vec().into()).unwrap();
+                let request = message.pdu.standard().unwrap();
+                assert_eq!(request.pdu_type, PduType::GetBulkRequest);
+                let mut varbinds: Vec<_> = (1..10)
+                    .map(|index| {
+                        VarBind::new(
+                            Oid::parse(&format!("{root}.{index}")).unwrap(),
+                            Value::Integer(index),
+                        )
+                    })
+                    .collect();
+                varbinds.push(VarBind::new(Oid::parse(root).unwrap(), Value::EndOfMibView));
+                let response = CommunityMessage::new(
+                    message.version,
+                    message.community,
+                    Pdu {
+                        pdu_type: PduType::Response,
+                        request_id: request.request_id,
+                        error_status: 0,
+                        error_index: 0,
+                        varbinds,
+                    },
+                )
+                .encode();
+                socket.send_to(&response, peer).await.unwrap();
+                tokio::time::Instant::now()
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(values.unwrap().len(), 9);
+        // A single bulk response still consumes one pacing slot per buffered value.
+        assert!(sent_at.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[tokio::test]
     async fn bounds_the_whole_query_time() {
         let _sink = UdpSocket::bind(("127.0.0.2", SNMP_PORT)).await.unwrap();
         let mut auto = settings("auto");
         auto.username = Some("inventory".into());
-        let (attempts, result) = query_with_attempts(
-            "127.0.0.2",
-            None,
-            &[auto],
-            QuerySelection {
-                inventory: false,
-                lldp: true,
-            },
+        let (attempts, result) = tokio::time::timeout(
+            QUERY_TIMEOUT + Duration::from_millis(250),
+            query_with_attempts(
+                "127.0.0.2",
+                None,
+                &[auto],
+                QuerySelection {
+                    inventory: false,
+                    lldp: true,
+                },
+            ),
         )
-        .await;
+        .await
+        .expect("query outlived its whole-query budget");
         let Err(error) = result else {
             panic!("query unexpectedly completed")
         };

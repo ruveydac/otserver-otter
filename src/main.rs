@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
@@ -19,6 +20,8 @@ pub trait LogOutput: Send + Sync {
     fn log(&self, msg: String) {
         self.write(format_log_line(&msg));
     }
+
+    fn devices(&self, _configuration: &str, _devices: &[Device]) {}
 }
 
 pub struct StdoutLogger;
@@ -352,7 +355,7 @@ async fn run() -> Result<(), String> {
         Some(Commands::Scan(args)) => {
             let configs = load_config()?;
             let logger = StdoutLogger;
-            let cancelled = AtomicBool::new(false);
+            let cancelled = Arc::new(AtomicBool::new(false));
             let (scans, mut failures) = prepare_scans(
                 args,
                 configs.named_configs(),
@@ -634,9 +637,10 @@ fn doctor() -> Result<(), String> {
 }
 
 pub async fn scan(
+    configuration: &str,
     options: &ScanOptions,
     logger: &dyn LogOutput,
-    cancelled: &AtomicBool,
+    cancelled: &Arc<AtomicBool>,
 ) -> Result<bool, String> {
     let started_at = otserver_otter::now();
     #[cfg(windows)]
@@ -660,12 +664,24 @@ pub async fn scan(
         "Interface: {}, Source MAC: {}",
         options.interface, options.source_mac
     ));
+    logger.log(format!(
+        "Traffic pacing: {} ARP requests/s, approximately {} discovery operations/s, shared across targets. OS-generated packets are not a hard-capped wire budget.",
+        otserver_otter::traffic::ARP_REQUESTS_PER_SECOND,
+        otserver_otter::traffic::OPERATIONS_PER_SECOND,
+    ));
 
     let target_addresses = discovery::expand_targets(&options.targets)?;
 
     if options.protocols.arp && !cancelled.load(Ordering::Relaxed) {
         logger.log("Executing ARP discovery...".into());
-        match discover(&options.interface, &options.source_mac, &target_addresses).await {
+        match discover(
+            &options.interface,
+            &options.source_mac,
+            &target_addresses,
+            cancelled,
+        )
+        .await
+        {
             Ok(found) => {
                 logger.log(format!("ARP discovery found {} device(s).", found.len()));
                 for device in &found {
@@ -721,6 +737,7 @@ pub async fn scan(
         "Unique devices after Layer 2 discovery: {}",
         devices.len()
     ));
+    logger.devices(configuration, &devices);
 
     let native_selection = protocols::Selection {
         s7: options.protocols.s7,
@@ -736,6 +753,7 @@ pub async fn scan(
             native_selection.labels().join(", ")
         ));
         probe_protocols(
+            configuration,
             &mut devices,
             &mut warnings,
             native_selection,
@@ -744,6 +762,7 @@ pub async fn scan(
             cancelled,
         )
         .await;
+        logger.devices(configuration, &devices);
     }
 
     if (options.protocols.snmp || options.protocols.lldp) && !cancelled.load(Ordering::Relaxed) {
@@ -772,6 +791,7 @@ pub async fn scan(
                 .flat_map(|device| device.ip_addresses.iter().cloned()),
         );
         protocol_failed |= probe_snmp(
+            configuration,
             ips,
             &mut devices,
             &mut links,
@@ -791,6 +811,9 @@ pub async fn scan(
             .push("Scan stopped by user; this export contains results collected so far.".into());
         logger.log("Stopping scan and writing collected results...".into());
     }
+
+    let devices = merge_devices(devices);
+    logger.devices(configuration, &devices);
 
     let scan = ScanExport {
         format: "otserver-scan".into(),
@@ -813,7 +836,7 @@ pub async fn scan(
             },
             partial: stopped || protocol_failed || !errors.is_empty(),
         },
-        devices: merge_devices(devices),
+        devices,
         links,
         unresolved,
         warnings,
@@ -836,7 +859,7 @@ pub async fn scan(
 pub async fn run_scan_batch(
     scans: &[ConfiguredScan],
     logger: &dyn LogOutput,
-    cancelled: &AtomicBool,
+    cancelled: &Arc<AtomicBool>,
 ) -> BatchResult {
     let mut result = BatchResult::default();
     for (index, configured) in scans.iter().enumerate() {
@@ -851,7 +874,7 @@ pub async fn run_scan_batch(
             index + 1,
             scans.len()
         ));
-        match scan(&configured.options, logger, cancelled).await {
+        match scan(&configured.name, &configured.options, logger, cancelled).await {
             Ok(_) if cancelled.load(Ordering::Relaxed) => {
                 logger.log(format!("Configuration {:?} stopped.", configured.name));
                 result.cancelled = true;
@@ -983,18 +1006,27 @@ async fn discover(
     interface: &str,
     source_mac: &str,
     targets: &[Ipv4Addr],
+    cancelled: &Arc<AtomicBool>,
 ) -> Result<Vec<otserver_otter::contract::Device>, String> {
     let interface = interface.to_owned();
     let source_mac = source_mac.to_owned();
     let targets = targets.to_vec();
+    let cancelled = Arc::clone(cancelled);
     tokio::task::spawn_blocking(move || {
-        discovery::scan(&interface, &source_mac, &targets, Duration::from_secs(3))
+        discovery::scan(
+            &interface,
+            &source_mac,
+            &targets,
+            Duration::from_secs(3),
+            &cancelled,
+        )
     })
     .await
     .map_err(|error| error.to_string())?
 }
 
 async fn probe_protocols(
+    configuration: &str,
     devices: &mut [otserver_otter::contract::Device],
     warnings: &mut Vec<String>,
     selection: protocols::Selection,
@@ -1012,7 +1044,11 @@ async fn probe_protocols(
             break;
         }
         if tasks.len() == 32 {
-            apply_probe(devices, warnings, logger, tasks.join_next().await);
+            let result = tokio::select! {
+                () = wait_for_cancellation(cancelled) => break,
+                result = tasks.join_next() => result,
+            };
+            apply_probe(configuration, devices, warnings, logger, result);
         }
         let opcua = opcua.clone();
         tasks.spawn(async move {
@@ -1020,13 +1056,15 @@ async fn probe_protocols(
             (ip, mac, result)
         });
     }
-    while !cancelled.load(Ordering::Relaxed)
-        && let Some(result) = tasks.join_next().await
-    {
-        apply_probe(devices, warnings, logger, Some(result));
+    while !tasks.is_empty() {
+        let result = tokio::select! {
+            () = wait_for_cancellation(cancelled) => break,
+            result = tasks.join_next() => result,
+        };
+        apply_probe(configuration, devices, warnings, logger, result);
     }
     while let Some(result) = tasks.try_join_next() {
-        apply_probe(devices, warnings, logger, Some(result));
+        apply_probe(configuration, devices, warnings, logger, Some(result));
     }
     tasks.abort_all();
 }
@@ -1036,6 +1074,7 @@ async fn probe_protocols(
     reason = "keeps scan result mutation in one bounded probe path"
 )]
 async fn probe_snmp(
+    configuration: &str,
     ips: BTreeSet<String>,
     devices: &mut Vec<Device>,
     links: &mut Vec<otserver_otter::contract::TopologyLink>,
@@ -1059,7 +1098,14 @@ async fn probe_snmp(
                 result = tasks.join_next() => result,
             };
             failed |= apply_snmp_probe(
-                devices, links, unresolved, warnings, logger, selection, result,
+                configuration,
+                devices,
+                links,
+                unresolved,
+                warnings,
+                logger,
+                selection,
+                result,
             );
         }
         let settings = settings.to_vec();
@@ -1076,11 +1122,19 @@ async fn probe_snmp(
             result = tasks.join_next() => result,
         };
         failed |= apply_snmp_probe(
-            devices, links, unresolved, warnings, logger, selection, result,
+            configuration,
+            devices,
+            links,
+            unresolved,
+            warnings,
+            logger,
+            selection,
+            result,
         );
     }
     while let Some(result) = tasks.try_join_next() {
         failed |= apply_snmp_probe(
+            configuration,
             devices,
             links,
             unresolved,
@@ -1104,7 +1158,12 @@ async fn wait_for_cancellation(cancelled: &AtomicBool) {
     clippy::type_complexity,
     reason = "the join result carries the target and fallible SNMP response"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps live device snapshots in the single bounded probe path"
+)]
 fn apply_snmp_probe(
+    configuration: &str,
     devices: &mut Vec<Device>,
     links: &mut Vec<otserver_otter::contract::TopologyLink>,
     unresolved: &mut Vec<otserver_otter::contract::Observation>,
@@ -1179,10 +1238,12 @@ fn apply_snmp_probe(
     } else if let Some(observation) = result.observation {
         unresolved.push(observation);
     }
+    logger.devices(configuration, devices);
     incomplete
 }
 
 fn apply_probe(
+    configuration: &str,
     devices: &mut [otserver_otter::contract::Device],
     warnings: &mut Vec<String>,
     logger: &dyn LogOutput,
@@ -1201,6 +1262,7 @@ fn apply_probe(
         device.observations.append(&mut result.observations);
         device.ports.append(&mut result.ports);
     }
+    logger.devices(configuration, devices);
 }
 
 fn unique_ip_identities(devices: &[otserver_otter::contract::Device]) -> BTreeMap<String, String> {
@@ -1243,6 +1305,22 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[derive(Default)]
+    struct DeviceLogger {
+        snapshots: std::sync::Mutex<Vec<(String, usize)>>,
+    }
+
+    impl LogOutput for DeviceLogger {
+        fn write(&self, _msg: String) {}
+
+        fn devices(&self, configuration: &str, devices: &[Device]) {
+            self.snapshots
+                .lock()
+                .unwrap()
+                .push((configuration.to_string(), devices.len()));
+        }
+    }
 
     fn args() -> ScanArgs {
         ScanArgs {
@@ -1445,7 +1523,7 @@ mod tests {
         let (scans, failures) = prepare_scans(args(), configs, None).unwrap();
         assert!(failures.is_empty());
 
-        let result = run_scan_batch(&scans, &StdoutLogger, &AtomicBool::new(false)).await;
+        let result = run_scan_batch(&scans, &StdoutLogger, &Arc::new(AtomicBool::new(false))).await;
 
         assert_eq!(result.failures.len(), 2);
         assert!(!result.cancelled);
@@ -1633,12 +1711,14 @@ mod tests {
             lldp_complete: true,
         };
 
+        let logger = DeviceLogger::default();
         assert!(!apply_snmp_probe(
+            "Line A",
             &mut devices,
             &mut links,
             &mut unresolved,
             &mut warnings,
-            &StdoutLogger,
+            &logger,
             snmp::QuerySelection {
                 inventory: true,
                 lldp: false,
@@ -1648,6 +1728,7 @@ mod tests {
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].mac_address, "00:11:22:33:44:55");
         assert!(unresolved.is_empty());
+        assert_eq!(*logger.snapshots.lock().unwrap(), [("Line A".into(), 1)]);
     }
 
     #[tokio::test]
@@ -1674,18 +1755,21 @@ mod tests {
         let mut unresolved = vec![];
         let mut warnings = vec![];
 
+        let logger = DeviceLogger::default();
         assert!(apply_snmp_probe(
+            "Line A",
             &mut devices,
             &mut links,
             &mut unresolved,
             &mut warnings,
-            &StdoutLogger,
+            &logger,
             snmp::QuerySelection {
                 inventory: true,
                 lldp: false,
             },
             Some(Ok(("127.0.0.1".into(), vec![], Err(error)))),
         ));
+        assert!(logger.snapshots.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1722,14 +1806,46 @@ mod tests {
             opcua: protocols::OpcuaSettings::default(),
             upload: None,
         };
-        let cancelled = AtomicBool::new(true);
+        let cancelled = Arc::new(AtomicBool::new(true));
 
-        assert!(scan(&options, &StdoutLogger, &cancelled).await.unwrap());
+        assert!(
+            scan("Test", &options, &StdoutLogger, &cancelled)
+                .await
+                .unwrap()
+        );
         let export: ScanExport =
             serde_json::from_slice(&tokio::fs::read(&output).await.unwrap()).unwrap();
         tokio::fs::remove_file(output).await.unwrap();
 
         assert!(export.scan.partial);
+    }
+
+    #[tokio::test]
+    async fn scan_reports_device_snapshots_with_the_configuration_name() {
+        let output = std::env::temp_dir().join(format!("{}.json", Uuid::new_v4()));
+        let options = ScanOptions {
+            targets: vec!["192.0.2.1".into()],
+            interface: "test-interface".into(),
+            source_mac: "00:11:22:33:44:55".into(),
+            output: output.clone(),
+            protocols: ProtocolOptions::default(),
+            snmp: vec![snmp::Settings::default()],
+            opcua: protocols::OpcuaSettings::default(),
+            upload: None,
+        };
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let logger = DeviceLogger::default();
+
+        scan("Line A", &options, &logger, &cancelled).await.unwrap();
+        tokio::fs::remove_file(output).await.unwrap();
+
+        let snapshots = logger.snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert!(
+            snapshots
+                .iter()
+                .all(|(name, count)| name == "Line A" && *count == 0)
+        );
     }
 
     #[tokio::test]

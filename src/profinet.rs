@@ -443,25 +443,32 @@ pub fn scan(interface: &str, source_mac: &str, wait: Duration) -> Result<Vec<Dev
     address.sll_addr[..DCP_MULTICAST.len()].copy_from_slice(&DCP_MULTICAST);
     let request = identify_request(source, xid);
     let send_request = || {
-        // SAFETY: request and address remain valid for the duration of sendto.
-        let sent = unsafe {
-            libc::sendto(
-                descriptor.as_raw_fd(),
-                request.as_ptr().cast(),
-                request.len(),
-                0,
-                (&raw const address).cast(),
-                size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-            )
-        };
-        if sent == request.len() as isize {
-            Ok(())
-        } else {
-            Err(format!(
-                "Could not send complete PROFINET DCP request: {}",
-                io::Error::last_os_error()
-            ))
-        }
+        crate::discovery::send_with_retry(|| {
+            crate::traffic::send_blocking(crate::traffic::Kind::Other, || {
+                // SAFETY: request and address remain valid for the duration of sendto.
+                let sent = unsafe {
+                    libc::sendto(
+                        descriptor.as_raw_fd(),
+                        request.as_ptr().cast(),
+                        request.len(),
+                        0,
+                        (&raw const address).cast(),
+                        size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+                    )
+                };
+                if sent == request.len() as isize {
+                    Ok(())
+                } else if sent < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "short DCP frame send",
+                    ))
+                }
+            })
+        })
+        .map_err(|error| format!("Could not send complete PROFINET DCP request: {error}"))
     };
     send_request()?;
 
