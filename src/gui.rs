@@ -3,7 +3,7 @@ use crate::{
     nonempty_opt, prepare_scans, run_scan_batch, save_config_sync,
 };
 use eframe::egui;
-use otserver_otter::contract::{Device, normalize_mac};
+use otserver_otter::contract::Device;
 use otserver_otter::profinet::{self, CaptureInterface};
 use otserver_otter::protocols::{OpcuaCredential, OpcuaCredentials};
 use otserver_otter::snmp::{Credentials as SnmpCredentials, Settings as SnmpSettings};
@@ -45,13 +45,6 @@ fn bound_ip_addresses(interfaces: &[CaptureInterface], selected: &str) -> Vec<St
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn interface_mac(interface: &CaptureInterface) -> Option<String> {
-    interface
-        .addresses
-        .iter()
-        .find_map(|address| normalize_mac(address))
 }
 
 fn with_added_configuration(
@@ -359,7 +352,7 @@ impl GuiApp {
                 self.interfaces
                     .iter()
                     .find(|item| item.name == self.interface)
-                    .and_then(interface_mac)
+                    .and_then(profinet::interface_mac)
             })
             .unwrap_or_default();
         self.output = config
@@ -370,7 +363,7 @@ impl GuiApp {
 
         self.snmp_credentials = config
             .snmp
-            .map(|credentials| credentials.settings())
+            .map(|credentials| credentials.to_vec())
             .filter(|settings| !settings.is_empty())
             .unwrap_or_else(|| vec![SnmpSettings::default()]);
         self.selected_snmp = 0;
@@ -389,7 +382,7 @@ impl GuiApp {
         self.lldp_enabled = !config.no_lldp.unwrap_or(false);
         let mut opcua = config
             .opcua_credentials
-            .map(|credentials| credentials.credentials())
+            .map(|credentials| credentials.to_vec())
             .unwrap_or_default();
         if opcua.is_empty() && (config.opcua_username.is_some() || config.opcua_password.is_some())
         {
@@ -905,7 +898,7 @@ impl eframe::App for GuiApp {
                                         .interfaces
                                         .iter()
                                         .find(|iface| iface.name == selected)
-                                        .and_then(interface_mac)
+                                        .and_then(profinet::interface_mac)
                                     {
                                         self.source_mac = mac;
                                     }
@@ -955,7 +948,7 @@ impl eframe::App for GuiApp {
                         if ui.button("Auto-fill from Interface").clicked()
                             && let Some(iface) =
                                 self.interfaces.iter().find(|i| i.name == self.interface)
-                            && let Some(mac) = interface_mac(iface)
+                            && let Some(mac) = profinet::interface_mac(iface)
                         {
                             self.source_mac = mac;
                             self.save_config();
@@ -1545,13 +1538,13 @@ mod tests {
     use super::{
         GuiApp, MANUFACTURER_KEYS, MODEL_KEYS, OS_KEYS, OpcuaCredential, OpcuaCredentials,
         SnmpCredentials, SnmpSettings, asset_field, asset_protocols, asset_title,
-        bound_ip_addresses, interface_mac, json_value_text, merge_assets, opcua_credential_detail,
+        bound_ip_addresses, json_value_text, merge_assets, opcua_credential_detail,
         opcua_credential_label, snmp_credential_detail, snmp_version_label,
         with_added_configuration,
     };
     use crate::{ScannerConfig, ScannerConfigs};
     use otserver_otter::contract::{Device, Observation, Source};
-    use otserver_otter::profinet::CaptureInterface;
+    use otserver_otter::profinet::{CaptureInterface, interface_mac};
     use std::collections::BTreeMap;
 
     #[test]
@@ -1737,7 +1730,7 @@ mod tests {
         assert_eq!(app.snmp_credentials.len(), 2);
         assert_eq!(app.snmp_community, "first");
 
-        let settings = app.to_config().snmp.unwrap().settings();
+        let settings = app.to_config().snmp.unwrap().to_vec();
         assert_eq!(settings.len(), 2);
         assert_eq!(settings[0].community.as_deref(), Some("first"));
         assert_eq!(settings[1].username.as_deref(), Some("ops"));
@@ -1804,7 +1797,7 @@ mod tests {
             ["1. User first", "2. User second"]
         );
 
-        let credentials = app.to_config().opcua_credentials.unwrap().credentials();
+        let credentials = app.to_config().opcua_credentials.unwrap().to_vec();
         assert_eq!(credentials.len(), 2);
         assert_eq!(credentials[0].password.as_deref(), Some("first-password"));
         assert_eq!(credentials[1].username.as_deref(), Some("second"));
@@ -1823,7 +1816,7 @@ mod tests {
         let saved = app.to_config();
         assert!(saved.opcua_username.is_none());
         assert_eq!(
-            saved.opcua_credentials.unwrap().credentials()[0]
+            saved.opcua_credentials.unwrap().to_vec()[0]
                 .username
                 .as_deref(),
             Some("legacy")

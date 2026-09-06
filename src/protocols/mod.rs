@@ -1,6 +1,7 @@
-use crate::contract::{Observation, Port, Source};
+use crate::contract::{Observation, Port, Source, hex};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::net::Ipv4Addr;
 
 mod bacnet;
@@ -11,8 +12,7 @@ mod opcua;
 mod s7;
 
 pub use opcua::{
-    Credential as OpcuaCredential, Credentials as OpcuaCredentials,
-    DEFAULT_PORTS as OPCUA_DEFAULT_PORTS, ProbeSettings as OpcuaSettings,
+    Credential as OpcuaCredential, Credentials as OpcuaCredentials, ProbeSettings as OpcuaSettings,
 };
 
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -85,48 +85,12 @@ pub async fn scan(
         crate::traffic::wait().await;
     }
     let (s7, enip, bacnet, fins, fox, ua) = tokio::join!(
-        async {
-            if selection.s7 {
-                s7::probe(target).await
-            } else {
-                Ok(None)
-            }
-        },
-        async {
-            if selection.enip {
-                enip::probe(target).await
-            } else {
-                Ok(None)
-            }
-        },
-        async {
-            if selection.bacnet {
-                bacnet::probe(target).await
-            } else {
-                Ok(None)
-            }
-        },
-        async {
-            if selection.fins {
-                fins::probe(target).await
-            } else {
-                Ok(None)
-            }
-        },
-        async {
-            if selection.fox {
-                fox::probe(target).await
-            } else {
-                Ok(None)
-            }
-        },
-        async {
-            if selection.opcua {
-                opcua::probe(target, opcua).await
-            } else {
-                Ok(None)
-            }
-        },
+        probe_if(selection.s7, s7::probe(target)),
+        probe_if(selection.enip, enip::probe(target)),
+        probe_if(selection.bacnet, bacnet::probe(target)),
+        probe_if(selection.fins, fins::probe(target)),
+        probe_if(selection.fox, fox::probe(target)),
+        probe_if(selection.opcua, opcua::probe(target, opcua)),
     );
     let mut observations = Vec::new();
     let mut ports = Vec::new();
@@ -184,6 +148,13 @@ pub async fn scan(
     }
 }
 
+async fn probe_if(
+    enabled: bool,
+    probe: impl Future<Output = Result<Option<Finding>, String>>,
+) -> Result<Option<Finding>, String> {
+    if enabled { probe.await } else { Ok(None) }
+}
+
 fn port(protocol: &str, number: u16, source: Source, raw: Value) -> Port {
     Port {
         key: format!("{protocol}:{number}"),
@@ -204,10 +175,6 @@ fn text(bytes: &[u8]) -> Option<String> {
         .unwrap_or(bytes.len());
     let value = String::from_utf8_lossy(&bytes[..end]).trim().to_owned();
     (!value.is_empty()).then_some(value)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
 
 #[cfg(test)]

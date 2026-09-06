@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 pub mod contract;
 pub mod discovery;
 pub mod profinet;
@@ -6,6 +8,22 @@ pub mod snmp;
 pub mod traffic;
 
 pub const VERSION: &str = env!("OTTER_BUILD_VERSION");
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OneOrMany<T> {
+    Single(T),
+    Multiple(Vec<T>),
+}
+
+impl<T: Clone> OneOrMany<T> {
+    pub fn to_vec(&self) -> Vec<T> {
+        match self {
+            Self::Single(value) => vec![value.clone()],
+            Self::Multiple(values) => values.clone(),
+        }
+    }
+}
 
 #[cfg(test)]
 pub(crate) async fn network_test_lock() -> tokio::sync::MutexGuard<'static, ()> {

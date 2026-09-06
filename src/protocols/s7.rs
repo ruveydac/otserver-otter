@@ -23,34 +23,26 @@ const TSAP_PAIRS: [(u16, u16); 12] = [
     (0x0300, 0x0302),
     (0x0300, 0x0303),
 ];
-const SETUP: &[u8] = &hex_literal::<25>("0300001902F08032010000000000080000F0000001000101E0");
-const SZL_11: &[u8] =
-    &hex_literal::<33>("0300002102F080320700000000000800080001120411440100FF09000400110001");
-const SZL_1C: &[u8] =
-    &hex_literal::<33>("0300002102F080320700000000000800080001120411440100FF090004001C0001");
+// S7 Setup Communication request.
+const SETUP: &[u8] = &[
+    0x03, 0x00, 0x00, 0x19, 0x02, 0xf0, 0x80, 0x32, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00,
+    0x00, 0xf0, 0x00, 0x00, 0x01, 0x00, 0x01, 0x01, 0xe0,
+];
+// Read SZL 0x0011 (hardware identification) and 0x001C (component identification).
+const SZL_11: &[u8] = &[
+    0x03, 0x00, 0x00, 0x21, 0x02, 0xf0, 0x80, 0x32, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00,
+    0x08, 0x00, 0x01, 0x12, 0x04, 0x11, 0x44, 0x01, 0x00, 0xff, 0x09, 0x00, 0x04, 0x00, 0x11, 0x00,
+    0x01,
+];
+const SZL_1C: &[u8] = &[
+    0x03, 0x00, 0x00, 0x21, 0x02, 0xf0, 0x80, 0x32, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00,
+    0x08, 0x00, 0x01, 0x12, 0x04, 0x11, 0x44, 0x01, 0x00, 0xff, 0x09, 0x00, 0x04, 0x00, 0x1c, 0x00,
+    0x01,
+];
 #[cfg(not(test))]
 const CONNECT_PORT: u16 = 102;
 #[cfg(test)]
 const CONNECT_PORT: u16 = 10_102;
-
-const fn nibble(value: u8) -> u8 {
-    match value {
-        b'0'..=b'9' => value - b'0',
-        b'A'..=b'F' => value - b'A' + 10,
-        _ => 0,
-    }
-}
-
-const fn hex_literal<const N: usize>(value: &str) -> [u8; N] {
-    let bytes = value.as_bytes();
-    let mut output = [0; N];
-    let mut index = 0;
-    while index < N {
-        output[index] = nibble(bytes[index * 2]) << 4 | nibble(bytes[index * 2 + 1]);
-        index += 1;
-    }
-    output
-}
 
 pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
     // Real CPUs reject a connect request whose TSAP does not match a configured

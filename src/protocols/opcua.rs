@@ -48,35 +48,12 @@ pub struct Credential {
     pub password: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Credentials {
-    Single(Credential),
-    Multiple(Vec<Credential>),
-}
-
-impl Credentials {
-    pub fn credentials(&self) -> Vec<Credential> {
-        match self {
-            Self::Single(credential) => vec![credential.clone()],
-            Self::Multiple(credentials) => credentials.clone(),
-        }
-    }
-}
+pub type Credentials = crate::OneOrMany<Credential>;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProbeSettings {
     pub ports: Vec<u16>,
     pub credentials: Vec<Credential>,
-}
-
-impl ProbeSettings {
-    pub fn ports_or_default(ports: Option<Vec<u16>>) -> Vec<u16> {
-        match ports {
-            Some(ports) if !ports.is_empty() => ports,
-            _ => DEFAULT_PORTS.to_vec(),
-        }
-    }
 }
 
 fn build_client() -> Result<Client, String> {
@@ -865,16 +842,6 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[test]
-    fn resolves_ports_or_default() {
-        assert_eq!(ProbeSettings::ports_or_default(None), DEFAULT_PORTS);
-        assert_eq!(ProbeSettings::ports_or_default(Some(vec![])), DEFAULT_PORTS);
-        assert_eq!(
-            ProbeSettings::ports_or_default(Some(vec![4841])),
-            vec![4841]
-        );
-    }
-
-    #[test]
     fn converts_variants_to_json() {
         assert_eq!(variant_to_value(&Variant::Empty), Value::Null);
         assert_eq!(variant_to_value(&Variant::Boolean(true)), json!(true));
@@ -1526,7 +1493,7 @@ mod tests {
         let single: Credentials =
             serde_json::from_str(r#"{"username":"ops","password":"secret"}"#).unwrap();
         assert_eq!(
-            single.credentials(),
+            single.to_vec(),
             [Credential {
                 username: Some("ops".into()),
                 password: Some("secret".into()),
@@ -1534,7 +1501,7 @@ mod tests {
         );
         let multiple: Credentials =
             serde_json::from_str(r#"[{"username":"a"},{"username":"b","password":"p"}]"#).unwrap();
-        assert_eq!(multiple.credentials().len(), 2);
+        assert_eq!(multiple.to_vec().len(), 2);
         assert!(serde_json::from_str::<Credentials>(r#"{"unknown":true}"#).is_err());
         assert!(serde_json::to_value(&multiple).unwrap().is_array());
     }

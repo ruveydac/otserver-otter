@@ -1,5 +1,6 @@
 use crate::contract::{
-    Endpoint, NetworkInterface, Observation, Port, Source, TopologyLink, format_mac, normalize_mac,
+    Endpoint, NetworkInterface, Observation, Port, Source, TopologyLink, format_mac, hex,
+    normalize_mac,
 };
 use async_snmp::{
     Auth, AuthProtocol, Client, PrivProtocol, Retry, Transport, Value, VarBind, oid::Oid,
@@ -45,21 +46,7 @@ pub struct Settings {
     pub privacy_password: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Credentials {
-    Single(Settings),
-    Multiple(Vec<Settings>),
-}
-
-impl Credentials {
-    pub fn settings(&self) -> Vec<Settings> {
-        match self {
-            Self::Single(settings) => vec![settings.clone()],
-            Self::Multiple(settings) => settings.clone(),
-        }
-    }
-}
+pub type Credentials = crate::OneOrMany<Settings>;
 
 pub struct ResultData {
     pub identity_mac: Option<String>,
@@ -1576,12 +1563,7 @@ fn value_json(value: &Value) -> serde_json::Value {
     } else if let Some(oid) = value.as_oid() {
         json!(oid.to_string())
     } else if let Some(bytes) = value.as_bytes() {
-        json!(
-            bytes
-                .iter()
-                .map(|byte| format!("{byte:02X}"))
-                .collect::<String>()
-        )
+        json!(hex(bytes))
     } else {
         json!(format!("{value:?}"))
     }
@@ -1743,7 +1725,7 @@ mod tests {
         let single: Credentials =
             serde_json::from_str(r#"{"version":"2c","community":"public"}"#).unwrap();
         assert_eq!(
-            single.settings(),
+            single.to_vec(),
             [Settings {
                 version: Some("2c".into()),
                 community: Some("public".into()),
@@ -1753,7 +1735,7 @@ mod tests {
         let multiple: Credentials =
             serde_json::from_str(r#"[{"community":"first"},{"version":"3","username":"ops"}]"#)
                 .unwrap();
-        let settings = multiple.settings();
+        let settings = multiple.to_vec();
         assert_eq!(settings.len(), 2);
         assert_eq!(settings[0].community.as_deref(), Some("first"));
         assert_eq!(settings[1].username.as_deref(), Some("ops"));

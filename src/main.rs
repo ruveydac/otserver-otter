@@ -524,7 +524,7 @@ pub fn resolve_scan(
         snmp: config
             .snmp
             .as_ref()
-            .map(snmp::Credentials::settings)
+            .map(snmp::Credentials::to_vec)
             .filter(|settings| !settings.is_empty())
             .unwrap_or_else(|| vec![snmp::Settings::default()]),
         opcua,
@@ -542,7 +542,7 @@ fn opcua_probe_settings(config: &ScannerConfig) -> otserver_otter::protocols::Op
     let mut credentials = config
         .opcua_credentials
         .as_ref()
-        .map(|credentials| credentials.credentials())
+        .map(|credentials| credentials.to_vec())
         .unwrap_or_default();
     if credentials.is_empty()
         && let Some(username) = config_value(config.opcua_username.as_deref())
@@ -553,9 +553,8 @@ fn opcua_probe_settings(config: &ScannerConfig) -> otserver_otter::protocols::Op
         });
     }
     otserver_otter::protocols::OpcuaSettings {
-        ports: otserver_otter::protocols::OpcuaSettings::ports_or_default(
-            config.opcua_ports.clone(),
-        ),
+        // Empty means the probe falls back to its default ports.
+        ports: config.opcua_ports.clone().unwrap_or_default(),
         credentials,
     }
 }
@@ -1056,15 +1055,26 @@ async fn probe_protocols(
             (ip, mac, result)
         });
     }
+    drain_tasks(&mut tasks, cancelled, |result| {
+        apply_probe(configuration, devices, warnings, logger, result);
+    })
+    .await;
+}
+
+async fn drain_tasks<T: 'static>(
+    tasks: &mut tokio::task::JoinSet<T>,
+    cancelled: &AtomicBool,
+    mut apply: impl FnMut(Option<Result<T, tokio::task::JoinError>>),
+) {
     while !tasks.is_empty() {
         let result = tokio::select! {
             () = wait_for_cancellation(cancelled) => break,
             result = tasks.join_next() => result,
         };
-        apply_probe(configuration, devices, warnings, logger, result);
+        apply(result);
     }
     while let Some(result) = tasks.try_join_next() {
-        apply_probe(configuration, devices, warnings, logger, Some(result));
+        apply(Some(result));
     }
     tasks.abort_all();
 }
@@ -1116,11 +1126,7 @@ async fn probe_snmp(
             (ip, attempts, result)
         });
     }
-    while !tasks.is_empty() {
-        let result = tokio::select! {
-            () = wait_for_cancellation(cancelled) => break,
-            result = tasks.join_next() => result,
-        };
+    drain_tasks(&mut tasks, cancelled, |result| {
         failed |= apply_snmp_probe(
             configuration,
             devices,
@@ -1131,20 +1137,8 @@ async fn probe_snmp(
             selection,
             result,
         );
-    }
-    while let Some(result) = tasks.try_join_next() {
-        failed |= apply_snmp_probe(
-            configuration,
-            devices,
-            links,
-            unresolved,
-            warnings,
-            logger,
-            selection,
-            Some(result),
-        );
-    }
-    tasks.abort_all();
+    })
+    .await;
     failed
 }
 
@@ -1550,10 +1544,7 @@ mod tests {
         );
 
         let settings = opcua_probe_settings(&ScannerConfig::default());
-        assert_eq!(
-            settings.ports,
-            otserver_otter::protocols::OPCUA_DEFAULT_PORTS
-        );
+        assert!(settings.ports.is_empty());
         assert!(settings.credentials.is_empty());
     }
 
