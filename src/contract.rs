@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -220,6 +220,10 @@ pub fn format_mac(value: &[u8]) -> String {
         .join(":")
 }
 
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+}
+
 pub fn merge_devices(devices: Vec<Device>) -> Vec<Device> {
     let mut merged = BTreeMap::<String, Device>::new();
     for mut device in devices {
@@ -308,10 +312,6 @@ fn reject_secrets(value: &Value, path: &str) -> Result<(), String> {
         _ => {}
     }
     Ok(())
-}
-
-pub fn object(entries: impl IntoIterator<Item = (String, Value)>) -> Value {
-    Value::Object(Map::from_iter(entries))
 }
 
 #[cfg(test)]
@@ -433,7 +433,7 @@ mod tests {
 
         assert!(reject_secrets(&json!({ "nested": [{ "password": "secret" }] }), "").is_err());
         assert!(reject_secrets(&json!([1, "safe"]), "").is_ok());
-        assert_eq!(object([("value".into(), json!(1))])["value"], 1);
+        assert_eq!(hex(&[0xaa, 0x01]), "AA01");
     }
 
     #[test]

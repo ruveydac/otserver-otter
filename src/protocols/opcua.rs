@@ -24,7 +24,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 pub const DEFAULT_PORTS: [u16; 3] = [4840, 4841, 48_400];
@@ -46,35 +48,12 @@ pub struct Credential {
     pub password: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Credentials {
-    Single(Credential),
-    Multiple(Vec<Credential>),
-}
-
-impl Credentials {
-    pub fn credentials(&self) -> Vec<Credential> {
-        match self {
-            Self::Single(credential) => vec![credential.clone()],
-            Self::Multiple(credentials) => credentials.clone(),
-        }
-    }
-}
+pub type Credentials = crate::OneOrMany<Credential>;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProbeSettings {
     pub ports: Vec<u16>,
     pub credentials: Vec<Credential>,
-}
-
-impl ProbeSettings {
-    pub fn ports_or_default(ports: Option<Vec<u16>>) -> Vec<u16> {
-        match ports {
-            Some(ports) if !ports.is_empty() => ports,
-            _ => DEFAULT_PORTS.to_vec(),
-        }
-    }
 }
 
 fn build_client() -> Result<Client, String> {
@@ -117,10 +96,10 @@ async fn probe_port(
 
     // Slow presence check: GetEndpoints performs the HEL/ACK handshake, opens an unsecured
     // channel, and enumerates the endpoints with their user token policies.
-    let endpoints = match timeout(
-        ENDPOINTS_TIMEOUT,
-        client.get_endpoints(url.as_str(), &[], &[]),
-    )
+    let endpoints = match timeout(ENDPOINTS_TIMEOUT, async {
+        crate::traffic::wait().await;
+        client.get_endpoints(url.as_str(), &[], &[]).await
+    })
     .await
     {
         Ok(Ok(endpoints)) => endpoints,
@@ -215,34 +194,15 @@ async fn probe_port(
                     .into(),
             );
         }
-        let (session, event_loop) = match timeout(
-            SESSION_TIMEOUT,
-            client.connect_to_matching_endpoint(endpoint.clone(), identity),
-        )
-        .await
-        {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(error)) => {
-                warnings.push(format!("OPC UA session: {error}"));
-                continue;
+        match connect_session(client, endpoint.clone(), identity).await {
+            Ok(pair) => {
+                connected_pair = Some(pair);
+                break;
             }
-            Err(_) => {
-                warnings.push("OPC UA session establishment timed out.".into());
-                continue;
-            }
-        };
-        let handle = event_loop.spawn();
-        let connected = timeout(SESSION_TIMEOUT, session.wait_for_connection())
-            .await
-            .unwrap_or(false);
-        if connected {
-            connected_pair = Some((session, handle));
-            break;
+            Err(error) => warnings.push(error),
         }
-        warnings.push("OPC UA session could not be established.".into());
-        handle.abort();
     }
-    let Some((session, handle)) = connected_pair else {
+    let Some((session, mut event_loops)) = connected_pair else {
         return Ok(Some(finding(
             &url,
             port_number,
@@ -251,8 +211,6 @@ async fn probe_port(
             warnings,
         )));
     };
-    let abort_handle = handle.abort_handle();
-
     let mut fields = base_fields();
     match collect_assets(&session, &mut warnings).await {
         Ok((asset_fields, assets)) => {
@@ -264,10 +222,36 @@ async fn probe_port(
 
     let _ = timeout(Duration::from_secs(2), session.disconnect()).await;
     drop(session);
-    if timeout(Duration::from_secs(1), handle).await.is_err() {
-        abort_handle.abort();
-    }
+    let _ = timeout(Duration::from_secs(1), event_loops.join_next()).await;
     Ok(Some(finding(&url, port_number, fields, raw, warnings)))
+}
+
+async fn connect_session(
+    client: &mut Client,
+    endpoint: EndpointDescription,
+    identity: IdentityToken,
+) -> Result<(Arc<Session>, JoinSet<StatusCode>), String> {
+    let (session, event_loop) = client
+        .connect_to_endpoint_directly(endpoint, identity)
+        .map_err(|error| format!("OPC UA session: {error}"))?;
+    session.disable_reconnects();
+    // Keep abort-on-drop ownership while connecting and transfer it to the probe on success.
+    let mut event_loops = JoinSet::new();
+    let connected = timeout(SESSION_TIMEOUT, async {
+        crate::traffic::wait().await;
+        event_loops.spawn(event_loop.run());
+        tokio::select! {
+            connected = session.wait_for_connection() => connected,
+            _ = event_loops.join_next() => false,
+        }
+    })
+    .await
+    .unwrap_or(false);
+    if !connected {
+        event_loops.shutdown().await;
+        return Err("OPC UA session could not be established.".into());
+    }
+    Ok((session, event_loops))
 }
 
 fn endpoint_failure_finding(url: &str, port_number: u16, error: UaError) -> Option<Finding> {
@@ -333,10 +317,10 @@ async fn browse_children(session: &Session, node: &NodeId) -> Result<Vec<Referen
         node_class_mask: 0,
         result_mask: 63,
     };
-    let results = timeout(
-        SERVICE_TIMEOUT,
-        session.browse(&[description], MAX_CHILDREN, None),
-    )
+    let results = timeout(SERVICE_TIMEOUT, async {
+        crate::traffic::wait().await;
+        session.browse(&[description], MAX_CHILDREN, None).await
+    })
     .await
     .map_err(|_| "OPC UA browse timed out".to_string())?
     .map_err(|error| format!("OPC UA browse: {error}"))?;
@@ -372,10 +356,13 @@ async fn find_alias(
         method_id: method.clone(),
         input_arguments: Some(vec![Variant::String(UAString::from(""))]),
     };
-    let result = timeout(SERVICE_TIMEOUT, session.call_one(request))
-        .await
-        .map_err(|_| "OPC UA FindAlias timed out".to_string())?
-        .map_err(|error| format!("OPC UA FindAlias: {error}"))?;
+    let result = timeout(SERVICE_TIMEOUT, async {
+        crate::traffic::wait().await;
+        session.call_one(request).await
+    })
+    .await
+    .map_err(|_| "OPC UA FindAlias timed out".to_string())?
+    .map_err(|error| format!("OPC UA FindAlias: {error}"))?;
     if result.status_code.is_bad() {
         return Err(format!("OPC UA FindAlias failed: {}", result.status_code));
     }
@@ -548,10 +535,10 @@ async fn collect_asset(
             data_encoding: QualifiedName::null(),
         })
         .collect();
-    let values = timeout(
-        SERVICE_TIMEOUT,
-        session.read(&reads, TimestampsToReturn::Source, 0.0),
-    )
+    let values = timeout(SERVICE_TIMEOUT, async {
+        crate::traffic::wait().await;
+        session.read(&reads, TimestampsToReturn::Source, 0.0).await
+    })
     .await
     .map_err(|_| "OPC UA read timed out".to_string())?
     .map_err(|error| format!("OPC UA read: {error}"))?;
@@ -851,17 +838,8 @@ mod tests {
         AccessRestrictionType, Array, DataTypeId, ExpandedNodeId, LocalizedText,
         VariantScalarTypeId, argument::Argument,
     };
+    use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
-
-    #[test]
-    fn resolves_ports_or_default() {
-        assert_eq!(ProbeSettings::ports_or_default(None), DEFAULT_PORTS);
-        assert_eq!(ProbeSettings::ports_or_default(Some(vec![])), DEFAULT_PORTS);
-        assert_eq!(
-            ProbeSettings::ports_or_default(Some(vec![4841])),
-            vec![4841]
-        );
-    }
 
     #[test]
     fn converts_variants_to_json() {
@@ -983,7 +961,7 @@ mod tests {
 
     struct LabServer {
         port: u16,
-        _task: tokio::task::JoinHandle<()>,
+        _tasks: JoinSet<()>,
     }
 
     struct LabConfig {
@@ -1220,12 +1198,16 @@ mod tests {
                 });
         }
 
-        let task = tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
             let _ = server.run_with(listener).await;
         });
         // Give the server a moment to start accepting connections.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        LabServer { port, _task: task }
+        LabServer {
+            port,
+            _tasks: tasks,
+        }
     }
 
     fn settings_for(server: &LabServer) -> ProbeSettings {
@@ -1233,6 +1215,43 @@ mod tests {
             ports: vec![server.port],
             ..ProbeSettings::default()
         }
+    }
+
+    #[tokio::test]
+    async fn dropping_connection_attempt_closes_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("opc.tcp://{}", listener.local_addr().unwrap());
+        let endpoint = EndpointDescription::from((
+            url.as_str(),
+            "None",
+            MessageSecurityMode::None,
+            opcua::types::UserTokenPolicy::anonymous(),
+        ));
+        let mut client = build_client().unwrap();
+        let mut connecting = Box::pin(connect_session(
+            &mut client,
+            endpoint,
+            IdentityToken::Anonymous,
+        ));
+        let (mut socket, _) = tokio::select! {
+            _ = &mut connecting => panic!("silent peer unexpectedly established a session"),
+            accepted = timeout(Duration::from_secs(2), listener.accept()) => {
+                accepted.unwrap().unwrap()
+            }
+        };
+        let mut hello = [0; 1024];
+        assert!(
+            timeout(Duration::from_secs(1), socket.read(&mut hello))
+                .await
+                .unwrap()
+                .unwrap()
+                > 0
+        );
+        drop(connecting);
+        timeout(Duration::from_secs(1), socket.read_to_end(&mut Vec::new()))
+            .await
+            .expect("dropped connection attempt left its event loop running")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1253,18 +1272,24 @@ mod tests {
             MessageSecurityMode::None,
         )
         .unwrap();
-        let (session, event_loop) = client
-            .connect_to_matching_endpoint(endpoint, IdentityToken::Anonymous)
-            .await
-            .unwrap();
-        let handle = event_loop.spawn();
-        session.wait_for_connection().await;
+        let (session, event_loops) =
+            connect_session(&mut client, endpoint, IdentityToken::Anonymous)
+                .await
+                .unwrap();
         let nodes = find_alias(&session, &NodeId::new(2, 111), &NodeId::new(2, 121))
             .await
             .unwrap();
         assert_eq!(nodes, vec![NodeId::new(2, 300)]);
-        let _ = session.disconnect().await;
-        handle.abort();
+        let weak = Arc::downgrade(&session);
+        drop(session);
+        drop(event_loops);
+        timeout(Duration::from_secs(1), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped session owner left its event loop running");
     }
 
     #[tokio::test]
@@ -1468,7 +1493,7 @@ mod tests {
         let single: Credentials =
             serde_json::from_str(r#"{"username":"ops","password":"secret"}"#).unwrap();
         assert_eq!(
-            single.credentials(),
+            single.to_vec(),
             [Credential {
                 username: Some("ops".into()),
                 password: Some("secret".into()),
@@ -1476,7 +1501,7 @@ mod tests {
         );
         let multiple: Credentials =
             serde_json::from_str(r#"[{"username":"a"},{"username":"b","password":"p"}]"#).unwrap();
-        assert_eq!(multiple.credentials().len(), 2);
+        assert_eq!(multiple.to_vec().len(), 2);
         assert!(serde_json::from_str::<Credentials>(r#"{"unknown":true}"#).is_err());
         assert!(serde_json::to_value(&multiple).unwrap().is_array());
     }

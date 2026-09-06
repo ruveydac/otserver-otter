@@ -1,4 +1,4 @@
-use crate::contract::{Device, Observation, Source, format_mac, mac_bytes, normalize_mac, object};
+use crate::contract::{Device, Observation, Source, format_mac, hex, mac_bytes, normalize_mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -443,25 +443,32 @@ pub fn scan(interface: &str, source_mac: &str, wait: Duration) -> Result<Vec<Dev
     address.sll_addr[..DCP_MULTICAST.len()].copy_from_slice(&DCP_MULTICAST);
     let request = identify_request(source, xid);
     let send_request = || {
-        // SAFETY: request and address remain valid for the duration of sendto.
-        let sent = unsafe {
-            libc::sendto(
-                descriptor.as_raw_fd(),
-                request.as_ptr().cast(),
-                request.len(),
-                0,
-                (&raw const address).cast(),
-                size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-            )
-        };
-        if sent == request.len() as isize {
-            Ok(())
-        } else {
-            Err(format!(
-                "Could not send complete PROFINET DCP request: {}",
-                io::Error::last_os_error()
-            ))
-        }
+        crate::discovery::send_with_retry(|| {
+            crate::traffic::send_blocking(crate::traffic::Kind::Other, || {
+                // SAFETY: request and address remain valid for the duration of sendto.
+                let sent = unsafe {
+                    libc::sendto(
+                        descriptor.as_raw_fd(),
+                        request.as_ptr().cast(),
+                        request.len(),
+                        0,
+                        (&raw const address).cast(),
+                        size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+                    )
+                };
+                if sent == request.len() as isize {
+                    Ok(())
+                } else if sent < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "short DCP frame send",
+                    ))
+                }
+            })
+        })
+        .map_err(|error| format!("Could not send complete PROFINET DCP request: {error}"))
     };
     send_request()?;
 
@@ -781,7 +788,7 @@ pub fn parse_response(frame: &[u8], expected_xid: u32) -> Option<Device> {
             ip_address: ip,
             mac_address: Some(mac),
             fields,
-            raw: object(raw),
+            raw: Value::Object(raw.into_iter().collect()),
             warnings,
         }],
         interfaces: vec![],
@@ -837,8 +844,7 @@ fn windows_scan_interface(interface: &str) -> Result<CaptureInterface, String> {
     Ok(selected)
 }
 
-#[cfg(any(windows, test))]
-fn interface_mac(interface: &CaptureInterface) -> Option<String> {
+pub fn interface_mac(interface: &CaptureInterface) -> Option<String> {
     interface
         .addresses
         .iter()
@@ -874,9 +880,6 @@ fn is_obsolete_bridge(interface: &CaptureInterface) -> bool {
             .eq_ignore_ascii_case("Network Bridge")
 }
 
-fn hex(value: &[u8]) -> String {
-    value.iter().map(|byte| format!("{byte:02X}")).collect()
-}
 fn ipv4(value: &[u8]) -> String {
     format!("{}.{}.{}.{}", value[0], value[1], value[2], value[3])
 }
@@ -890,14 +893,9 @@ fn insert_string(target: &mut BTreeMap<String, Value>, key: &str, value: &[u8]) 
     }
 }
 fn uuid(value: &[u8]) -> String {
-    format!(
-        "{}-{}-{}-{}-{}",
-        hex(&value[0..4]),
-        hex(&value[4..6]),
-        hex(&value[6..8]),
-        hex(&value[8..10]),
-        hex(&value[10..16]),
-    )
+    uuid::Uuid::from_slice(value)
+        .expect("sixteen-byte UUID")
+        .to_string()
 }
 
 #[cfg(test)]

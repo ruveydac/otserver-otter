@@ -45,12 +45,14 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
 
 async fn tcp(target: Ipv4Addr) -> Result<Option<Vec<u8>>, String> {
     let address = SocketAddr::new(IpAddr::V4(target), 44818);
+    crate::traffic::wait().await;
     let mut stream = match timeout(TIMEOUT, TcpStream::connect(address)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => return Ok(None),
         Ok(Err(error)) => return Err(error.to_string()),
         Err(_) => return Ok(None),
     };
+    crate::traffic::wait().await;
     timeout(TIMEOUT, stream.write_all(&LIST_IDENTITY))
         .await
         .map_err(|_| "write timed out".to_string())?
@@ -81,6 +83,7 @@ async fn udp(target: Ipv4Addr) -> Result<Option<Vec<u8>>, String> {
         .connect((target, 44818))
         .await
         .map_err(|error| error.to_string())?;
+    crate::traffic::wait().await;
     socket
         .send(&LIST_IDENTITY)
         .await

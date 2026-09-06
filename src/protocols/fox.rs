@@ -54,6 +54,7 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
 
 async fn exchange(target: Ipv4Addr, port: u16) -> Result<Option<(String, bool)>, String> {
     let address = SocketAddr::new(IpAddr::V4(target), port);
+    crate::traffic::wait().await;
     let mut stream = match timeout(TIMEOUT, TcpStream::connect(address)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => return Ok(None),
@@ -66,6 +67,7 @@ async fn exchange(target: Ipv4Addr, port: u16) -> Result<Option<(String, bool)>,
         return Ok(Some((response, false)));
     }
 
+    crate::traffic::wait().await;
     let stream = match timeout(TIMEOUT, TcpStream::connect(address)).await {
         Ok(Ok(stream)) => stream,
         _ => return Ok(None),
@@ -75,6 +77,7 @@ async fn exchange(target: Ipv4Addr, port: u16) -> Result<Option<(String, bool)>,
         .danger_accept_invalid_hostnames(true)
         .build()
         .map_err(|error| error.to_string())?;
+    crate::traffic::wait().await;
     let mut stream = match timeout(
         TIMEOUT,
         TlsConnector::from(connector).connect(&target.to_string(), stream),
@@ -89,6 +92,7 @@ async fn exchange(target: Ipv4Addr, port: u16) -> Result<Option<(String, bool)>,
 }
 
 async fn request(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> Result<String, String> {
+    crate::traffic::wait().await;
     timeout(TIMEOUT, stream.write_all(HELLO))
         .await
         .map_err(|_| "Fox write timed out".to_string())?
@@ -194,6 +198,27 @@ mod tests {
         assert_eq!(finding.fields["name"], "station-1");
         assert_eq!(finding.ports.len(), 1);
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retries_with_tls_after_plain_hello_is_rejected() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut hello = [0; HELLO.len()];
+            stream.read_exact(&mut hello).await.unwrap();
+            assert_eq!(hello, HELLO);
+            drop(stream);
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut tls_header = [0; 6];
+            stream.read_exact(&mut tls_header).await.unwrap();
+            assert_eq!(&tls_header[..2], &[0x16, 0x03]);
+            assert_eq!(tls_header[5], 1); // ClientHello
+        });
+        assert!(exchange(Ipv4Addr::LOCALHOST, port).await.unwrap().is_none());
+        timeout(TIMEOUT, responder).await.unwrap().unwrap();
     }
 
     #[tokio::test]

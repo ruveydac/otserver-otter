@@ -12,6 +12,7 @@ use windows_sys::Win32::Foundation::{
     FreeLibrary, GetLastError, HANDLE, HMODULE, SetLastError, WAIT_FAILED, WAIT_OBJECT_0,
     WAIT_TIMEOUT,
 };
+use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
@@ -69,32 +70,11 @@ const DCP_FILTER: [BpfInsn; 4] = [
 
 enum Adapter {}
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct OverlappedOffsets {
-    offset: u32,
-    offset_high: u32,
-}
-
-#[repr(C)]
-union OverlappedOffset {
-    offsets: OverlappedOffsets,
-    pointer: *mut c_void,
-}
-
-#[repr(C)]
-struct Overlapped {
-    internal: usize,
-    internal_high: usize,
-    offset: OverlappedOffset,
-    event: *mut c_void,
-}
-
 /// Public PACKET structure from the Npcap SDK's Packet32.h.
 #[repr(C)]
 struct Packet {
     event: *mut c_void,
-    overlapped: Overlapped,
+    overlapped: OVERLAPPED,
     buffer: *mut c_void,
     length: u32,
     bytes_received: u32,
@@ -208,19 +188,25 @@ impl Api {
             return Err("Npcap PacketGetVersion returned a null pointer.".into());
         }
         // SAFETY: the non-null pointer follows PacketGetVersion's documented contract.
-        normalize_version(
-            unsafe { CStr::from_ptr(version) }
-                .to_string_lossy()
-                .as_ref(),
-        )
+        let version = unsafe { CStr::from_ptr(version) }.to_string_lossy();
+        let version = version.trim();
+        (!version.is_empty())
+            .then(|| version.to_string())
+            .ok_or_else(|| "Npcap PacketGetVersion returned an empty version.".into())
     }
 
     fn device_names(&self) -> Result<Vec<String>, String> {
         let mut size = 0_u32;
         // Npcap returns FALSE with ERROR_INSUFFICIENT_BUFFER for this successful size query.
         // SAFETY: a null first buffer is the documented size query for PacketGetAdapterNames.
-        let probe_result = unsafe { (self.get_adapter_names)(null_mut(), &mut size) };
-        let mut buffer = vec![0_i8; adapter_buffer_size(probe_result, size)?];
+        let _ = unsafe { (self.get_adapter_names)(null_mut(), &mut size) };
+        if size == 0 {
+            return Err(
+                "Npcap could not enumerate adapters. Verify that the Npcap service is running."
+                    .into(),
+            );
+        }
+        let mut buffer = vec![0_i8; size as usize];
         // SAFETY: buffer is writable for the in/out size supplied to PacketGetAdapterNames.
         if unsafe { (self.get_adapter_names)(buffer.as_mut_ptr(), &mut size) } == 0 {
             return Err("Npcap failed while reading its adapter list.".into());
@@ -359,7 +345,10 @@ pub fn capture(interface: &str, request: &[u8], wait: Duration) -> Result<Vec<Ve
         )
     };
     // SAFETY: adapter and packet remain valid; synchronous send completes before returning.
-    if unsafe { (api.send_packet)(adapter.handle, tx_packet.packet, 1) } == 0 {
+    if crate::traffic::send_blocking(crate::traffic::Kind::Other, || unsafe {
+        (api.send_packet)(adapter.handle, tx_packet.packet, 1)
+    }) == 0
+    {
         return Err(format!(
             "Npcap could not transmit DCP Identify on {interface}."
         ));
@@ -459,30 +448,10 @@ fn canonical_adapter_name(value: &str) -> String {
 }
 
 fn is_npcap_name(value: &str) -> bool {
-    let trimmed = value.trim();
-    let Some(guid) = trimmed.strip_prefix(r"\Device\NPF_") else {
-        return false;
-    };
-    let canonical = canonical_adapter_name(trimmed);
-    guid.starts_with('{')
-        && guid.ends_with('}')
-        && canonical.len() == 36
-        && [8, 13, 18, 23]
-            .into_iter()
-            .all(|index| canonical.as_bytes().get(index) == Some(&b'-'))
-        && canonical
-            .bytes()
-            .enumerate()
-            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
-}
-
-fn adapter_buffer_size(_: c_uchar, size: u32) -> Result<usize, String> {
-    if size == 0 {
-        return Err(
-            "Npcap could not enumerate adapters. Verify that the Npcap service is running.".into(),
-        );
-    }
-    Ok(size as usize)
+    value
+        .trim()
+        .strip_prefix(r"\Device\NPF_")
+        .is_some_and(|guid| uuid::Uuid::parse_str(guid).is_ok())
 }
 
 fn parse_multistring(buffer: &[i8]) -> Result<Vec<String>, String> {
@@ -555,15 +524,6 @@ fn wait_millis(duration: Duration) -> u32 {
     duration.as_millis().clamp(1, (u32::MAX - 1) as u128) as u32
 }
 
-fn normalize_version(version: &str) -> Result<String, String> {
-    let version = version.trim();
-    if version.is_empty() {
-        Err("Npcap PacketGetVersion returned an empty version.".into())
-    } else {
-        Ok(version.to_string())
-    }
-}
-
 fn npcap_error(context: &str, error: u32) -> String {
     if error == 0 {
         format!("{context}; Npcap did not provide a Windows error code.")
@@ -603,10 +563,7 @@ fn symbol_name(name: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        adapter_buffer_size, canonical_adapter_name, is_npcap_name, normalize_version,
-        parse_bpf_records, wait_millis,
-    };
+    use super::{canonical_adapter_name, is_npcap_name, parse_bpf_records, wait_millis};
     use std::time::Duration;
 
     #[test]
@@ -623,17 +580,6 @@ mod tests {
             r"\Device\NPF_{8D11417D-4D16-4D5B-9917-C30CF60DF212}"
         ));
         assert!(!is_npcap_name("{8D11417D-4D16-4D5B-9917-C30CF60DF212}"));
-    }
-
-    #[test]
-    fn accepts_npcap_failed_adapter_size_probe() {
-        assert_eq!(adapter_buffer_size(0, 4096).unwrap(), 4096);
-    }
-
-    #[test]
-    fn normalizes_runtime_version_and_rejects_empty_values() {
-        assert_eq!(normalize_version(" 1.88 \r\n").unwrap(), "1.88");
-        assert!(normalize_version("  ").is_err());
     }
 
     #[test]
