@@ -23,6 +23,10 @@ services:
       - "${OTSERVER_LAB_BIND_IP}:1911:1911/tcp"
       - "${OTSERVER_LAB_BIND_IP}:4911:4911/tcp"
 
+  dnp3:
+    ports:
+      - "${OTSERVER_LAB_BIND_IP}:20000:20000/tcp"
+
   opcua:
     ports:
       - "${OTSERVER_LAB_BIND_IP}:4840:4840/tcp"

@@ -5,6 +5,7 @@ use std::future::Future;
 use std::net::Ipv4Addr;
 
 mod bacnet;
+mod dnp3;
 mod enip;
 mod fins;
 mod fox;
@@ -31,12 +32,13 @@ pub struct Selection {
     pub bacnet: bool,
     pub fins: bool,
     pub fox: bool,
+    pub dnp3: bool,
     pub opcua: bool,
 }
 
 impl Selection {
     pub fn any(self) -> bool {
-        self.s7 || self.enip || self.bacnet || self.fins || self.fox || self.opcua
+        self.s7 || self.enip || self.bacnet || self.fins || self.fox || self.dnp3 || self.opcua
     }
 
     pub fn labels(self) -> Vec<&'static str> {
@@ -46,6 +48,7 @@ impl Selection {
             (self.bacnet, "BACnet"),
             (self.fins, "FINS"),
             (self.fox, "Fox"),
+            (self.dnp3, "DNP3"),
             (self.opcua, "OPC UA"),
         ]
         .into_iter()
@@ -62,6 +65,7 @@ impl Default for Selection {
             bacnet: true,
             fins: true,
             fox: true,
+            dnp3: true,
             opcua: true,
         }
     }
@@ -84,12 +88,13 @@ pub async fn scan(
     if selection.any() {
         crate::traffic::wait().await;
     }
-    let (s7, enip, bacnet, fins, fox, ua) = tokio::join!(
+    let (s7, enip, bacnet, fins, fox, dnp3, ua) = tokio::join!(
         probe_if(selection.s7, s7::probe(target)),
         probe_if(selection.enip, enip::probe(target)),
         probe_if(selection.bacnet, bacnet::probe(target)),
         probe_if(selection.fins, fins::probe(target)),
         probe_if(selection.fox, fox::probe(target)),
+        probe_if(selection.dnp3, dnp3::probe(target)),
         probe_if(selection.opcua, opcua::probe(target, opcua)),
     );
     let mut observations = Vec::new();
@@ -102,6 +107,7 @@ pub async fn scan(
         (selection.bacnet, Source::Bacnet, bacnet),
         (selection.fins, Source::OmronFins, fins),
         (selection.fox, Source::NiagaraFox, fox),
+        (selection.dnp3, Source::Dnp3, dnp3),
         (selection.opcua, Source::OpcUa, ua),
     ];
     for (enabled, source, result) in results {
@@ -195,7 +201,7 @@ mod tests {
         .await;
         assert!(result.observations.is_empty());
         assert!(result.ports.is_empty());
-        assert_eq!(result.outcomes.len(), 6);
+        assert_eq!(result.outcomes.len(), 7);
         assert!(result.outcomes.iter().all(|(_, success)| !success));
         assert!(text(b"  value\0ignored").as_deref() == Some("value"));
         assert_eq!(text(b" \0"), None);
@@ -210,6 +216,7 @@ mod tests {
             bacnet: false,
             fins: false,
             fox: false,
+            dnp3: false,
             opcua: false,
         };
         assert!(!selection.any());
