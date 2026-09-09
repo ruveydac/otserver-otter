@@ -7,17 +7,17 @@ contract, or safety boundary.
 
 OTserver Otter is a read-only Rust discovery CLI and GUI for Windows and Linux. It discovers OT
 assets with native ARP, PROFINET DCP Identify, S7 identity, EtherNet/IP List Identity, BACnet
-ReadProperty, Omron FINS identity, Niagara Fox hello, OPC UA asset discovery, SNMP GET/WALK, and
-LLDP. It exports `otserver-scan` schema-version-2 JSON for OTserver.
+ReadProperty, Omron FINS identity, Niagara Fox hello, DNP3 Group 0 device attributes, OPC UA asset
+discovery, SNMP GET/WALK, and LLDP. It exports `otserver-scan` schema-version-2 JSON for OTserver.
 
 The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
 
 ## Safety Rules
 
 - Require `--ack-authorized` for every scan.
-- Keep discovery read-only. Do not add configuration writes, DCP Set, SNMP SET, brute force,
-  exploits, vulnerability scripts, or Modbus requests without an explicit product decision and
-  safety review.
+- Keep discovery read-only. Do not add configuration writes, DCP Set, SNMP SET, DNP3 writes,
+  operates, class assignment, freezes, or restarts, brute force, exploits, vulnerability scripts, or
+  Modbus requests without an explicit product decision and safety review.
 - Keep protocol framing and parsing in `src/protocols/` or the existing dedicated modules. Reject
   truncated, oversized, mismatched, or unsolicited responses.
 - Active DCP must verify that its source MAC belongs to the selected physical interface. Send

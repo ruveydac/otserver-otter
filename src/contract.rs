@@ -86,6 +86,7 @@ pub struct Observation {
 pub enum Source {
     Arp,
     Bacnet,
+    Dnp3,
     EthernetIp,
     Lldp,
     NiagaraFox,
@@ -103,6 +104,7 @@ impl Source {
         match self {
             Self::Arp => "arp",
             Self::Bacnet => "bacnet",
+            Self::Dnp3 => "dnp3",
             Self::EthernetIp => "ethernet-ip",
             Self::Lldp => "lldp",
             Self::NiagaraFox => "niagara-fox",
@@ -441,6 +443,7 @@ mod tests {
         let labels = [
             Source::Arp,
             Source::Bacnet,
+            Source::Dnp3,
             Source::EthernetIp,
             Source::Lldp,
             Source::NiagaraFox,
@@ -454,8 +457,9 @@ mod tests {
         ]
         .map(Source::label);
         assert_eq!(labels[0], "arp");
-        assert_eq!(labels[6], "opc-ua");
-        assert_eq!(labels[11], "unknown");
+        assert_eq!(labels[2], "dnp3");
+        assert_eq!(labels[7], "opc-ua");
+        assert_eq!(labels[12], "unknown");
         let devices = merge_devices(vec![
             Device {
                 mac_address: "invalid".into(),

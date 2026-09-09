@@ -4,7 +4,7 @@
 
 ### Read-only OT discovery for the [OTserver inventory](https://github.com/ruveydac/OTserver)
 
-Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Fox · OPC UA · SNMP · LLDP
+Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Fox · DNP3 · OPC UA · SNMP · LLDP
 
 [![Website](https://img.shields.io/badge/otserver.org-111111?logo=firefoxbrowser&logoColor=white)](https://otserver.org)
 [![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
@@ -20,10 +20,10 @@ Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Fox · OPC 
 
 OTserver Otter is a cross-platform Rust CLI (with an optional GUI) built specifically for identifying
 industrial devices through fixed, read-only protocol requests. It discovers IPv4/MAC pairs with ARP
-and directly queries PROFINET DCP, S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, OPC UA, and
-optional SNMP/LLDP. It collects structured evidence and exports
-observations, interfaces, ports, and topology through the schema-version-2 `otserver-scan` contract
-understood directly by [OTserver](https://github.com/ruveydac/OTserver).
+and directly queries PROFINET DCP, S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, DNP3, OPC UA,
+and optional SNMP/LLDP. It collects structured evidence and exports observations, interfaces, ports,
+and topology through the schema-version-2 `otserver-scan` contract understood directly by
+[OTserver](https://github.com/ruveydac/OTserver).
 
 Windows uses native IP Helper for active ARP, Npcap for active PROFINET DCP, and Microsoft pktmon
 as a passive fallback. Linux uses native `AF_PACKET` raw sockets. No TAP adapter or Windows Network
@@ -133,8 +133,8 @@ Validate an export before uploading it:
 ## Protocols and safety
 
 The scanner sends PROFINET DCP Identify, read-only SNMP requests, and fixed read-only identity
-requests for S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, and OPC UA. It never runs SNMP SET,
-DCP Set, brute-force, exploit, vulnerability, or Modbus requests.
+requests for S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, DNP3, and OPC UA. It never runs SNMP
+SET, DCP Set, brute-force, exploit, vulnerability, or Modbus requests.
 
 Discovery uses process-wide pacing based on the supplied site ceilings of 50 ARP frames/s and
 500 packets/s, with 30% headroom:
@@ -161,8 +161,8 @@ capture. Otter does not change host QoS, neighbor tables, or network-device conf
 
 All discovery protocols are enabled by default. Disable individual protocols on the CLI with
 `--no-arp`, `--no-profinet`, `--no-s7`, `--no-enip`, `--no-bacnet`, `--no-fins`, `--no-fox`,
-`--no-opcua`, or `--no-snmp` and `--no-lldp`. SNMP inventory and LLDP topology queries share the
-same SNMP settings but can be enabled independently. The GUI exposes the same choices as
+`--no-dnp3`, `--no-opcua`, or `--no-snmp` and `--no-lldp`. SNMP inventory and LLDP topology queries
+share the same SNMP settings but can be enabled independently. The GUI exposes the same choices as
 highlighted on/off toggle buttons.
 
 Exit code `0` means every scan completed, `2` means at least one valid output contains partial
@@ -182,6 +182,15 @@ identities.
 OPC UA discovery connects to ports 4840, 4841, and 48400 by default (configurable via `opcuaPorts`).
 The scanner prefers anonymous authentication and reads only asset identification, health, and
 location variables; it never writes values or calls methods that modify server state.
+
+DNP3 (IEEE 1815) discovery connects to TCP port 20000 and sends one read-only cold start: a link
+reset followed by a Read of Object Group 0 Variation 0 device attributes with the "all objects"
+qualifier. Outstations silently drop frames addressed elsewhere, so the reset and read are pipelined
+for four common outstation and master address pairs and the pair that answers identifies the device.
+Reported attributes include software and hardware version, product name, manufacturer, serial
+number, user-assigned name, ID code, location, and DNP3 conformance level. Discovery never writes or
+operates points, assigns classes, freezes counters, restarts a device, or uses Secure Authentication;
+DNP3/UDP and TLS-wrapped DNP3 are not probed.
 
 ### GUI
 
@@ -248,6 +257,7 @@ single-object form remains supported:
   "noBacnet": false,
   "noFins": false,
   "noFox": false,
+  "noDnp3": false,
   "noOpcua": false,
   "opcuaPorts": [4840, 4841, 48400],
   "opcuaCredentials": [{ "username": "inventory", "password": "..." }],
@@ -349,7 +359,8 @@ scan.
 ## Virtual OT lab
 
 The Docker lab exercises the complete Linux scanner against deterministic virtual devices for ARP,
-PROFINET DCP, S7, EtherNet/IP, BACnet/IP, Omron FINS, Niagara Fox, OPC UA, SNMPv2c, SNMPv3, and LLDP:
+PROFINET DCP, S7, EtherNet/IP, BACnet/IP, Omron FINS, Niagara Fox, DNP3, OPC UA, SNMPv2c, SNMPv3, and
+LLDP:
 
 ```bash
 ./lab/test.sh
@@ -374,15 +385,15 @@ forwarded protocol responses belong to that one temporary identity; Docker's int
 MACs are not visible to the Windows host. The importable scan is deleted after validation and only a
 plain-text summary and Compose log are retained.
 
-This smoke test covers Windows ARP, S7, EtherNet/IP, BACnet, FINS, Fox, OPC UA, SNMP, and LLDP
+This smoke test covers Windows ARP, S7, EtherNet/IP, BACnet, FINS, Fox, DNP3, OPC UA, SNMP, and LLDP
 client paths. It does not verify distinct device MAC correlation. Docker Desktop also does not bridge
 raw Ethernet frames between its Linux bridge and a Windows capture driver, so the harness disables
 PROFINET DCP. Active Windows DCP and multi-device MAC discovery require physical Layer-2 test devices
 or a dedicated external Layer-2 test interface.
 
 Images use pinned Snap7 and SNMP Simulator packages plus checksum-pinned OpENer and BACnet Stack
-sources; the repository's small FINS and Fox responders implement only the fixed read-only identity
-requests sent by this scanner. The OPC UA responder uses the maintained asyncua (opcua-asyncio)
+sources; the repository's small FINS, Fox, and DNP3 responders implement only the fixed read-only
+identity requests sent by this scanner. The OPC UA responder uses the maintained asyncua (opcua-asyncio)
 Python stack.
 
 ## Development

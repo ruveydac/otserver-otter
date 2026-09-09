@@ -99,6 +99,7 @@
           "enum": [
             "arp",
             "bacnet",
+            "dnp3",
             "ethernet-ip",
             "lldp",
             "niagara-fox",

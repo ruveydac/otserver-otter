@@ -18,8 +18,9 @@ DEVICES = {
     "fins": "02:00:00:00:00:13",
     "fox": "02:00:00:00:00:14",
     "opcua": "02:00:00:00:00:15",
+    "dnp3": "02:00:00:00:00:16",
 }
-TARGETS = [f"172.30.0.{number}" for number in range(10, 16)]
+TARGETS = [f"172.30.0.{number}" for number in range(10, 17)]
 
 
 def run(*arguments: str) -> None:
@@ -168,6 +169,26 @@ def assert_full(result: dict) -> None:
     fox_ports = {value["key"]: value["raw"] for value in by_mac(result, DEVICES["fox"])["ports"]}
     assert fox_ports["tcp:1911"]["tls"] is False
     assert fox_ports["tcp:4911"]["tls"] is True
+
+    dnp3 = observation(by_mac(result, DEVICES["dnp3"]), "dnp3")
+    assert dnp3["fields"] | {
+        "name": "dnp3-outstation-1",
+        "model": "OT Lab RTU 3000",
+        "vendor": "OT Lab Automation",
+        "firmwareVersion": "4.2.1",
+        "serialNumber": "DNPLAB0001",
+        "location": "OT Lab / Cell 2",
+    } == dnp3["fields"]
+    assert dnp3["raw"]["outstationAddress"] == 1
+    assert dnp3["raw"]["masterAddress"] == 1
+    assert dnp3["raw"]["hardwareVersion"] == "rev C"
+    assert dnp3["raw"]["idCode"] == "OTLAB-DNP3-1"
+    assert dnp3["raw"]["conformance"] == 3
+    assert dnp3["raw"]["iin1"] == "02" and dnp3["raw"]["iin2"] == "00"
+    assert dnp3["raw"]["attributes"]["247"] == "dnp3-outstation-1"
+    assert dnp3["warnings"] == []
+    dnp3_ports = {value["key"] for value in by_mac(result, DEVICES["dnp3"])["ports"]}
+    assert "tcp:20000" in dnp3_ports
 
     opcua = observation(by_mac(result, DEVICES["opcua"]), "opc-ua")
     assert opcua["fields"] | {
