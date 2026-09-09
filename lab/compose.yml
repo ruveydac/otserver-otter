@@ -72,6 +72,16 @@ services:
         ipv4_address: 172.30.0.16
         mac_address: "02:00:00:00:00:16"
 
+  iec61850:
+    build:
+      context: .
+      dockerfile: devices/Dockerfile.iec61850
+    healthcheck: *process-health
+    networks:
+      ot_lab:
+        ipv4_address: 172.30.0.17
+        mac_address: "02:00:00:00:00:17"
+
   opcua:
     build:
       context: .
@@ -94,6 +104,7 @@ services:
       fins: { condition: service_healthy }
       fox: { condition: service_healthy }
       dnp3: { condition: service_healthy }
+      iec61850: { condition: service_healthy }
       opcua: { condition: service_healthy }
     volumes:
       - ./artifacts:/artifacts:Z

@@ -1,0 +1,35 @@
+FROM debian:bookworm-slim AS build
+
+ARG LIBIEC61850_COMMIT=f0f797bf955da763353f7081c892a1ff6b55e5a1
+ARG LIBIEC61850_SHA256=8c0094da5f55b11942ab1608b3fcebc545d6df66e1ce8622cd9e131f95608ab4
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates cmake curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+RUN curl --fail --silent --show-error --location \
+      "https://github.com/mz-automation/libiec61850/archive/${LIBIEC61850_COMMIT}.tar.gz" \
+      --output /tmp/libiec61850.tar.gz \
+    && echo "${LIBIEC61850_SHA256}  /tmp/libiec61850.tar.gz" | sha256sum --check \
+    && tar -xzf /tmp/libiec61850.tar.gz \
+    && mv "/src/libiec61850-${LIBIEC61850_COMMIT}" /src/libiec61850-1.6.2 \
+    && rm /tmp/libiec61850.tar.gz
+
+COPY devices/iec61850_lab_server.c /src/libiec61850-1.6.2/examples/server_example_dynamic/server_example_dynamic.c
+
+RUN cmake -S /src/libiec61850-1.6.2 -B /build \
+      -DBUILD_EXAMPLES=ON \
+      -DBUILD_TESTS=OFF \
+      -DCONFIG_IEC61850_L2_GOOSE=OFF \
+      -DCONFIG_IEC61850_L2_SMV=OFF \
+      -DCONFIG_IEC61850_R_GOOSE=OFF \
+      -DCONFIG_IEC61850_R_SMV=OFF \
+    && cmake --build /build --target server_example_dynamic --parallel \
+    && test -x /build/examples/server_example_dynamic/server_example_dynamic
+
+FROM debian:bookworm-slim
+
+COPY --from=build /build/examples/server_example_dynamic/server_example_dynamic /usr/local/bin/iec61850-lab-server
+
+ENTRYPOINT ["/usr/local/bin/iec61850-lab-server"]

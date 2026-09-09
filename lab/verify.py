@@ -19,8 +19,9 @@ DEVICES = {
     "fox": "02:00:00:00:00:14",
     "opcua": "02:00:00:00:00:15",
     "dnp3": "02:00:00:00:00:16",
+    "iec61850": "02:00:00:00:00:17",
 }
-TARGETS = [f"172.30.0.{number}" for number in range(10, 17)]
+TARGETS = [f"172.30.0.{number}" for number in range(10, 18)]
 
 
 def run(*arguments: str) -> None:
@@ -189,6 +190,35 @@ def assert_full(result: dict) -> None:
     assert dnp3["warnings"] == []
     dnp3_ports = {value["key"] for value in by_mac(result, DEVICES["dnp3"])["ports"]}
     assert "tcp:20000" in dnp3_ports
+
+    iec61850_device = by_mac(result, DEVICES["iec61850"])
+    iec61850 = observation(iec61850_device, "iec61850")
+    assert iec61850["fields"] | {
+        "name": "IEC 61850 Breaker IED",
+        "vendor": "OT Lab Automation",
+        "model": "IEC 61850 Breaker IED",
+        "serialNumber": "IEDLAB0001",
+        "firmwareVersion": "1.6.2",
+        "location": "OT Lab / Substation 1",
+        "health": True,
+        "physicalHealth": True,
+        "position": "off",
+        "blockedOpen": False,
+        "blockedClose": False,
+    } == iec61850["fields"]
+    assert iec61850["raw"]["logicalDevices"] == ["OTTERIEDLD0"]
+    logical_nodes = iec61850["raw"]["logicalNodes"]["OTTERIEDLD0"]
+    assert set(logical_nodes) == {"LLN0", "LPHD1", "XCBR1"}
+    assert "DC$PhyNam$vendor" in logical_nodes["LPHD1"]
+    assert "ST$Pos$stVal" in logical_nodes["XCBR1"]
+    assert iec61850["raw"]["values"]["OTTERIEDLD0/LPHD1.PhyNam.vendor[DC]"] == "OT Lab Automation"
+    assert iec61850["raw"]["values"]["OTTERIEDLD0/XCBR1.Pos.stVal[ST]"] == {
+        "padding": 6,
+        "data": "40",
+    }
+    assert not any("IEC 61850" in warning for warning in result["warnings"])
+    iec61850_ports = {value["key"] for value in iec61850_device["ports"]}
+    assert "tcp:102" in iec61850_ports
 
     opcua = observation(by_mac(result, DEVICES["opcua"]), "opc-ua")
     assert opcua["fields"] | {

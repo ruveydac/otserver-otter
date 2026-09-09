@@ -88,6 +88,7 @@ pub enum Source {
     Bacnet,
     Dnp3,
     EthernetIp,
+    Iec61850,
     Lldp,
     NiagaraFox,
     OmronFins,
@@ -106,6 +107,7 @@ impl Source {
             Self::Bacnet => "bacnet",
             Self::Dnp3 => "dnp3",
             Self::EthernetIp => "ethernet-ip",
+            Self::Iec61850 => "iec61850",
             Self::Lldp => "lldp",
             Self::NiagaraFox => "niagara-fox",
             Self::OmronFins => "omron-fins",
@@ -445,6 +447,7 @@ mod tests {
             Source::Bacnet,
             Source::Dnp3,
             Source::EthernetIp,
+            Source::Iec61850,
             Source::Lldp,
             Source::NiagaraFox,
             Source::OmronFins,
@@ -458,8 +461,8 @@ mod tests {
         .map(Source::label);
         assert_eq!(labels[0], "arp");
         assert_eq!(labels[2], "dnp3");
-        assert_eq!(labels[7], "opc-ua");
-        assert_eq!(labels[12], "unknown");
+        assert_eq!(labels[8], "opc-ua");
+        assert_eq!(labels[13], "unknown");
         let devices = merge_devices(vec![
             Device {
                 mac_address: "invalid".into(),

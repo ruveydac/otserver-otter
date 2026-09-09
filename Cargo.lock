@@ -2445,6 +2445,68 @@ dependencies = [
 ]
 
 [[package]]
+name = "iec61850-asn1"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e59e6f636fdcd3dec0142d3ae05c5ad57971915db4ebf911318ce8cf008d9b2"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "iec61850-client"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a28f41aafa1bf448495e7321e69a96aa72388397082d7d5c2cafa8ebc0c2ea33"
+dependencies = [
+ "bitflags 2.13.1",
+ "bytes",
+ "iec61850-hal",
+ "iec61850-mms",
+ "iec61850-model",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "iec61850-hal"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc162bae3c889fb675e1412bf1b1df1115f6f06c23fa893c9d1ec7628c11fcf8"
+dependencies = [
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
+name = "iec61850-mms"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6a0e59df45797ba73f66142ce28b18539ee7e6e4e7a2ca322a699196b0d8500"
+dependencies = [
+ "bytes",
+ "iec61850-asn1",
+ "iec61850-hal",
+ "iec61850-model",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "iec61850-model"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90b71f10f5cd3f60a62297231a3ced93c21ef9bb782ea76e3aa669cd5bfa164d"
+dependencies = [
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "image"
 version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3340,6 +3402,9 @@ dependencies = [
  "async-snmp",
  "clap",
  "eframe",
+ "iec61850-client",
+ "iec61850-mms",
+ "iec61850-model",
  "libc",
  "native-tls",
  "oui-data",

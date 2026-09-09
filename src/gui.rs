@@ -243,6 +243,7 @@ pub struct GuiApp {
     fins_enabled: bool,
     fox_enabled: bool,
     dnp3_enabled: bool,
+    iec61850_enabled: bool,
     opcua_enabled: bool,
     snmp_enabled: bool,
     lldp_enabled: bool,
@@ -306,6 +307,7 @@ impl GuiApp {
             fins_enabled: true,
             fox_enabled: true,
             dnp3_enabled: true,
+            iec61850_enabled: true,
             opcua_enabled: true,
             snmp_enabled: true,
             lldp_enabled: true,
@@ -380,6 +382,7 @@ impl GuiApp {
         self.fins_enabled = !(legacy_native_disabled || config.no_fins.unwrap_or(false));
         self.fox_enabled = !(legacy_native_disabled || config.no_fox.unwrap_or(false));
         self.dnp3_enabled = !(legacy_native_disabled || config.no_dnp3.unwrap_or(false));
+        self.iec61850_enabled = !(legacy_native_disabled || config.no_iec61850.unwrap_or(false));
         self.opcua_enabled = !(legacy_native_disabled || config.no_opcua.unwrap_or(false));
         self.snmp_enabled = !config.no_snmp.unwrap_or(false);
         self.lldp_enabled = !config.no_lldp.unwrap_or(false);
@@ -515,6 +518,7 @@ impl GuiApp {
         config.no_fins = (!self.fins_enabled).then_some(true);
         config.no_fox = (!self.fox_enabled).then_some(true);
         config.no_dnp3 = (!self.dnp3_enabled).then_some(true);
+        config.no_iec61850 = (!self.iec61850_enabled).then_some(true);
         config.no_opcua = (!self.opcua_enabled).then_some(true);
         config.no_snmp = (!self.snmp_enabled).then_some(true);
         config.no_lldp = (!self.lldp_enabled).then_some(true);
@@ -982,6 +986,9 @@ impl eframe::App for GuiApp {
                                 ui.toggle_value(&mut self.fox_enabled, "Fox").changed();
                             protocol_changed |=
                                 ui.toggle_value(&mut self.dnp3_enabled, "DNP3").changed();
+                            protocol_changed |= ui
+                                .toggle_value(&mut self.iec61850_enabled, "IEC 61850")
+                                .changed();
                             protocol_changed |= ui
                                 .toggle_value(&mut self.opcua_enabled, "OPC UA")
                                 .changed();
