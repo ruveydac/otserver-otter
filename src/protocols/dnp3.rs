@@ -534,7 +534,11 @@ mod tests {
         address: u16,
         replies: Vec<Vec<u8>>,
     ) {
-        while let Some(received) = read(&mut server).await.unwrap() {
+        let mut replied = false;
+        for _ in 0..ADDRESSES.len() * 2 {
+            let Some(received) = read(&mut server).await.unwrap() else {
+                return;
+            };
             if received.destination != address {
                 continue;
             }
@@ -542,11 +546,11 @@ mod tests {
                 .write_all(&frame(ACK, received.source, address, &[]))
                 .await
                 .unwrap();
-            if received.control & FUNCTION != RESET_LINK_STATES {
+            if received.control & FUNCTION != RESET_LINK_STATES && !replied {
                 for reply in &replies {
                     server.write_all(reply).await.unwrap();
                 }
-                return;
+                replied = true;
             }
         }
     }
