@@ -89,6 +89,8 @@ pub struct ScanArgs {
     #[arg(long)]
     pub no_dnp3: bool,
     #[arg(long)]
+    pub no_iec61850: bool,
+    #[arg(long)]
     pub no_opcua: bool,
     #[arg(long)]
     pub no_snmp: bool,
@@ -133,6 +135,8 @@ pub struct ScannerConfig {
     pub no_fox: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_dnp3: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_iec61850: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_opcua: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -271,6 +275,7 @@ pub struct ProtocolOptions {
     pub fins: bool,
     pub fox: bool,
     pub dnp3: bool,
+    pub iec61850: bool,
     pub opcua: bool,
     pub snmp: bool,
     pub lldp: bool,
@@ -287,6 +292,7 @@ impl Default for ProtocolOptions {
             fins: true,
             fox: true,
             dnp3: true,
+            iec61850: true,
             opcua: true,
             snmp: true,
             lldp: true,
@@ -486,6 +492,7 @@ pub fn resolve_scan(
         fins: !(no_native_protocols || args.no_fins || config.no_fins.unwrap_or(false)),
         fox: !(no_native_protocols || args.no_fox || config.no_fox.unwrap_or(false)),
         dnp3: !(no_native_protocols || args.no_dnp3 || config.no_dnp3.unwrap_or(false)),
+        iec61850: !(no_native_protocols || args.no_iec61850 || config.no_iec61850.unwrap_or(false)),
         opcua: !(no_native_protocols || args.no_opcua || config.no_opcua.unwrap_or(false)),
         snmp: !(args.no_snmp || config.no_snmp.unwrap_or(false)),
         lldp: !(args.no_lldp || config.no_lldp.unwrap_or(false)),
@@ -752,6 +759,7 @@ pub async fn scan(
         fins: options.protocols.fins,
         fox: options.protocols.fox,
         dnp3: options.protocols.dnp3,
+        iec61850: options.protocols.iec61850,
         opcua: options.protocols.opcua,
     };
     if native_selection.any() && !cancelled.load(Ordering::Relaxed) {
@@ -1340,6 +1348,7 @@ mod tests {
             no_fins: false,
             no_fox: false,
             no_dnp3: false,
+            no_iec61850: false,
             no_opcua: false,
             no_snmp: false,
             no_lldp: false,
@@ -1380,6 +1389,7 @@ mod tests {
         assert!(!resolved.protocols.fins);
         assert!(!resolved.protocols.fox);
         assert!(!resolved.protocols.dnp3);
+        assert!(!resolved.protocols.iec61850);
         assert!(!resolved.protocols.opcua);
         assert!(resolved.protocols.snmp);
         assert!(resolved.protocols.lldp);
@@ -1416,6 +1426,7 @@ mod tests {
             no_fins: None,
             no_fox: Some(true),
             no_dnp3: Some(true),
+            no_iec61850: Some(true),
             no_opcua: Some(true),
             no_snmp: Some(true),
             no_lldp: Some(true),
@@ -1619,6 +1630,7 @@ mod tests {
             "--no-fins",
             "--no-fox",
             "--no-dnp3",
+            "--no-iec61850",
             "--no-opcua",
             "--no-snmp",
             "--no-lldp",
@@ -1635,6 +1647,7 @@ mod tests {
         assert!(args.no_fins);
         assert!(args.no_fox);
         assert!(args.no_dnp3);
+        assert!(args.no_iec61850);
         assert!(args.no_opcua);
         assert!(args.no_snmp);
         assert!(args.no_lldp);

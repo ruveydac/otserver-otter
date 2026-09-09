@@ -101,6 +101,7 @@
             "bacnet",
             "dnp3",
             "ethernet-ip",
+            "iec61850",
             "lldp",
             "niagara-fox",
             "omron-fins",

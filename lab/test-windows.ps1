@@ -83,6 +83,7 @@ $services = @('siemens', 'ethernet_ip', 'bacnet', 'fins', 'fox', 'dnp3', 'opcua'
 Write-Host "Windows lab adapter: $($labAdapter.Name) ($interfaceId), $labAddress, $sourceMac"
 Write-Host 'This is a host-routed protocol smoke test. Docker responders share the host adapter MAC.'
 Write-Host 'PROFINET DCP is excluded: Docker Desktop does not bridge raw Ethernet DCP frames to Windows.'
+Write-Host 'IEC 61850 is excluded: its MMS port 102 is already host-bound by the S7 lab device.'
 
 try {
     & $DockerPath @composeArguments up --build --wait @services
@@ -127,7 +128,7 @@ try {
         "Adapter MAC: $sourceMac"
         "Observed protocols: $($sources -join ', ')"
         'The temporary scan represented one Docker host endpoint and was deleted; do not import it as asset data.'
-        'PROFINET DCP and distinct device MAC correlation were not tested.'
+        'PROFINET DCP, IEC 61850, and distinct device MAC correlation were not tested.'
     ) | Out-File -LiteralPath $summaryPath -Encoding utf8
     Write-Host "OTserver Otter Windows Docker protocol smoke test passed. Summary: $summaryPath"
 } finally {

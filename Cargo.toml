@@ -25,6 +25,9 @@ tokio-native-tls = "0.3"
 uuid = { version = "1", features = ["v4"] }
 eframe = { version = "0.29", optional = true }
 async-opcua = { version = "0.19", features = ["client"] }
+iec61850-client = { version = "0.2", default-features = false, features = ["std"] }
+iec61850-mms = { version = "0.2", default-features = false, features = ["std"] }
+iec61850-model = { version = "0.2", default-features = false, features = ["std"] }
 
 
 [target.'cfg(windows)'.dependencies]
@@ -48,3 +51,4 @@ winresource = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 async-opcua = { version = "0.19", features = ["server"] }
+iec61850-server = { version = "0.2", default-features = false, features = ["std", "full-server"] }

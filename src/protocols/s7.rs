@@ -87,12 +87,24 @@ async fn negotiate(stream: &mut TcpStream, request: &[u8]) -> Result<bool, Strin
 }
 
 async fn read_identity(mut stream: TcpStream, target: Ipv4Addr) -> Result<Option<Finding>, String> {
-    write(&mut stream, SETUP).await?;
-    if !setup_response(&read_frame(&mut stream).await?) {
+    // S7 and IEC 61850 MMS share port 102 and both speak COTP, so a peer that
+    // accepts the COTP connect but then drops or answers the S7 exchange with
+    // junk is simply not an S7 endpoint, not an error worth a warning.
+    if write(&mut stream, SETUP).await.is_err() {
         return Ok(None);
     }
-    let hardware = read_szl(&mut stream, SZL_11).await?;
-    let identity = read_szl(&mut stream, SZL_1C).await?;
+    let Ok(frame) = read_frame(&mut stream).await else {
+        return Ok(None);
+    };
+    if !setup_response(&frame) {
+        return Ok(None);
+    }
+    let Ok(hardware) = read_szl(&mut stream, SZL_11).await else {
+        return Ok(None);
+    };
+    let Ok(identity) = read_szl(&mut stream, SZL_1C).await else {
+        return Ok(None);
+    };
     parse(&hardware, &identity)
         .map(Some)
         .map_err(|error| format!("S7 {target}: {error}"))
@@ -493,6 +505,23 @@ mod tests {
         });
         let finding = probe(Ipv4Addr::LOCALHOST).await.unwrap().unwrap();
         assert_eq!(finding.fields["name"], "PLC1");
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cotp_peer_that_drops_the_s7_exchange_is_not_s7() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, CONNECT_PORT))
+            .await
+            .unwrap();
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_tpkt(&mut stream).await;
+            stream.write_all(&[3, 0, 0, 7, 2, 0xd0, 0]).await.unwrap();
+            stream.flush().await.unwrap();
+            // An MMS server accepts the COTP connect and then drops the S7 setup.
+        });
+        assert!(probe(Ipv4Addr::LOCALHOST).await.unwrap().is_none());
         responder.await.unwrap();
     }
 
