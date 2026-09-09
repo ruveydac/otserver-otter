@@ -2472,6 +2472,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "iec61850-goose"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a20a21750124bbde7e75e795d3a53d8ab8a9db49fdfe84d8f5d50b30c25ab5ec"
+dependencies = [
+ "bytes",
+ "iec61850-asn1",
+ "iec61850-hal",
+ "iec61850-model",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "iec61850-hal"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2503,6 +2517,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "90b71f10f5cd3f60a62297231a3ced93c21ef9bb782ea76e3aa669cd5bfa164d"
 dependencies = [
  "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "iec61850-server"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27dac75e5868ae82523505bf92a0581ad0540754800495a3e46ac13cebf291c8"
+dependencies = [
+ "bytes",
+ "iec61850-asn1",
+ "iec61850-goose",
+ "iec61850-mms",
+ "iec61850-model",
+ "thiserror 2.0.20",
+ "tokio",
  "tracing",
 ]
 
@@ -3405,6 +3435,7 @@ dependencies = [
  "iec61850-client",
  "iec61850-mms",
  "iec61850-model",
+ "iec61850-server",
  "libc",
  "native-tls",
  "oui-data",

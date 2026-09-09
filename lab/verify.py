@@ -198,13 +198,15 @@ def assert_full(result: dict) -> None:
         "vendor": "OT Lab Automation",
         "model": "IEC 61850 Breaker IED",
         "serialNumber": "IEDLAB0001",
+        "hardwareVersion": "HW-2",
         "firmwareVersion": "1.6.2",
         "location": "OT Lab / Substation 1",
-        "health": True,
+        "health": "ok",
         "physicalHealth": True,
         "position": "off",
         "blockedOpen": False,
         "blockedClose": False,
+        "operationCount": 42,
     } == iec61850["fields"]
     assert iec61850["raw"]["logicalDevices"] == ["OTTERIEDLD0"]
     logical_nodes = iec61850["raw"]["logicalNodes"]["OTTERIEDLD0"]
@@ -212,6 +214,9 @@ def assert_full(result: dict) -> None:
     assert "DC$PhyNam$vendor" in logical_nodes["LPHD1"]
     assert "ST$Pos$stVal" in logical_nodes["XCBR1"]
     assert iec61850["raw"]["values"]["OTTERIEDLD0/LPHD1.PhyNam.vendor[DC]"] == "OT Lab Automation"
+    assert iec61850["raw"]["values"]["OTTERIEDLD0/LLN0.Health.stVal[ST]"] == 1
+    assert iec61850["raw"]["values"]["OTTERIEDLD0/XCBR1.OpCnt.stVal[ST]"] == 42
+    assert iec61850["warnings"] == []
     assert iec61850["raw"]["values"]["OTTERIEDLD0/XCBR1.Pos.stVal[ST]"] == {
         "padding": 6,
         "data": "40",

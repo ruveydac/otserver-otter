@@ -86,7 +86,12 @@ services:
     build:
       context: .
       dockerfile: devices/Dockerfile.opcua
-    healthcheck: *process-health
+    # asyncua needs several seconds to bind 4840; wait for the socket, not just the process.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 4840), 2).close()"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
     networks:
       ot_lab:
         ipv4_address: 172.30.0.15

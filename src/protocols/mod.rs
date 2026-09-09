@@ -106,7 +106,7 @@ pub async fn scan(
         probe_if(selection.fins, fins::probe(target)),
         probe_if(selection.fox, fox::probe(target)),
         probe_if(selection.dnp3, dnp3::probe(target)),
-        probe_if(selection.iec61850, iec61850::probe(target)),
+        probe_if(selection.iec61850, iec61850::probe(target, iec61850::PORT)),
         probe_if(selection.opcua, opcua::probe(target, opcua)),
     );
     let mut observations = Vec::new();

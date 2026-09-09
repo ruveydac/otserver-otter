@@ -193,8 +193,8 @@ operates points, assigns classes, freezes counters, restarts a device, or uses S
 DNP3/UDP and TLS-wrapped DNP3 are not probed.
 
 IEC 61850 discovery connects to MMS/TCP port 102, browses the logical-device model, and reads only
-advertised identity, health, breaker-position, and blocking attributes. It does not access control,
-report, setting-group, file, or write services.
+advertised identity, health, breaker-position, blocking, and operation-count attributes. It does not
+access control, report, setting-group, file, or write services.
 
 ### GUI
 
