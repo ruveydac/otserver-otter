@@ -15,6 +15,10 @@ The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
 ## Safety Rules
 
 - Require `--ack-authorized` for every scan.
+- Refresh the selected interface's current source MAC at scan start in the shared CLI/GUI path;
+  log stale configured MACs and export the actual sender MAC. With ARP enabled, native protocols,
+  SNMP, and LLDP use discovered, unambiguous MAC/IP pairs. Only explicit ARP disablement enables
+  IP probing independently of Layer-2 discovery; never substitute a gateway MAC for a routed target.
 - Keep discovery read-only. Do not add configuration writes, DCP Set, SNMP SET, DNP3 writes,
   operates, class assignment, freezes, or restarts, brute force, exploits, vulnerability scripts, or
   Modbus requests without an explicit product decision and safety review.

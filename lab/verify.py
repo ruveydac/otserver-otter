@@ -98,6 +98,7 @@ def assert_full(result: dict) -> None:
     s7 = observation(siemens, "s7")
     assert s7["fields"]["vendor"] == "Siemens"
     assert s7["fields"]["model"] and s7["fields"]["firmwareVersion"]
+    assert s7["raw"]["accessPath"]["destinationTsap"]
 
     snmp = observation(siemens, "snmp")
     assert snmp["fields"] | {
@@ -112,6 +113,7 @@ def assert_full(result: dict) -> None:
     assert interface["speed"] == 1_000_000_000
     assert interface["adminStatus"] == interface["operStatus"] == "up"
     assert snmp["raw"]["1.0.62439.1.1.1.1.2.1"] == "00112233445566778899AABBCCDDEEFF"
+    assert snmp["raw"]["physicalEntities"][0]["serialClaim"]["original"] == "S7LAB0001"
     lldp_port = next(value for value in siemens["ports"] if value["key"] == "lldpPort:1")
     assert lldp_port["vlans"] == [1]
     assert lldp_port["raw"]["lldpDot3"]["maxFrameSize"] == 1500
@@ -135,6 +137,8 @@ def assert_full(result: dict) -> None:
         "firmwareVersion": "2.3",
         "serialNumber": "075BCD15",
     } == ethernet_ip["fields"]
+    assert ethernet_ip["raw"]["serialClaim"]["scope"] == "adapter"
+    assert len(ethernet_ip["raw"]["transportResponses"]) == 2
     enip_ports = {
         (value["key"], value["source"])
         for value in by_mac(result, DEVICES["ethernet_ip"])["ports"]

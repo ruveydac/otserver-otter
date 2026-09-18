@@ -34,7 +34,8 @@ Bridge is used or modified.
 - **Native protocol identity** — Fixed queries designed to retrieve device identity without
   configuration changes, vulnerability scripts, or exploit behavior.
 - **Evidence-preserving output** — Per-protocol observations and raw source data alongside
-  normalized devices, instead of collapsing a scan into one guessed record.
+  normalized devices, instead of collapsing a scan into one guessed record. Native observations
+  include scan-local IDs, explicit subjects, serial scope, and listening endpoints.
 - **Topology-aware collection** — LLDP, SNMP, and PROFINET link evidence, network interfaces, and
   ports in a validated JSON export.
 - **Quality-aware by design** — Each observation reaches the importer with its source quality, so
@@ -110,10 +111,14 @@ GUID, transmits DCP Identify, and captures only PROFINET Ethernet frames. Npcap'
 up to five installations but not redistribution; larger or bundled deployments require an appropriate
 Npcap OEM license.
 
-Active DCP verifies that the configured source MAC belongs to the selected physical interface before
+Active DCP verifies that the sender MAC belongs to the selected physical interface before
 opening the selected Npcap adapter. Identify-All is sent once with an engineering-tool response
 delay factor so device replies are spread over the capture window instead of creating a synchronized
 response burst.
+
+At scan start, both the CLI and GUI read the selected interface's current MAC for ARP and DCP.
+If `sourceMac` is stale (for example, after Wi-Fi MAC randomization), the scanner logs the replacement
+and uses the current MAC in requests and scan metadata.
 
 The Windows executable exposes its build Git tag in Explorer file properties and in the GUI.
 Starting the GUI detaches its console window; CLI commands keep normal terminal input and output.
@@ -174,10 +179,19 @@ SNMP uses bounded, read-only queries covering MIB-II (RFC 1213) system and inter
 LLDP-MIB topology (IEEE 802.1AB) with the LLDP-EXT-DOT1, LLDP-EXT-DOT3, and LLDP-EXT-PNO
 extensions (IEEE 802.1AB / IEC 61158-6-10), MRP media-redundancy monitoring (IEC 62439-2),
 IF-MIB/IP-MIB interfaces, ENTITY-MIB components, BRIDGE/Q-BRIDGE ports and VLANs, and the generic
-Siemens AUTOMATION-SYSTEM-MIB identity scalars. It probes configured IPv4 targets even when Layer 2
-discovery cannot see them, but creates an asset only after obtaining a valid MAC from an interface,
-bridge, or LLDP chassis identity. Forwarding-table MACs are port evidence only and never asset
-identities.
+Siemens AUTOMATION-SYSTEM-MIB identity scalars. With ARP explicitly disabled, it probes configured
+IPv4 targets even when Layer 2 discovery cannot see them, but creates an asset only after obtaining
+a valid MAC from an interface, bridge, or LLDP chassis identity. Forwarding-table MACs are port
+evidence only and never asset identities. ENTITY-MIB observations preserve every reported component, containment position,
+serial claim, and supported component-to-interface mapping; ENTITY and interface indexes remain
+observation-local references.
+
+With ARP enabled, native protocols, SNMP, and LLDP probe only discovered, unambiguous MAC/IP pairs
+from ARP or DCP. An unanswered target does not trigger a second IP-protocol sweep. To probe selected
+targets independently of ARP (for example, routed hosts), use `--no-arp` or turn off ARP in the GUI.
+MAC-less responses remain in `unresolved` and are never assigned a next-hop MAC.
+EtherNet/IP preserves each valid List Identity transport response, and S7 preserves the accepted
+TSAP access path and both identity SZL payloads.
 
 OPC UA discovery connects to ports 4840, 4841, and 48400 by default (configurable via `opcuaPorts`).
 The scanner prefers anonymous authentication and reads only asset identification, health, and

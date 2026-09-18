@@ -16,10 +16,16 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
     let (tcp, udp) = tokio::join!(tcp(target), udp(target));
     let mut responses = Vec::new();
     let mut ports = Vec::new();
+    let mut warnings = Vec::new();
     for (protocol, result) in [("tcp", tcp), ("udp", udp)] {
         match result {
             Ok(Some(response)) => {
-                responses.push(parse(&response)?);
+                match parse(&response) {
+                    Ok((fields, raw)) => responses.push((protocol, fields, raw)),
+                    Err(error) => {
+                        warnings.push(format!("EtherNet/IP {target} {protocol}: {error}"))
+                    }
+                }
                 ports.push(port(
                     protocol,
                     44818,
@@ -28,18 +34,47 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
                 ));
             }
             Ok(None) => {}
-            Err(error) => return Err(format!("EtherNet/IP {target}: {error}")),
+            Err(error) => warnings.push(format!("EtherNet/IP {target} {protocol}: {error}")),
         }
     }
-    let Some((fields, raw)) = responses.into_iter().next() else {
+    let Some((_, fields, mut raw)) = responses.first().cloned() else {
+        if let Some(error) = warnings.into_iter().next() {
+            return Err(error);
+        }
         return Ok(None);
     };
+    if let Value::Object(raw) = &mut raw {
+        raw.insert(
+            "transportResponses".into(),
+            responses
+                .into_iter()
+                .map(|(transport, _, identity)| {
+                    json!({
+                        "transport": transport,
+                        "identity": identity,
+                    })
+                })
+                .collect(),
+        );
+        raw.insert(
+            "serialClaim".into(),
+            json!({
+                "scope": "adapter",
+                "issuer": fields.get("vendor"),
+                "manufacturerId": raw.get("vendorId"),
+                "original": fields.get("serialNumber"),
+                "encoding": "cip-uint32-hex",
+                "catalogNumber": raw.get("productCode"),
+                "normalizationVersion": 1,
+            }),
+        );
+    }
     Ok(Some(Finding {
         source: Source::EthernetIp,
         fields,
         raw,
         ports,
-        warnings: vec![],
+        warnings,
     }))
 }
 
@@ -248,6 +283,11 @@ mod tests {
         let finding = probe(Ipv4Addr::LOCALHOST).await.unwrap().unwrap();
         assert_eq!(finding.fields["model"], "PLC1");
         assert_eq!(finding.ports.len(), 2);
+        assert_eq!(
+            finding.raw["transportResponses"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(finding.raw["serialClaim"]["scope"], "adapter");
         tcp_task.await.unwrap();
         udp_task.await.unwrap();
     }

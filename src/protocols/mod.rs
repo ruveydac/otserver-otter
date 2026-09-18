@@ -92,7 +92,7 @@ struct Finding {
 
 pub async fn scan(
     target: Ipv4Addr,
-    mac: &str,
+    mac: Option<&str>,
     selection: Selection,
     opcua: &opcua::ProbeSettings,
 ) -> ProbeResult {
@@ -137,19 +137,66 @@ pub async fn scan(
                 finding
                     .fields
                     .insert("lastSeen".into(), serde_json::json!(observed_at));
-                finding
-                    .fields
-                    .insert("macAddress".into(), serde_json::json!(mac));
+                if let Some(mac) = mac {
+                    finding
+                        .fields
+                        .insert("macAddress".into(), serde_json::json!(mac));
+                }
                 finding
                     .fields
                     .entry("status".into())
                     .or_insert_with(|| serde_json::json!("online"));
+                if let Value::Object(raw) = &mut finding.raw {
+                    raw.insert(
+                        "observationId".into(),
+                        serde_json::json!(uuid::Uuid::new_v4()),
+                    );
+                    raw.insert(
+                        "subject".into(),
+                        mac.map_or_else(
+                            || serde_json::json!({ "kind": "endpoint", "ipAddress": target }),
+                            |mac| serde_json::json!({ "kind": "device", "macAddress": mac }),
+                        ),
+                    );
+                    raw.insert(
+                        "listeners".into(),
+                        Value::Array(
+                            finding
+                                .ports
+                                .iter()
+                                .map(|port| {
+                                    let (transport, number) = port
+                                        .key
+                                        .split_once(':')
+                                        .unwrap_or((port.source.as_str(), ""));
+                                    serde_json::json!({
+                                        "address": target,
+                                        "transport": transport,
+                                        "port": number.parse::<u16>().ok(),
+                                        "route": [],
+                                    })
+                                })
+                                .collect(),
+                        ),
+                    );
+                    if let Some(serial) = finding.fields.get("serialNumber") {
+                        raw.entry("serialClaim").or_insert_with(|| {
+                            serde_json::json!({
+                                "scope": "device",
+                                "issuer": finding.fields.get("vendor"),
+                                "original": serial,
+                                "encoding": "protocol-text",
+                                "normalizationVersion": 1,
+                            })
+                        });
+                    }
+                }
                 ports.append(&mut finding.ports);
                 observations.push(Observation {
                     source: finding.source,
                     observed_at,
                     ip_address: Some(target.to_string()),
-                    mac_address: Some(mac.to_owned()),
+                    mac_address: mac.map(str::to_owned),
                     fields: finding.fields,
                     raw: finding.raw,
                     warnings: finding.warnings,
@@ -207,7 +254,7 @@ mod tests {
         let _network = crate::network_test_lock().await;
         let result = scan(
             Ipv4Addr::LOCALHOST,
-            "00:11:22:33:44:55",
+            Some("00:11:22:33:44:55"),
             Selection::default(),
             &opcua::ProbeSettings::default(),
         )
@@ -237,7 +284,7 @@ mod tests {
         assert!(selection.labels().is_empty());
         let result = scan(
             Ipv4Addr::LOCALHOST,
-            "00:11:22:33:44:55",
+            Some("00:11:22:33:44:55"),
             selection,
             &opcua::ProbeSettings::default(),
         )
@@ -271,13 +318,16 @@ mod tests {
         });
         let result = scan(
             Ipv4Addr::LOCALHOST,
-            "00:11:22:33:44:55",
+            None,
             Selection::default(),
             &opcua::ProbeSettings::default(),
         )
         .await;
         assert_eq!(result.observations.len(), 1);
         assert_eq!(result.observations[0].fields["name"], "station");
+        assert_eq!(result.observations[0].mac_address, None);
+        assert_eq!(result.observations[0].raw["subject"]["kind"], "endpoint");
+        assert_eq!(result.observations[0].raw["listeners"][0]["port"], 1911);
         assert_eq!(result.ports.len(), 1);
         let outcomes: std::collections::BTreeMap<Source, bool> =
             result.outcomes.iter().copied().collect();

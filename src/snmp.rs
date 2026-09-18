@@ -666,19 +666,74 @@ async fn query_inner(
                     .map(str::to_owned)
             };
             match column {
+                "2" => entity.description = text(),
                 "4" => entity.contained_in = item.value.as_i32(),
                 "5" => entity.class = item.value.as_i32(),
+                "7" => entity.name = text(),
                 "8" => entity.hardware = text(),
                 "9" => entity.firmware = text(),
                 "10" => entity.software = text(),
                 "11" => entity.serial = text(),
                 "12" => entity.vendor = text(),
                 "13" => entity.model = text(),
+                "14" => entity.alias = text(),
                 "15" => entity.asset_id = text(),
                 "17" => entity.manufactured_at = text(),
                 _ => {}
             }
         }
+        for column in ["3", "6", "16"] {
+            match collect_walk(&client, &format!("{entity_root}.{column}"), MAX_TABLE_ROWS).await {
+                Ok(values) => {
+                    for item in values {
+                        let key = item.oid.to_string();
+                        raw.insert(key.clone(), value_json(&item.value));
+                        let Some((_, index)) = table_cell(&key, entity_root) else {
+                            continue;
+                        };
+                        let entity = entities.entry(index).or_default();
+                        match column {
+                            "3" => {
+                                entity.vendor_type = item.value.as_oid().map(ToString::to_string)
+                            }
+                            "6" => entity.parent_position = item.value.as_i32(),
+                            "16" => entity.is_fru = item.value.as_i32().map(|value| value == 1),
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                Err(error) => warnings.push(format!(
+                    "SNMP ENTITY-MIB {target} optional column {column}: {error}"
+                )),
+            }
+        }
+        let alias_root = "1.3.6.1.2.1.47.1.3.2.1";
+        let mut interface_mappings = Vec::new();
+        match collect_walk(&client, &format!("{alias_root}.2"), MAX_TABLE_ROWS).await {
+            Ok(values) => {
+                for item in values {
+                    let key = item.oid.to_string();
+                    raw.insert(key.clone(), value_json(&item.value));
+                    if let Some((_, index)) = table_cell(&key, alias_root)
+                        && let Some((physical, logical)) = index.split_once('.')
+                        && let Some(if_index) = item
+                            .value
+                            .as_oid()
+                            .and_then(|oid| entity_alias_if_index(&oid.to_string()))
+                    {
+                        interface_mappings.push(json!({
+                            "componentRef": format!("entity:{physical}"),
+                            "interfaceKey": format!("ifIndex:{if_index}"),
+                            "entPhysicalIndex": physical,
+                            "entLogicalIndex": logical,
+                        }));
+                    }
+                }
+            }
+            Err(error) => warnings.push(format!("SNMP ENTITY-MIB {target} aliases: {error}")),
+        }
+        raw.insert("physicalEntities".into(), physical_entities_json(&entities));
+        raw.insert("entityInterfaceMappings".into(), interface_mappings.into());
         if let Some(entity) = preferred_entity(&entities) {
             for (field, value) in [
                 ("vendor", entity.vendor.as_ref()),
@@ -1311,8 +1366,14 @@ fn interface<'a>(
 
 #[derive(Default)]
 struct PhysicalEntity {
+    description: Option<String>,
     contained_in: Option<i32>,
     class: Option<i32>,
+    name: Option<String>,
+    alias: Option<String>,
+    vendor_type: Option<String>,
+    parent_position: Option<i32>,
+    is_fru: Option<bool>,
     hardware: Option<String>,
     firmware: Option<String>,
     software: Option<String>,
@@ -1321,6 +1382,63 @@ struct PhysicalEntity {
     model: Option<String>,
     asset_id: Option<String>,
     manufactured_at: Option<String>,
+}
+
+fn physical_entities_json(entities: &BTreeMap<String, PhysicalEntity>) -> serde_json::Value {
+    entities
+        .iter()
+        .map(|(index, entity)| {
+            let class = entity.class.map(entity_class);
+            json!({
+                "ref": format!("entity:{index}"),
+                "entPhysicalIndex": index,
+                "parentRef": entity.contained_in.filter(|parent| *parent != 0).map(|parent| format!("entity:{parent}")),
+                "parentPosition": entity.parent_position,
+                "class": class,
+                "description": entity.description,
+                "name": entity.name,
+                "alias": entity.alias,
+                "vendorType": entity.vendor_type,
+                "manufacturer": entity.vendor,
+                "catalogNumber": entity.model,
+                "hardwareRevision": entity.hardware,
+                "firmwareRevision": entity.firmware,
+                "softwareRevision": entity.software,
+                "assetId": entity.asset_id,
+                "manufacturedAt": entity.manufactured_at,
+                "isFru": entity.is_fru,
+                "serialClaim": entity.serial.as_ref().map(|serial| json!({
+                    "scope": class.unwrap_or("unknown"),
+                    "issuer": entity.vendor,
+                    "original": serial,
+                    "encoding": "snmp-display-string",
+                    "normalizationVersion": 1,
+                })),
+            })
+        })
+        .collect()
+}
+
+fn entity_class(value: i32) -> &'static str {
+    match value {
+        3 => "chassis",
+        4 => "backplane",
+        5 => "container",
+        6 => "power-supply",
+        7 => "fan",
+        8 => "sensor",
+        9 => "module",
+        10 => "port",
+        11 => "stack",
+        12 => "cpu",
+        _ => "unknown",
+    }
+}
+
+fn entity_alias_if_index(value: &str) -> Option<String> {
+    value
+        .strip_prefix("1.3.6.1.2.1.2.2.1.1.")
+        .map(str::to_owned)
 }
 
 fn preferred_entity(entities: &BTreeMap<String, PhysicalEntity>) -> Option<&PhysicalEntity> {
@@ -1967,12 +2085,19 @@ mod tests {
             ("1.3.6.1.2.1.17.7.1.4.5.1.1.7", Value::Integer(100)),
             ("1.3.6.1.2.1.31.1.1.1.1.1", string("port-1")),
             ("1.3.6.1.2.1.31.1.1.1.15.1", Value::Gauge32(1000)),
+            ("1.3.6.1.2.1.47.1.1.1.1.2.2", string("Main chassis")),
+            (
+                "1.3.6.1.2.1.47.1.1.1.1.3.2",
+                Value::ObjectIdentifier(Oid::parse("1.3.6.1.4.1.4329.1").unwrap()),
+            ),
             ("1.3.6.1.2.1.47.1.1.1.1.4.1", Value::Integer(3)),
             ("1.3.6.1.2.1.47.1.1.1.1.4.2", Value::Integer(3)),
             ("1.3.6.1.2.1.47.1.1.1.1.4.3", Value::Integer(0)),
             ("1.3.6.1.2.1.47.1.1.1.1.5.1", Value::Integer(6)),
             ("1.3.6.1.2.1.47.1.1.1.1.5.2", Value::Integer(3)),
             ("1.3.6.1.2.1.47.1.1.1.1.5.3", Value::Integer(11)),
+            ("1.3.6.1.2.1.47.1.1.1.1.6.2", Value::Integer(1)),
+            ("1.3.6.1.2.1.47.1.1.1.1.7.2", string("chassis-1")),
             ("1.3.6.1.2.1.47.1.1.1.1.9.3", string("FW8.1")),
             ("1.3.6.1.2.1.47.1.1.1.1.10.2", string("V8.0")),
             ("1.3.6.1.2.1.47.1.1.1.1.10.3", string("SW8.0")),
@@ -1981,6 +2106,12 @@ mod tests {
             ("1.3.6.1.2.1.47.1.1.1.1.13.1", string("Power supply")),
             ("1.3.6.1.2.1.47.1.1.1.1.13.2", string("SCALANCE X")),
             ("1.3.6.1.2.1.47.1.1.1.1.13.3", string("SCALANCE stack")),
+            ("1.3.6.1.2.1.47.1.1.1.1.14.2", string("cabinet-a")),
+            ("1.3.6.1.2.1.47.1.1.1.1.16.2", Value::Integer(1)),
+            (
+                "1.3.6.1.2.1.47.1.3.2.1.2.2.0",
+                Value::ObjectIdentifier(Oid::parse("1.3.6.1.2.1.2.2.1.1.1").unwrap()),
+            ),
             (
                 "1.3.6.1.4.1.4329.6.3.2.1.1.2.0",
                 string("6GK5008-0BA10-1AB2"),
@@ -2128,6 +2259,15 @@ mod tests {
             "lab-vlan"
         );
         assert_eq!(observation.raw["1.0.62439.1.1.1.1.1.1"], 1);
+        assert_eq!(observation.raw["physicalEntities"][1]["class"], "chassis");
+        assert_eq!(
+            observation.raw["physicalEntities"][1]["serialClaim"]["scope"],
+            "chassis"
+        );
+        assert_eq!(
+            observation.raw["entityInterfaceMappings"][0]["interfaceKey"],
+            "ifIndex:1"
+        );
         assert_eq!(
             observation.raw["1.0.62439.1.1.1.1.2.1"],
             "AB3C99510E74B268D0471B83F6255AC9"
