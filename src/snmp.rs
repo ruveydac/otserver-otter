@@ -1692,6 +1692,7 @@ mod tests {
     use super::*;
     use async_snmp::message::CommunityMessage;
     use async_snmp::{Oid, Pdu, PduType, VarBind};
+    use std::io::ErrorKind;
     use std::sync::{Arc, Mutex};
     use tokio::net::UdpSocket;
 
@@ -2133,7 +2134,11 @@ mod tests {
         let task = tokio::spawn(async move {
             let mut buffer = [0; 65_535];
             loop {
-                let (length, peer) = socket.recv_from(&mut buffer).await.unwrap();
+                let (length, peer) = match socket.recv_from(&mut buffer).await {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == ErrorKind::ConnectionReset => continue,
+                    Err(error) => panic!("SNMP test responder failed: {error}"),
+                };
                 let message = CommunityMessage::decode(buffer[..length].to_vec().into()).unwrap();
                 let request = message.pdu.standard().unwrap();
                 server_requests

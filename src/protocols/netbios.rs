@@ -129,7 +129,7 @@ fn parse(response: &[u8], transaction: [u8; 2]) -> Result<Finding, String> {
     let mut workstation = None;
     let mut server = None;
     let mut workgroup = None;
-    for entry in data[1..table_end].chunks_exact(18) {
+    for entry in data[1..table_end].as_chunks::<18>().0 {
         let name = text(&entry[..15]).filter(|name| !name.chars().any(char::is_control));
         let suffix = entry[15];
         let flags = u16::from_be_bytes([entry[16], entry[17]]);
@@ -195,7 +195,9 @@ mod tests {
         let query = request([0x12, 0x34]);
         assert_eq!(&query[..12], &[0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
         let decoded: Vec<u8> = query[13..45]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| ((pair[0] - b'A') << 4) | (pair[1] - b'A'))
             .collect();
         assert_eq!(decoded, b"*\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");

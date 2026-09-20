@@ -326,6 +326,7 @@ fn no_service(error: &ClientError) -> bool {
             let message = message.to_ascii_lowercase();
             [
                 "connection refused",
+                "os error 10061",
                 "connection reset",
                 "connect timeout",
                 "timed out",
@@ -535,6 +536,13 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         assert!(probe(Ipv4Addr::LOCALHOST, port).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn windows_refused_connection_is_absent_service() {
+        assert!(no_service(&ClientError::Mms(
+            "iso protocol error: TCP connect: target refused it (os error 10061)".into()
+        )));
     }
 
     #[test]
