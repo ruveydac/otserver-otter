@@ -4,7 +4,7 @@
 
 ### Read-only OT discovery for the [OTserver inventory](https://github.com/ruveydac/OTserver)
 
-Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Fox · DNP3 · IEC 61850 · OPC UA · SNMP · LLDP
+Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Fox · DNP3 · IEC 61850 · NetBIOS · OPC UA · SNMP · LLDP
 
 [![Website](https://img.shields.io/badge/otserver.org-111111?logo=firefoxbrowser&logoColor=white)](https://otserver.org)
 [![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
@@ -20,8 +20,8 @@ Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Fox · DNP3
 
 OTserver Otter is a cross-platform Rust CLI (with an optional GUI) built specifically for identifying
 industrial devices through fixed, read-only protocol requests. It discovers IPv4/MAC pairs with ARP
-and directly queries PROFINET DCP, S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, DNP3, IEC 61850, OPC UA,
-and optional SNMP/LLDP. It collects structured evidence and exports observations, interfaces, ports,
+and directly queries PROFINET DCP, S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, DNP3,
+IEC 61850, NetBIOS, OPC UA, and optional SNMP/LLDP. It collects structured evidence and exports observations, interfaces, ports,
 and topology through the schema-version-2 `otserver-scan` contract understood directly by
 [OTserver](https://github.com/ruveydac/OTserver).
 
@@ -138,8 +138,8 @@ Validate an export before uploading it:
 ## Protocols and safety
 
 The scanner sends PROFINET DCP Identify, read-only SNMP requests, and fixed read-only identity
-requests for S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, DNP3, IEC 61850, and OPC UA. It never runs SNMP
-SET, DCP Set, brute-force, exploit, vulnerability, or Modbus requests.
+requests for S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, DNP3, IEC 61850, NetBIOS, and
+OPC UA. It never runs SNMP SET, DCP Set, brute-force, exploit, vulnerability, or Modbus requests.
 
 Discovery uses process-wide pacing based on the supplied site ceilings of 50 ARP frames/s and
 500 packets/s, with 30% headroom:
@@ -166,9 +166,9 @@ capture. Otter does not change host QoS, neighbor tables, or network-device conf
 
 All discovery protocols are enabled by default. Disable individual protocols on the CLI with
 `--no-arp`, `--no-profinet`, `--no-s7`, `--no-enip`, `--no-bacnet`, `--no-fins`, `--no-fox`,
-`--no-dnp3`, `--no-iec61850`, `--no-opcua`, or `--no-snmp` and `--no-lldp`. SNMP inventory and LLDP topology queries
-share the same SNMP settings but can be enabled independently. The GUI exposes the same choices as
-highlighted on/off toggle buttons.
+`--no-dnp3`, `--no-iec61850`, `--no-netbios`, `--no-opcua`, or `--no-snmp` and `--no-lldp`.
+SNMP inventory and LLDP topology queries share the same SNMP settings but can be enabled
+independently. The GUI exposes the same choices as highlighted on/off toggle buttons.
 
 Exit code `0` means every scan completed, `2` means at least one valid output contains partial
 failures, and `1` means a configuration, scan, or upload failed. A multi-configuration run continues
@@ -209,6 +209,15 @@ DNP3/UDP and TLS-wrapped DNP3 are not probed.
 IEC 61850 discovery connects to MMS/TCP port 102, browses the logical-device model, and reads only
 advertised identity, health, breaker-position, blocking, and operation-count attributes. It does not
 access control, report, setting-group, file, or write services.
+
+NetBIOS discovery sends one unicast wildcard Node Status (`NBSTAT`) query to UDP port 137
+(RFC 1002). It exports the active computer name, preferring the workstation name over the server
+name, plus the registered name table, suffixes, flags, workgroup, reported unit ID, and raw response
+as `netbios` observations. The unit ID remains raw evidence, including when it is all zeros; device
+identity uses the shared ARP/DCP correlation. With `--no-arp`, responses without a correlated MAC
+remain in `unresolved`. Discovery uses no credentials, broadcasts, registration requests, or SMB
+sessions. Disable it with `--no-netbios`, `"noNetbios": true`, or the GUI NetBIOS toggle.
+OTserver importers must recognize the `netbios` source added to the schema-version-2 contract.
 
 ### GUI
 
@@ -276,6 +285,7 @@ single-object form remains supported:
   "noFins": false,
   "noFox": false,
   "noDnp3": false,
+  "noNetbios": false,
   "noOpcua": false,
   "opcuaPorts": [4840, 4841, 48400],
   "opcuaCredentials": [{ "username": "inventory", "password": "..." }],
@@ -377,8 +387,8 @@ scan.
 ## Virtual OT lab
 
 The Docker lab exercises the complete Linux scanner against deterministic virtual devices for ARP,
-PROFINET DCP, S7, EtherNet/IP, BACnet/IP, Omron FINS, Niagara Fox, DNP3, IEC 61850, OPC UA, SNMPv2c, SNMPv3, and
-LLDP:
+PROFINET DCP, S7, EtherNet/IP, BACnet/IP, Omron FINS, Niagara Fox, DNP3, IEC 61850, NetBIOS,
+OPC UA, SNMPv2c, SNMPv3, and LLDP:
 
 ```bash
 ./lab/test.sh
@@ -413,6 +423,7 @@ Images use pinned Snap7, libIEC61850, and SNMP Simulator packages plus checksum-
 sources; the repository's small FINS, Fox, and DNP3 responders implement only the fixed read-only
 identity requests sent by this scanner. The OPC UA responder uses the maintained asyncua (opcua-asyncio)
 Python stack.
+NetBIOS interoperability uses Samba's `nmbd` with a fixed computer name and workgroup.
 
 ## Development
 

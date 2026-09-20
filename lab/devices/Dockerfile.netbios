@@ -1,0 +1,5 @@
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends samba \
+    && rm -rf /var/lib/apt/lists/*
+ENTRYPOINT ["nmbd", "--foreground", "--no-process-group", "--debug-stdout", "--option=netbios name=OTTER-NB", "--option=workgroup=OTLAB", "--option=local master=no", "--option=preferred master=no", "--option=domain master=no"]

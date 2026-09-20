@@ -91,6 +91,8 @@ pub struct ScanArgs {
     #[arg(long)]
     pub no_iec61850: bool,
     #[arg(long)]
+    pub no_netbios: bool,
+    #[arg(long)]
     pub no_opcua: bool,
     #[arg(long)]
     pub no_snmp: bool,
@@ -137,6 +139,8 @@ pub struct ScannerConfig {
     pub no_dnp3: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_iec61850: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_netbios: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_opcua: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -276,6 +280,7 @@ pub struct ProtocolOptions {
     pub fox: bool,
     pub dnp3: bool,
     pub iec61850: bool,
+    pub netbios: bool,
     pub opcua: bool,
     pub snmp: bool,
     pub lldp: bool,
@@ -293,6 +298,7 @@ impl Default for ProtocolOptions {
             fox: true,
             dnp3: true,
             iec61850: true,
+            netbios: true,
             opcua: true,
             snmp: true,
             lldp: true,
@@ -493,6 +499,7 @@ pub fn resolve_scan(
         fox: !(no_native_protocols || args.no_fox || config.no_fox.unwrap_or(false)),
         dnp3: !(no_native_protocols || args.no_dnp3 || config.no_dnp3.unwrap_or(false)),
         iec61850: !(no_native_protocols || args.no_iec61850 || config.no_iec61850.unwrap_or(false)),
+        netbios: !(no_native_protocols || args.no_netbios || config.no_netbios.unwrap_or(false)),
         opcua: !(no_native_protocols || args.no_opcua || config.no_opcua.unwrap_or(false)),
         snmp: !(args.no_snmp || config.no_snmp.unwrap_or(false)),
         lldp: !(args.no_lldp || config.no_lldp.unwrap_or(false)),
@@ -782,6 +789,7 @@ pub async fn scan(
         fox: options.protocols.fox,
         dnp3: options.protocols.dnp3,
         iec61850: options.protocols.iec61850,
+        netbios: options.protocols.netbios,
         opcua: options.protocols.opcua,
     };
     if native_selection.any() && !cancelled.load(Ordering::Relaxed) {
@@ -1424,6 +1432,7 @@ mod tests {
             no_fox: false,
             no_dnp3: false,
             no_iec61850: false,
+            no_netbios: false,
             no_opcua: false,
             no_snmp: false,
             no_lldp: false,
@@ -1465,6 +1474,7 @@ mod tests {
         assert!(!resolved.protocols.fox);
         assert!(!resolved.protocols.dnp3);
         assert!(!resolved.protocols.iec61850);
+        assert!(!resolved.protocols.netbios);
         assert!(!resolved.protocols.opcua);
         assert!(resolved.protocols.snmp);
         assert!(resolved.protocols.lldp);
@@ -1502,6 +1512,7 @@ mod tests {
             no_fox: Some(true),
             no_dnp3: Some(true),
             no_iec61850: Some(true),
+            no_netbios: Some(true),
             no_opcua: Some(true),
             no_snmp: Some(true),
             no_lldp: Some(true),
@@ -1706,6 +1717,7 @@ mod tests {
             "--no-fox",
             "--no-dnp3",
             "--no-iec61850",
+            "--no-netbios",
             "--no-opcua",
             "--no-snmp",
             "--no-lldp",
@@ -1723,6 +1735,7 @@ mod tests {
         assert!(args.no_fox);
         assert!(args.no_dnp3);
         assert!(args.no_iec61850);
+        assert!(args.no_netbios);
         assert!(args.no_opcua);
         assert!(args.no_snmp);
         assert!(args.no_lldp);
@@ -1732,6 +1745,22 @@ mod tests {
     #[test]
     fn cli_requires_subcommand_without_gui() {
         assert!(Cli::try_parse_from(["otserver-otter"]).is_err());
+    }
+
+    #[test]
+    fn netbios_can_be_disabled_by_cli_or_config() {
+        for (cli_disabled, config_disabled) in [(false, false), (true, false), (false, true)] {
+            let mut cli = args();
+            cli.no_netbios = cli_disabled;
+            let mut config = complete_config("Test", "192.0.2.1", "test.json");
+            config.no_netbios = Some(config_disabled);
+            let options = resolve_scan(cli, config, None).unwrap();
+            assert_eq!(
+                options.protocols.netbios,
+                !(cli_disabled || config_disabled)
+            );
+            assert!(options.protocols.s7);
+        }
     }
 
     #[test]

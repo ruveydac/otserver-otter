@@ -7,8 +7,9 @@ contract, or safety boundary.
 
 OTserver Otter is a read-only Rust discovery CLI and GUI for Windows and Linux. It discovers OT
 assets with native ARP, PROFINET DCP Identify, S7 identity, EtherNet/IP List Identity, BACnet
-ReadProperty, Omron FINS identity, Niagara Fox hello, DNP3 Group 0 device attributes, OPC UA asset
-discovery, SNMP GET/WALK, and LLDP. It exports `otserver-scan` schema-version-2 JSON for OTserver.
+ReadProperty, Omron FINS identity, Niagara Fox hello, DNP3 Group 0 device attributes, NetBIOS Node
+Status, OPC UA asset discovery, SNMP GET/WALK, and LLDP. It exports `otserver-scan`
+schema-version-2 JSON for OTserver.
 
 The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
 
@@ -26,6 +27,9 @@ The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
   truncated, oversized, mismatched, or unsolicited responses.
 - Active DCP must verify that its source MAC belongs to the selected physical interface. Send
   Identify-All once with `ResponseDelayFactor` `0x0080`; never use zero or rapid retries.
+- NetBIOS uses one unicast wildcard NBSTAT query to UDP 137. Keep the reported UNIT_ID as raw
+  evidence, never as an override for ARP/DCP identity or a way to resolve MAC-less targets.
+  It is enabled by default; `--no-netbios`, `noNetbios`, and the GUI toggle disable it.
 - Preserve process-wide `src/traffic.rs` pacing: 35 explicit ARP requests/s and approximately 350
   aggregate discovery operations/s, 70% of the supplied site ceilings (50 and 500). Serialize raw
   ARP sends and Windows `SendARP` calls through the blocking send gate, including syscall retries;

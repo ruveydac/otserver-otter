@@ -20,8 +20,9 @@ DEVICES = {
     "opcua": "02:00:00:00:00:15",
     "dnp3": "02:00:00:00:00:16",
     "iec61850": "02:00:00:00:00:17",
+    "netbios": "02:00:00:00:00:18",
 }
-TARGETS = [f"172.30.0.{number}" for number in range(10, 18)]
+TARGETS = [f"172.30.0.{number}" for number in range(10, 19)]
 
 
 def run(*arguments: str) -> None:
@@ -244,6 +245,22 @@ def assert_full(result: dict) -> None:
     opcua_ports = {value["key"] for value in by_mac(result, DEVICES["opcua"])["ports"]}
     assert "tcp:4840" in opcua_ports
 
+    netbios_device = by_mac(result, DEVICES["netbios"])
+    netbios = observation(netbios_device, "netbios")
+    assert netbios["fields"]["name"] == "OTTER-NB"
+    assert netbios["fields"]["protocols"] == ["netbios"]
+    assert netbios["fields"]["macAddress"] == DEVICES["netbios"]
+    assert netbios["raw"]["workgroup"] == "OTLAB"
+    assert any(
+        name["name"] == "OTTER-NB" and name["suffix"] == 0 and not name["group"]
+        for name in netbios["raw"]["names"]
+    )
+    assert len(netbios["raw"]["unitId"]) == 17
+    assert netbios["raw"]["response"]
+    assert ("udp:137", "netbios") in {
+        (port["key"], port["source"]) for port in netbios_device["ports"]
+    }
+
 
 def assert_v3(result: dict) -> None:
     assert result["errors"] == [] and result["scan"].get("partial", False) is False
@@ -259,6 +276,8 @@ def main() -> None:
     run_id = uuid.uuid4().hex[:8]
     full_path = ARTIFACTS / f"full-scan-{run_id}.otserver.json"
     v3_path = ARTIFACTS / f"snmp-v3-{run_id}.otserver.json"
+    netbios_disabled_path = ARTIFACTS / f"netbios-disabled-{run_id}.otserver.json"
+    netbios_unresolved_path = ARTIFACTS / f"netbios-unresolved-{run_id}.otserver.json"
     set_snmp({"version": "2c", "community": "lab-public"})
     assert_full(scan(full_path, TARGETS))
     set_snmp(
@@ -280,7 +299,22 @@ def main() -> None:
             "--no-profinet",
         )
     )
-    for artifact in (full_path, v3_path):
+    netbios_flags = (
+        "--no-profinet", "--no-s7", "--no-enip", "--no-bacnet", "--no-fins",
+        "--no-fox", "--no-dnp3", "--no-iec61850", "--no-opcua", "--no-snmp", "--no-lldp",
+    )
+    disabled = scan(netbios_disabled_path, ["172.30.0.18"], *netbios_flags, "--no-netbios")
+    disabled_device = by_mac(disabled, DEVICES["netbios"])
+    assert not any(item["source"] == "netbios" for item in disabled_device["observations"])
+    assert not any(port["source"] == "netbios" for port in disabled_device["ports"])
+    unresolved = scan(netbios_unresolved_path, ["172.30.0.18"], *netbios_flags, "--no-arp")
+    assert unresolved["devices"] == [] and len(unresolved["unresolved"]) == 1
+    netbios = unresolved["unresolved"][0]
+    assert netbios["source"] == "netbios" and netbios["fields"]["name"] == "OTTER-NB"
+    assert "macAddress" not in netbios and "macAddress" not in netbios["fields"]
+    assert netbios["raw"]["subject"]["kind"] == "endpoint"
+    assert netbios["raw"]["listeners"][0]["port"] == 137
+    for artifact in (full_path, v3_path, netbios_disabled_path, netbios_unresolved_path):
         os.chmod(artifact, 0o666)
     print("OTserver Otter virtual lab passed.", flush=True)
 

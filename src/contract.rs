@@ -90,6 +90,7 @@ pub enum Source {
     EthernetIp,
     Iec61850,
     Lldp,
+    Netbios,
     NiagaraFox,
     OmronFins,
     OpcUa,
@@ -109,6 +110,7 @@ impl Source {
             Self::EthernetIp => "ethernet-ip",
             Self::Iec61850 => "iec61850",
             Self::Lldp => "lldp",
+            Self::Netbios => "netbios",
             Self::NiagaraFox => "niagara-fox",
             Self::OmronFins => "omron-fins",
             Self::OpcUa => "opc-ua",
@@ -441,6 +443,33 @@ mod tests {
     }
 
     #[test]
+    fn netbios_observation_roundtrips_with_the_canonical_source() {
+        let mut scan = export(vec![]);
+        scan.unresolved.push(Observation {
+            source: Source::Netbios,
+            fields: BTreeMap::from([("name".into(), json!("ENGINEERING"))]),
+            raw: json!({ "unitId": "00:11:22:33:44:55" }),
+            ..observation()
+        });
+        validate(&scan).unwrap();
+        let value = serde_json::to_value(scan).unwrap();
+        let source = &value["unresolved"][0]["source"];
+        assert_eq!(source, "netbios");
+        let schema: Value =
+            serde_json::from_str(include_str!("../contracts/otserver-scan-v2.schema.json"))
+                .unwrap();
+        assert!(
+            schema["$defs"]["observation"]["properties"]["source"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(source)
+        );
+        let restored: ScanExport = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.unresolved[0].source, Source::Netbios);
+        assert_eq!(restored.unresolved[0].mac_address, None);
+    }
+
+    #[test]
     fn labels_all_sources_and_discards_invalid_merge_identities() {
         let labels = [
             Source::Arp,
@@ -449,6 +478,7 @@ mod tests {
             Source::EthernetIp,
             Source::Iec61850,
             Source::Lldp,
+            Source::Netbios,
             Source::NiagaraFox,
             Source::OmronFins,
             Source::OpcUa,
@@ -461,8 +491,9 @@ mod tests {
         .map(Source::label);
         assert_eq!(labels[0], "arp");
         assert_eq!(labels[2], "dnp3");
-        assert_eq!(labels[8], "opc-ua");
-        assert_eq!(labels[13], "unknown");
+        assert_eq!(labels[6], "netbios");
+        assert_eq!(labels[9], "opc-ua");
+        assert_eq!(labels[14], "unknown");
         let devices = merge_devices(vec![
             Device {
                 mac_address: "invalid".into(),
