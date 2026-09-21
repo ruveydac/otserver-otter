@@ -103,6 +103,7 @@
             "ethernet-ip",
             "iec61850",
             "lldp",
+            "netbios",
             "niagara-fox",
             "omron-fins",
             "opc-ua",

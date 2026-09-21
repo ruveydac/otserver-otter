@@ -91,6 +91,8 @@ pub struct ScanArgs {
     #[arg(long)]
     pub no_iec61850: bool,
     #[arg(long)]
+    pub no_netbios: bool,
+    #[arg(long)]
     pub no_opcua: bool,
     #[arg(long)]
     pub no_snmp: bool,
@@ -137,6 +139,8 @@ pub struct ScannerConfig {
     pub no_dnp3: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_iec61850: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_netbios: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_opcua: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -276,6 +280,7 @@ pub struct ProtocolOptions {
     pub fox: bool,
     pub dnp3: bool,
     pub iec61850: bool,
+    pub netbios: bool,
     pub opcua: bool,
     pub snmp: bool,
     pub lldp: bool,
@@ -293,6 +298,7 @@ impl Default for ProtocolOptions {
             fox: true,
             dnp3: true,
             iec61850: true,
+            netbios: true,
             opcua: true,
             snmp: true,
             lldp: true,
@@ -493,6 +499,7 @@ pub fn resolve_scan(
         fox: !(no_native_protocols || args.no_fox || config.no_fox.unwrap_or(false)),
         dnp3: !(no_native_protocols || args.no_dnp3 || config.no_dnp3.unwrap_or(false)),
         iec61850: !(no_native_protocols || args.no_iec61850 || config.no_iec61850.unwrap_or(false)),
+        netbios: !(no_native_protocols || args.no_netbios || config.no_netbios.unwrap_or(false)),
         opcua: !(no_native_protocols || args.no_opcua || config.no_opcua.unwrap_or(false)),
         snmp: !(args.no_snmp || config.no_snmp.unwrap_or(false)),
         lldp: !(args.no_lldp || config.no_lldp.unwrap_or(false)),
@@ -668,6 +675,18 @@ pub async fn scan(
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
     let mut protocol_failed = false;
+    let source_mac = if (options.protocols.arp || options.protocols.profinet)
+        && !cancelled.load(Ordering::Relaxed)
+    {
+        scan_source_mac(
+            &options.interface,
+            &options.source_mac,
+            &profinet::interfaces()?,
+            logger,
+        )?
+    } else {
+        options.source_mac.clone()
+    };
 
     logger.log(format!(
         "Starting discovery for target(s): {}",
@@ -675,7 +694,7 @@ pub async fn scan(
     ));
     logger.log(format!(
         "Interface: {}, Source MAC: {}",
-        options.interface, options.source_mac
+        options.interface, source_mac
     ));
     logger.log(format!(
         "Traffic pacing: {} ARP requests/s, approximately {} discovery operations/s, shared across targets. OS-generated packets are not a hard-capped wire budget.",
@@ -689,7 +708,7 @@ pub async fn scan(
         logger.log("Executing ARP discovery...".into());
         match discover(
             &options.interface,
-            &options.source_mac,
+            &source_mac,
             &target_addresses,
             cancelled,
         )
@@ -728,7 +747,7 @@ pub async fn scan(
         }
         logger.log("Scanning PROFINET DCP...".into());
         let selected = options.interface.clone();
-        let mac = options.source_mac.clone();
+        let mac = source_mac.clone();
         match tokio::task::spawn_blocking(move || {
             profinet::scan(&selected, &mac, Duration::from_secs(4))
         })
@@ -752,6 +771,16 @@ pub async fn scan(
     ));
     logger.devices(configuration, &devices);
 
+    let probe_targets = ip_probe_targets(&target_addresses, &devices, options.protocols.arp);
+    logger.log(format!(
+        "IP protocol targets: {} ({}).",
+        probe_targets.len(),
+        if options.protocols.arp {
+            "discovered MAC/IP identities"
+        } else {
+            "ARP disabled; selected targets included"
+        }
+    ));
     let native_selection = protocols::Selection {
         s7: options.protocols.s7,
         enip: options.protocols.enip,
@@ -760,6 +789,7 @@ pub async fn scan(
         fox: options.protocols.fox,
         dnp3: options.protocols.dnp3,
         iec61850: options.protocols.iec61850,
+        netbios: options.protocols.netbios,
         opcua: options.protocols.opcua,
     };
     if native_selection.any() && !cancelled.load(Ordering::Relaxed) {
@@ -769,7 +799,9 @@ pub async fn scan(
         ));
         probe_protocols(
             configuration,
+            &probe_targets,
             &mut devices,
+            &mut unresolved,
             &mut warnings,
             native_selection,
             &options.opcua,
@@ -796,15 +828,10 @@ pub async fn scan(
             (false, false) => unreachable!("guard requires one query type"),
         };
         logger.log(format!("Querying {label}..."));
-        let mut ips = target_addresses
+        let ips = probe_targets
             .iter()
             .map(Ipv4Addr::to_string)
             .collect::<BTreeSet<_>>();
-        ips.extend(
-            devices
-                .iter()
-                .flat_map(|device| device.ip_addresses.iter().cloned()),
-        );
         protocol_failed |= probe_snmp(
             configuration,
             ips,
@@ -846,7 +873,7 @@ pub async fn scan(
             interface: InterfaceRef {
                 id: options.interface.clone(),
                 name: options.interface.clone(),
-                mac_address: otserver_otter::contract::normalize_mac(&options.source_mac),
+                mac_address: otserver_otter::contract::normalize_mac(&source_mac),
                 addresses: vec![],
             },
             partial: stopped || protocol_failed || !errors.is_empty(),
@@ -1040,21 +1067,49 @@ async fn discover(
     .map_err(|error| error.to_string())?
 }
 
+fn scan_source_mac(
+    selected: &str,
+    configured: &str,
+    interfaces: &[profinet::CaptureInterface],
+    logger: &dyn LogOutput,
+) -> Result<String, String> {
+    let actual = interfaces
+        .iter()
+        .find(|interface| {
+            interface.name == selected
+                || interface.friendly_name == selected
+                || cfg!(windows)
+                    && (interface.name.eq_ignore_ascii_case(selected)
+                        || interface.friendly_name.eq_ignore_ascii_case(selected))
+        })
+        .and_then(profinet::interface_mac)
+        .ok_or_else(|| format!("Could not determine the current MAC of interface {selected}."))?;
+    if otserver_otter::contract::normalize_mac(configured).as_deref() != Some(&actual) {
+        logger.log(format!(
+            "Using current interface MAC {actual}; configured source MAC {configured} differs."
+        ));
+    }
+    Ok(actual)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps native result attachment in one bounded probe path"
+)]
 async fn probe_protocols(
     configuration: &str,
+    targets: &BTreeSet<Ipv4Addr>,
     devices: &mut [otserver_otter::contract::Device],
+    unresolved: &mut Vec<otserver_otter::contract::Observation>,
     warnings: &mut Vec<String>,
     selection: protocols::Selection,
     opcua: &otserver_otter::protocols::OpcuaSettings,
     logger: &dyn LogOutput,
     cancelled: &AtomicBool,
 ) {
-    let identities = unique_ip_identities(devices)
-        .into_iter()
-        .filter_map(|(ip, mac)| Some((ip.parse::<Ipv4Addr>().ok()?, mac)))
-        .collect::<Vec<_>>();
+    let identities = unique_ip_identities(devices);
     let mut tasks = tokio::task::JoinSet::new();
-    for (ip, mac) in identities {
+    for &ip in targets {
         if cancelled.load(Ordering::Relaxed) {
             break;
         }
@@ -1063,18 +1118,34 @@ async fn probe_protocols(
                 () = wait_for_cancellation(cancelled) => break,
                 result = tasks.join_next() => result,
             };
-            apply_probe(configuration, devices, warnings, logger, result);
+            apply_probe(configuration, devices, unresolved, warnings, logger, result);
         }
+        let mac = identities.get(&ip.to_string()).cloned();
         let opcua = opcua.clone();
         tasks.spawn(async move {
-            let result = protocols::scan(ip, &mac, selection, &opcua).await;
+            let result = protocols::scan(ip, mac.as_deref(), selection, &opcua).await;
             (ip, mac, result)
         });
     }
     drain_tasks(&mut tasks, cancelled, |result| {
-        apply_probe(configuration, devices, warnings, logger, result);
+        apply_probe(configuration, devices, unresolved, warnings, logger, result);
     })
     .await;
+}
+
+fn ip_probe_targets(
+    selected: &[Ipv4Addr],
+    devices: &[Device],
+    arp_enabled: bool,
+) -> BTreeSet<Ipv4Addr> {
+    let mut targets = unique_ip_identities(devices)
+        .keys()
+        .filter_map(|ip| ip.parse::<Ipv4Addr>().ok())
+        .collect::<BTreeSet<_>>();
+    if !arp_enabled {
+        targets.extend(selected);
+    }
+    targets
 }
 
 async fn drain_tasks<T: 'static>(
@@ -1252,12 +1323,19 @@ fn apply_snmp_probe(
     incomplete
 }
 
+#[expect(
+    clippy::type_complexity,
+    reason = "the join result carries the target, optional MAC, and protocol response"
+)]
 fn apply_probe(
     configuration: &str,
     devices: &mut [otserver_otter::contract::Device],
+    unresolved: &mut Vec<otserver_otter::contract::Observation>,
     warnings: &mut Vec<String>,
     logger: &dyn LogOutput,
-    result: Option<Result<(Ipv4Addr, String, protocols::ProbeResult), tokio::task::JoinError>>,
+    result: Option<
+        Result<(Ipv4Addr, Option<String>, protocols::ProbeResult), tokio::task::JoinError>,
+    >,
 ) {
     let Some(result) = result else { return };
     let Ok((ip, mac, mut result)) = result else {
@@ -1268,9 +1346,14 @@ fn apply_probe(
         log_probe(logger, &ip.to_string(), source.label(), *success);
     }
     warnings.append(&mut result.warnings);
-    if let Some(device) = devices.iter_mut().find(|device| device.mac_address == mac) {
+    if let Some(device) = mac
+        .as_deref()
+        .and_then(|mac| devices.iter_mut().find(|device| device.mac_address == mac))
+    {
         device.observations.append(&mut result.observations);
         device.ports.append(&mut result.ports);
+    } else {
+        unresolved.append(&mut result.observations);
     }
     logger.devices(configuration, devices);
 }
@@ -1349,6 +1432,7 @@ mod tests {
             no_fox: false,
             no_dnp3: false,
             no_iec61850: false,
+            no_netbios: false,
             no_opcua: false,
             no_snmp: false,
             no_lldp: false,
@@ -1390,6 +1474,7 @@ mod tests {
         assert!(!resolved.protocols.fox);
         assert!(!resolved.protocols.dnp3);
         assert!(!resolved.protocols.iec61850);
+        assert!(!resolved.protocols.netbios);
         assert!(!resolved.protocols.opcua);
         assert!(resolved.protocols.snmp);
         assert!(resolved.protocols.lldp);
@@ -1427,6 +1512,7 @@ mod tests {
             no_fox: Some(true),
             no_dnp3: Some(true),
             no_iec61850: Some(true),
+            no_netbios: Some(true),
             no_opcua: Some(true),
             no_snmp: Some(true),
             no_lldp: Some(true),
@@ -1631,6 +1717,7 @@ mod tests {
             "--no-fox",
             "--no-dnp3",
             "--no-iec61850",
+            "--no-netbios",
             "--no-opcua",
             "--no-snmp",
             "--no-lldp",
@@ -1648,6 +1735,7 @@ mod tests {
         assert!(args.no_fox);
         assert!(args.no_dnp3);
         assert!(args.no_iec61850);
+        assert!(args.no_netbios);
         assert!(args.no_opcua);
         assert!(args.no_snmp);
         assert!(args.no_lldp);
@@ -1657,6 +1745,22 @@ mod tests {
     #[test]
     fn cli_requires_subcommand_without_gui() {
         assert!(Cli::try_parse_from(["otserver-otter"]).is_err());
+    }
+
+    #[test]
+    fn netbios_can_be_disabled_by_cli_or_config() {
+        for (cli_disabled, config_disabled) in [(false, false), (true, false), (false, true)] {
+            let mut cli = args();
+            cli.no_netbios = cli_disabled;
+            let mut config = complete_config("Test", "192.0.2.1", "test.json");
+            config.no_netbios = Some(config_disabled);
+            let options = resolve_scan(cli, config, None).unwrap();
+            assert_eq!(
+                options.protocols.netbios,
+                !(cli_disabled || config_disabled)
+            );
+            assert!(options.protocols.s7);
+        }
     }
 
     #[test]
@@ -1670,6 +1774,58 @@ mod tests {
         assert_eq!(resolved.snmp, vec![snmp::Settings::default()]);
         assert_eq!(snmp::resolved_version(&resolved.snmp[0]), "2c");
         assert!(snmp::auth(&resolved.snmp[0]).is_ok());
+    }
+
+    #[test]
+    fn all_ip_protocols_use_discovery_unless_arp_is_explicitly_disabled() {
+        let selected = discovery::expand_targets(&["192.0.2.0/30".into()]).unwrap();
+        let found = vec![Device {
+            mac_address: "00:11:22:33:44:55".into(),
+            ip_addresses: vec!["192.0.2.1".into()],
+            ..Device::default()
+        }];
+        assert_eq!(
+            ip_probe_targets(&selected, &found, true),
+            [selected[0]].into()
+        );
+        assert!(ip_probe_targets(&selected, &[], true).is_empty());
+        assert!(ip_probe_targets(&selected[1..], &[], true).is_empty());
+        assert_eq!(
+            ip_probe_targets(&selected, &found, false),
+            selected.iter().copied().collect()
+        );
+        assert_eq!(
+            ip_probe_targets(&selected, &[], false),
+            selected.iter().copied().collect()
+        );
+
+        let conflict = Device {
+            mac_address: "00:11:22:33:44:66".into(),
+            ip_addresses: vec!["192.0.2.1".into()],
+            ..Device::default()
+        };
+        assert!(ip_probe_targets(&selected, &[found[0].clone(), conflict], true).is_empty());
+    }
+
+    #[test]
+    fn scan_uses_current_interface_mac_instead_of_stale_saved_mac() {
+        let interfaces = [profinet::CaptureInterface {
+            name: "wlan-test".into(),
+            friendly_name: "Wi-Fi".into(),
+            description: "Wi-Fi".into(),
+            addresses: vec!["192.0.2.17".into(), "F6:30:EA:29:58:EA".into()],
+        }];
+        assert_eq!(
+            scan_source_mac("wlan-test", "F6:00:00:00:00:02", &interfaces, &StdoutLogger).unwrap(),
+            "F6:30:EA:29:58:EA"
+        );
+        assert_eq!(
+            scan_source_mac("Wi-Fi", "f6-30-ea-29-58-ea", &interfaces, &StdoutLogger).unwrap(),
+            "F6:30:EA:29:58:EA"
+        );
+        assert!(
+            scan_source_mac("missing", "F6:00:00:00:00:02", &interfaces, &StdoutLogger).is_err()
+        );
     }
 
     #[test]
@@ -1746,6 +1902,40 @@ mod tests {
         assert_eq!(devices[0].mac_address, "00:11:22:33:44:55");
         assert!(unresolved.is_empty());
         assert_eq!(*logger.snapshots.lock().unwrap(), [("Line A".into(), 1)]);
+    }
+
+    #[test]
+    fn native_probe_without_mac_stays_unresolved() {
+        let mut devices = vec![];
+        let mut unresolved = vec![];
+        let mut warnings = vec![];
+        apply_probe(
+            "Line A",
+            &mut devices,
+            &mut unresolved,
+            &mut warnings,
+            &DeviceLogger::default(),
+            Some(Ok((
+                "192.0.2.10".parse().unwrap(),
+                None,
+                protocols::ProbeResult {
+                    observations: vec![otserver_otter::contract::Observation {
+                        source: Source::EthernetIp,
+                        observed_at: "2026-08-24T00:00:00Z".into(),
+                        ip_address: Some("192.0.2.10".into()),
+                        mac_address: None,
+                        fields: BTreeMap::new(),
+                        raw: serde_json::json!({}),
+                        warnings: vec![],
+                    }],
+                    ports: vec![],
+                    warnings: vec![],
+                    outcomes: vec![(Source::EthernetIp, true)],
+                },
+            ))),
+        );
+        assert_eq!(unresolved.len(), 1);
+        assert!(devices.is_empty());
     }
 
     #[tokio::test]

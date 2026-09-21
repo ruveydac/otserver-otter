@@ -10,6 +10,7 @@ mod enip;
 mod fins;
 mod fox;
 mod iec61850;
+mod netbios;
 mod opcua;
 mod s7;
 
@@ -35,6 +36,7 @@ pub struct Selection {
     pub fox: bool,
     pub dnp3: bool,
     pub iec61850: bool,
+    pub netbios: bool,
     pub opcua: bool,
 }
 
@@ -47,6 +49,7 @@ impl Selection {
             || self.fox
             || self.dnp3
             || self.iec61850
+            || self.netbios
             || self.opcua
     }
 
@@ -59,6 +62,7 @@ impl Selection {
             (self.fox, "Fox"),
             (self.dnp3, "DNP3"),
             (self.iec61850, "IEC 61850"),
+            (self.netbios, "NetBIOS"),
             (self.opcua, "OPC UA"),
         ]
         .into_iter()
@@ -77,6 +81,7 @@ impl Default for Selection {
             fox: true,
             dnp3: true,
             iec61850: true,
+            netbios: true,
             opcua: true,
         }
     }
@@ -92,14 +97,14 @@ struct Finding {
 
 pub async fn scan(
     target: Ipv4Addr,
-    mac: &str,
+    mac: Option<&str>,
     selection: Selection,
     opcua: &opcua::ProbeSettings,
 ) -> ProbeResult {
     if selection.any() {
         crate::traffic::wait().await;
     }
-    let (s7, enip, bacnet, fins, fox, dnp3, iec61850, ua) = tokio::join!(
+    let (s7, enip, bacnet, fins, fox, dnp3, iec61850, netbios, ua) = tokio::join!(
         probe_if(selection.s7, s7::probe(target)),
         probe_if(selection.enip, enip::probe(target)),
         probe_if(selection.bacnet, bacnet::probe(target)),
@@ -107,6 +112,7 @@ pub async fn scan(
         probe_if(selection.fox, fox::probe(target)),
         probe_if(selection.dnp3, dnp3::probe(target)),
         probe_if(selection.iec61850, iec61850::probe(target, iec61850::PORT)),
+        probe_if(selection.netbios, netbios::probe(target)),
         probe_if(selection.opcua, opcua::probe(target, opcua)),
     );
     let mut observations = Vec::new();
@@ -121,6 +127,7 @@ pub async fn scan(
         (selection.fox, Source::NiagaraFox, fox),
         (selection.dnp3, Source::Dnp3, dnp3),
         (selection.iec61850, Source::Iec61850, iec61850),
+        (selection.netbios, Source::Netbios, netbios),
         (selection.opcua, Source::OpcUa, ua),
     ];
     for (enabled, source, result) in results {
@@ -137,19 +144,66 @@ pub async fn scan(
                 finding
                     .fields
                     .insert("lastSeen".into(), serde_json::json!(observed_at));
-                finding
-                    .fields
-                    .insert("macAddress".into(), serde_json::json!(mac));
+                if let Some(mac) = mac {
+                    finding
+                        .fields
+                        .insert("macAddress".into(), serde_json::json!(mac));
+                }
                 finding
                     .fields
                     .entry("status".into())
                     .or_insert_with(|| serde_json::json!("online"));
+                if let Value::Object(raw) = &mut finding.raw {
+                    raw.insert(
+                        "observationId".into(),
+                        serde_json::json!(uuid::Uuid::new_v4().to_string()),
+                    );
+                    raw.insert(
+                        "subject".into(),
+                        mac.map_or_else(
+                            || serde_json::json!({ "kind": "endpoint", "ipAddress": target }),
+                            |mac| serde_json::json!({ "kind": "device", "macAddress": mac }),
+                        ),
+                    );
+                    raw.insert(
+                        "listeners".into(),
+                        Value::Array(
+                            finding
+                                .ports
+                                .iter()
+                                .map(|port| {
+                                    let (transport, number) = port
+                                        .key
+                                        .split_once(':')
+                                        .unwrap_or((port.source.as_str(), ""));
+                                    serde_json::json!({
+                                        "address": target,
+                                        "transport": transport,
+                                        "port": number.parse::<u16>().ok(),
+                                        "route": [],
+                                    })
+                                })
+                                .collect(),
+                        ),
+                    );
+                    if let Some(serial) = finding.fields.get("serialNumber") {
+                        raw.entry("serialClaim").or_insert_with(|| {
+                            serde_json::json!({
+                                "scope": "device",
+                                "issuer": finding.fields.get("vendor"),
+                                "original": serial,
+                                "encoding": "protocol-text",
+                                "normalizationVersion": 1,
+                            })
+                        });
+                    }
+                }
                 ports.append(&mut finding.ports);
                 observations.push(Observation {
                     source: finding.source,
                     observed_at,
                     ip_address: Some(target.to_string()),
-                    mac_address: Some(mac.to_owned()),
+                    mac_address: mac.map(str::to_owned),
                     fields: finding.fields,
                     raw: finding.raw,
                     warnings: finding.warnings,
@@ -207,14 +261,14 @@ mod tests {
         let _network = crate::network_test_lock().await;
         let result = scan(
             Ipv4Addr::LOCALHOST,
-            "00:11:22:33:44:55",
+            Some("00:11:22:33:44:55"),
             Selection::default(),
             &opcua::ProbeSettings::default(),
         )
         .await;
         assert!(result.observations.is_empty());
         assert!(result.ports.is_empty());
-        assert_eq!(result.outcomes.len(), 8);
+        assert_eq!(result.outcomes.len(), 9);
         assert!(result.outcomes.iter().all(|(_, success)| !success));
         assert!(text(b"  value\0ignored").as_deref() == Some("value"));
         assert_eq!(text(b" \0"), None);
@@ -231,13 +285,14 @@ mod tests {
             fox: false,
             dnp3: false,
             iec61850: false,
+            netbios: false,
             opcua: false,
         };
         assert!(!selection.any());
         assert!(selection.labels().is_empty());
         let result = scan(
             Ipv4Addr::LOCALHOST,
-            "00:11:22:33:44:55",
+            Some("00:11:22:33:44:55"),
             selection,
             &opcua::ProbeSettings::default(),
         )
@@ -271,13 +326,16 @@ mod tests {
         });
         let result = scan(
             Ipv4Addr::LOCALHOST,
-            "00:11:22:33:44:55",
+            None,
             Selection::default(),
             &opcua::ProbeSettings::default(),
         )
         .await;
         assert_eq!(result.observations.len(), 1);
         assert_eq!(result.observations[0].fields["name"], "station");
+        assert_eq!(result.observations[0].mac_address, None);
+        assert_eq!(result.observations[0].raw["subject"]["kind"], "endpoint");
+        assert_eq!(result.observations[0].raw["listeners"][0]["port"], 1911);
         assert_eq!(result.ports.len(), 1);
         let outcomes: std::collections::BTreeMap<Source, bool> =
             result.outcomes.iter().copied().collect();

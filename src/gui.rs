@@ -244,6 +244,7 @@ pub struct GuiApp {
     fox_enabled: bool,
     dnp3_enabled: bool,
     iec61850_enabled: bool,
+    netbios_enabled: bool,
     opcua_enabled: bool,
     snmp_enabled: bool,
     lldp_enabled: bool,
@@ -308,6 +309,7 @@ impl GuiApp {
             fox_enabled: true,
             dnp3_enabled: true,
             iec61850_enabled: true,
+            netbios_enabled: true,
             opcua_enabled: true,
             snmp_enabled: true,
             lldp_enabled: true,
@@ -383,6 +385,7 @@ impl GuiApp {
         self.fox_enabled = !(legacy_native_disabled || config.no_fox.unwrap_or(false));
         self.dnp3_enabled = !(legacy_native_disabled || config.no_dnp3.unwrap_or(false));
         self.iec61850_enabled = !(legacy_native_disabled || config.no_iec61850.unwrap_or(false));
+        self.netbios_enabled = !(legacy_native_disabled || config.no_netbios.unwrap_or(false));
         self.opcua_enabled = !(legacy_native_disabled || config.no_opcua.unwrap_or(false));
         self.snmp_enabled = !config.no_snmp.unwrap_or(false);
         self.lldp_enabled = !config.no_lldp.unwrap_or(false);
@@ -519,6 +522,7 @@ impl GuiApp {
         config.no_fox = (!self.fox_enabled).then_some(true);
         config.no_dnp3 = (!self.dnp3_enabled).then_some(true);
         config.no_iec61850 = (!self.iec61850_enabled).then_some(true);
+        config.no_netbios = (!self.netbios_enabled).then_some(true);
         config.no_opcua = (!self.opcua_enabled).then_some(true);
         config.no_snmp = (!self.snmp_enabled).then_some(true);
         config.no_lldp = (!self.lldp_enabled).then_some(true);
@@ -988,6 +992,9 @@ impl eframe::App for GuiApp {
                                 ui.toggle_value(&mut self.dnp3_enabled, "DNP3").changed();
                             protocol_changed |= ui
                                 .toggle_value(&mut self.iec61850_enabled, "IEC 61850")
+                                .changed();
+                            protocol_changed |= ui
+                                .toggle_value(&mut self.netbios_enabled, "NetBIOS")
                                 .changed();
                             protocol_changed |= ui
                                 .toggle_value(&mut self.opcua_enabled, "OPC UA")
@@ -1689,6 +1696,24 @@ mod tests {
             interface_mac(&interfaces[0]).as_deref(),
             Some("00:11:22:33:44:55")
         );
+    }
+
+    #[test]
+    fn netbios_toggle_roundtrips_and_honors_legacy_disable() {
+        for (no_netbios, no_protocols) in [(None, None), (Some(true), None), (None, Some(true))] {
+            let config = ScannerConfig {
+                no_netbios,
+                no_protocols,
+                ..ScannerConfig::default()
+            };
+            let mut app = GuiApp::new(ScannerConfigs::Single(Box::new(config)));
+            let disabled = no_netbios.unwrap_or(false) || no_protocols.unwrap_or(false);
+            assert_eq!(app.netbios_enabled, !disabled);
+            assert_eq!(app.to_config().no_netbios, disabled.then_some(true));
+            app.netbios_enabled = !app.netbios_enabled;
+            assert_eq!(app.to_config().no_netbios, (!disabled).then_some(true));
+            assert_eq!(app.to_config().no_protocols, None);
+        }
     }
 
     #[test]

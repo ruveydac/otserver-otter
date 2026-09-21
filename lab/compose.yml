@@ -82,6 +82,20 @@ services:
         ipv4_address: 172.30.0.17
         mac_address: "02:00:00:00:00:17"
 
+  netbios:
+    build:
+      context: .
+      dockerfile: devices/Dockerfile.netbios
+    healthcheck:
+      test: [CMD-SHELL, 'nmblookup -A "$$(hostname -i)" | grep -q OTTER-NB']
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    networks:
+      ot_lab:
+        ipv4_address: 172.30.0.18
+        mac_address: "02:00:00:00:00:18"
+
   opcua:
     build:
       context: .
@@ -110,6 +124,7 @@ services:
       fox: { condition: service_healthy }
       dnp3: { condition: service_healthy }
       iec61850: { condition: service_healthy }
+      netbios: { condition: service_healthy }
       opcua: { condition: service_healthy }
     volumes:
       - ./artifacts:/artifacts:Z

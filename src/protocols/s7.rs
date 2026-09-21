@@ -64,7 +64,7 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
             Err(_) => return Ok(None),
         };
         if negotiate(&mut stream, &request).await.unwrap_or(false) {
-            return read_identity(stream, target).await;
+            return read_identity(stream, target, src_tsap, dst_tsap).await;
         }
     }
     Ok(None)
@@ -86,7 +86,12 @@ async fn negotiate(stream: &mut TcpStream, request: &[u8]) -> Result<bool, Strin
     Ok(response.len() >= 7 && response[5] == 0xd0 && response[4] as usize + 5 == response.len())
 }
 
-async fn read_identity(mut stream: TcpStream, target: Ipv4Addr) -> Result<Option<Finding>, String> {
+async fn read_identity(
+    mut stream: TcpStream,
+    target: Ipv4Addr,
+    src_tsap: u16,
+    dst_tsap: u16,
+) -> Result<Option<Finding>, String> {
     // S7 and IEC 61850 MMS share port 102 and both speak COTP, so a peer that
     // accepts the COTP connect but then drops or answers the S7 exchange with
     // junk is simply not an S7 endpoint, not an error worth a warning.
@@ -105,9 +110,20 @@ async fn read_identity(mut stream: TcpStream, target: Ipv4Addr) -> Result<Option
     let Ok(identity) = read_szl(&mut stream, SZL_1C).await else {
         return Ok(None);
     };
-    parse(&hardware, &identity)
-        .map(Some)
-        .map_err(|error| format!("S7 {target}: {error}"))
+    let mut finding =
+        parse(&hardware, &identity).map_err(|error| format!("S7 {target}: {error}"))?;
+    if let Value::Object(raw) = &mut finding.raw {
+        raw.insert(
+            "accessPath".into(),
+            json!({
+                "sourceTsap": format!("{src_tsap:04X}"),
+                "destinationTsap": format!("{dst_tsap:04X}"),
+                "rack": (dst_tsap & 0xff) >> 5,
+                "slot": dst_tsap & 0x1f,
+            }),
+        );
+    }
+    Ok(Some(finding))
 }
 
 async fn read_szl(stream: &mut TcpStream, request: &[u8]) -> Result<Vec<u8>, String> {
@@ -156,6 +172,7 @@ async fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
 
 fn parse(hardware: &[u8], identity: &[u8]) -> Result<Finding, String> {
     let hardware_response = hardware;
+    let identity_response = identity;
     let hardware = szl(hardware, 0x0011)?;
     let identity = szl(identity, 0x001c)?;
     let module = record(&hardware, 1)
@@ -208,8 +225,20 @@ fn parse(hardware: &[u8], identity: &[u8]) -> Result<Finding, String> {
         ("moduleType".into(), json!(module_type)),
         ("plantIdentification".into(), json!(plant)),
         ("response".into(), json!(hex(hardware_response))),
+        ("identityResponse".into(), json!(hex(identity_response))),
         ("systemName".into(), json!(system_name)),
         ("version".into(), json!(version)),
+        (
+            "serialClaim".into(),
+            json!({
+                "scope": "cpu",
+                "issuer": "Siemens",
+                "original": serial,
+                "encoding": "s7-szl-text",
+                "catalogNumber": module_type.as_ref().or(module.as_ref()),
+                "normalizationVersion": 1,
+            }),
+        ),
     ]));
     Ok(Finding {
         source: Source::S7,
@@ -393,6 +422,8 @@ mod tests {
         let result = parse(&hardware, &identity).unwrap();
         assert_eq!(result.fields["name"], "PLC1");
         assert_eq!(result.fields["serialNumber"], "SERIAL");
+        assert_eq!(result.raw["serialClaim"]["scope"], "cpu");
+        assert_eq!(result.raw["identityResponse"], hex(&identity));
     }
 
     #[test]
@@ -477,6 +508,7 @@ mod tests {
         let finding = probe(Ipv4Addr::LOCALHOST).await.unwrap().unwrap();
         assert_eq!(finding.fields["name"], "PLC1");
         assert_eq!(finding.fields["model"], "S7-1500");
+        assert_eq!(finding.raw["accessPath"]["slot"], 0);
         responder.await.unwrap();
     }
 
