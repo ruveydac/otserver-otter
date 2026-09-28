@@ -3,7 +3,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY build.rs ./
 COPY src ./src
-RUN cargo build --locked --release
+RUN cargo build --locked --release --no-default-features
 
 FROM python:3.12-slim-bookworm
 RUN apt-get update \

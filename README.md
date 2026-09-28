@@ -114,7 +114,9 @@ Npcap OEM license.
 Active DCP verifies that the sender MAC belongs to the selected physical interface before
 opening the selected Npcap adapter. Identify-All is sent once with an engineering-tool response
 delay factor so device replies are spread over the capture window instead of creating a synchronized
-response burst.
+response burst. After a successful request, Otter keeps collecting replies for at least 60 seconds,
+including through quiet intervals, so slow devices are not missed. Stopping a scan or a capture
+failure ends this window early.
 
 At scan start, both the CLI and GUI read the selected interface's current MAC for ARP and DCP.
 If `sourceMac` is stale (for example, after Wi-Fi MAC randomization), the scanner logs the replacement
@@ -397,7 +399,8 @@ OPC UA, SNMPv2c, SNMPv3, and LLDP:
 It requires Linux containers, Docker Engine with Compose, and permission to use the Docker daemon.
 The scanner and Siemens containers receive only `NET_RAW`; the lab does not use host networking or
 publish protocol ports. Windows developers can run the same command through Docker Desktop with
-WSL2. Scan JSON and Compose logs are retained under `lab/artifacts/`.
+WSL2. Its Siemens DCP response is delayed by 55 seconds, so the test fails if the one-minute DCP
+collection window regresses. Scan JSON and Compose logs are retained under `lab/artifacts/`.
 
 To exercise the native Windows executable against the Docker Desktop responders, run PowerShell on
 the Windows host:
@@ -417,7 +420,8 @@ This smoke test covers Windows ARP, S7, EtherNet/IP, BACnet, FINS, Fox, DNP3, OP
 client paths. It does not verify distinct device MAC correlation. Docker Desktop also does not bridge
 raw Ethernet frames between its Linux bridge and a Windows capture driver, so the harness disables
 PROFINET DCP. Active Windows DCP and multi-device MAC discovery require physical Layer-2 test devices
-or a dedicated external Layer-2 test interface.
+or a dedicated external Layer-2 test interface. Run this validation ad hoc after changing Npcap
+capture code or updating the installed Npcap version.
 
 Images use pinned Snap7, libIEC61850, and SNMP Simulator packages plus checksum-pinned OpENer and BACnet Stack
 sources; the repository's small FINS, Fox, and DNP3 responders implement only the fixed read-only

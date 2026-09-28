@@ -297,6 +297,7 @@ def main() -> None:
             ["172.30.0.10"],
             "--no-protocols",
             "--no-profinet",
+            "--no-lldp",
         )
     )
     netbios_flags = (

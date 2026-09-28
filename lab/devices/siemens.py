@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Siemens lab device: Snap7 server, PROFINET DCP, and SNMP Simulator."""
 
+import os
 import signal
 import subprocess
 import threading
@@ -12,6 +13,7 @@ from snap7.server import Server
 INTERFACE = "eth0"
 DCP_MULTICAST = bytes.fromhex("010ECF000000")
 ETHERTYPE = bytes.fromhex("8892")
+RESPONSE_DELAY_SECONDS = float(os.environ.get("OTTER_DCP_RESPONSE_DELAY_SECONDS", "0"))
 
 
 def block(option: int, suboption: int, payload: bytes) -> bytes:
@@ -67,7 +69,9 @@ def respond_dcp(packet: Ether) -> None:
     if not 1 <= response_delay_factor <= 0x1900:
         return
     mac = bytes.fromhex(get_if_hwaddr(INTERFACE).replace(":", ""))
-    if response_delay_factor > 1:
+    if RESPONSE_DELAY_SECONDS > 0:
+        time.sleep(RESPONSE_DELAY_SECONDS)
+    elif response_delay_factor > 1:
         spread = int.from_bytes(mac[-2:], "big") % response_delay_factor
         time.sleep(spread * 0.01)
     data = dcp_blocks(mac)
@@ -99,6 +103,7 @@ def start_snmp() -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         [
             "snmpsim-command-responder",
+            "--logging-method=null",
             "--v3-engine-id=80004FB8054F544C4142",
             "--data-dir=/lab/snmp-data",
             "--cache-dir=/tmp/snmpsim",

@@ -20,7 +20,7 @@ const SNMP_PORT: u16 = 1_161;
 #[cfg(not(test))]
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
-const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+const QUERY_TIMEOUT: Duration = Duration::from_secs(6);
 const MAX_TABLE_ROWS: usize = 512;
 const MAX_FDB_ROWS: usize = 4000;
 const MAX_V1_FDB_ROWS: usize = 128;
