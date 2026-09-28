@@ -3,6 +3,7 @@ RUN pip install --no-cache-dir \
       python-snap7==2.0.2 \
       scapy==2.6.1 \
       snmpsim==1.2.2 \
+      pysnmp==7.1.29 \
       pysmi==1.6.2 \
       cryptography==45.0.7
 COPY devices/siemens.py /lab/siemens.py
