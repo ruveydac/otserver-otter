@@ -11,7 +11,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub trait LogOutput: Send + Sync {
@@ -745,17 +745,38 @@ pub async fn scan(
                     .into(),
             );
         }
-        logger.log("Scanning PROFINET DCP...".into());
+        logger.log(format!(
+            "Scanning PROFINET DCP; awaiting Identify replies for at least {} seconds...",
+            profinet::DCP_RESPONSE_WINDOW.as_secs()
+        ));
         let selected = options.interface.clone();
         let mac = source_mac.clone();
+        let cancellation = Arc::clone(cancelled);
+        let dcp_started = Instant::now();
         match tokio::task::spawn_blocking(move || {
-            profinet::scan(&selected, &mac, Duration::from_secs(4))
+            profinet::scan(
+                &selected,
+                &mac,
+                profinet::DCP_RESPONSE_WINDOW,
+                cancellation.as_ref(),
+            )
         })
         .await
         .map_err(|error| error.to_string())?
         {
             Ok(found) => {
-                logger.log(format!("PROFINET DCP found {} device(s).", found.len()));
+                let elapsed = dcp_started.elapsed().as_secs();
+                if cancelled.load(Ordering::Relaxed) {
+                    logger.log(format!(
+                        "PROFINET DCP collection stopped after {elapsed}s; found {} device(s).",
+                        found.len()
+                    ));
+                } else {
+                    logger.log(format!(
+                        "PROFINET DCP collection completed after {elapsed}s; found {} device(s).",
+                        found.len()
+                    ));
+                }
                 devices.extend(found);
             }
             Err(error) => {

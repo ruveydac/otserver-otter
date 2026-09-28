@@ -7,6 +7,7 @@ use std::ffi::{CStr, CString, c_char, c_int, c_uchar, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     FreeLibrary, GetLastError, HANDLE, HMODULE, SetLastError, WAIT_FAILED, WAIT_OBJECT_0,
@@ -20,9 +21,9 @@ use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 const RECEIVE_BUFFER_SIZE: usize = 1024 * 1024;
-const MAX_CAPTURED_FRAMES: usize = 4_096;
 const BPF_HEADER_MINIMUM: usize = 18;
 const PACKET_ALIGNMENT: usize = 4;
+const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 // Public bpf_insn/bpf_program layout from the Npcap SDK's Packet32.h.
 #[repr(C)]
@@ -39,9 +40,9 @@ struct BpfProgram {
     instructions: *mut BpfInsn,
 }
 
-// cBPF for `ether[12:2] == 0x8892`: load the etherType, accept PROFINET, drop the rest
-// in the driver so a busy segment does not flood the capture path.
-const DCP_FILTER: [BpfInsn; 4] = [
+// cBPF for successful DCP Identify responses. Cyclic PROFINET traffic must not accumulate during
+// the long response window.
+const DCP_FILTER: [BpfInsn; 10] = [
     BpfInsn {
         code: 0x28,
         jt: 0,
@@ -51,8 +52,44 @@ const DCP_FILTER: [BpfInsn; 4] = [
     BpfInsn {
         code: 0x15,
         jt: 0,
-        jf: 1,
+        jf: 7,
         k: 0x8892,
+    },
+    BpfInsn {
+        code: 0x28,
+        jt: 0,
+        jf: 0,
+        k: 14,
+    },
+    BpfInsn {
+        code: 0x15,
+        jt: 0,
+        jf: 5,
+        k: 0xfeff,
+    },
+    BpfInsn {
+        code: 0x30,
+        jt: 0,
+        jf: 0,
+        k: 16,
+    },
+    BpfInsn {
+        code: 0x15,
+        jt: 0,
+        jf: 3,
+        k: 0x05,
+    },
+    BpfInsn {
+        code: 0x30,
+        jt: 0,
+        jf: 0,
+        k: 17,
+    },
+    BpfInsn {
+        code: 0x15,
+        jt: 0,
+        jf: 1,
+        k: 0x01,
     },
     BpfInsn {
         code: 0x06,
@@ -270,7 +307,16 @@ pub fn interface_available(interface: &str) -> bool {
         .is_ok()
 }
 
-pub fn capture(interface: &str, request: &[u8], wait: Duration) -> Result<Vec<Vec<u8>>, String> {
+pub fn capture(
+    interface: &str,
+    request: &[u8],
+    wait: Duration,
+    cancelled: &AtomicBool,
+    mut on_frame: impl FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     let api = Api::load()?;
     let device = CString::new(find_device(&api, interface)?)
         .map_err(|_| "Npcap returned an invalid adapter name.".to_string())?;
@@ -314,9 +360,8 @@ pub fn capture(interface: &str, request: &[u8], wait: Duration) -> Result<Vec<Ve
             unsafe { GetLastError() },
         ));
     }
-    // Best effort: restrict the driver to PROFINET frames so a busy segment does not
-    // flood the capture path. If the filter cannot be installed, capture stays
-    // unfiltered and frames are filtered in user space as before.
+    // Best effort: restrict the driver to DCP Identify responses. If the filter cannot be
+    // installed, the same filtering is applied before frames reach the callback.
     if let Some(set_bpf) = api.set_bpf {
         let mut instructions = DCP_FILTER;
         let mut program = BpfProgram {
@@ -333,6 +378,9 @@ pub fn capture(interface: &str, request: &[u8], wait: Duration) -> Result<Vec<Ve
     let mut receive_buffer = vec![0_u8; RECEIVE_BUFFER_SIZE];
     let receive_length = u32::try_from(receive_buffer.len()).expect("bounded receive buffer");
 
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     // Send one Identify-All request. Its standards-compliant response delay factor spreads
     // replies across the capture window; repeating it would multiply traffic on a busy OT cell.
     // SAFETY: Npcap does not mutate or retain the caller-owned buffer, which outlives the
@@ -355,13 +403,17 @@ pub fn capture(interface: &str, request: &[u8], wait: Duration) -> Result<Vec<Ve
     }
 
     let started = Instant::now();
-    let mut frames = Vec::new();
     while started.elapsed() < wait {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
         let remaining = wait.saturating_sub(started.elapsed());
         // SAFETY: read_event belongs to the still-open adapter and remains valid for this call.
-        let wait_result = unsafe { WaitForSingleObject(read_event, wait_millis(remaining)) };
+        let wait_result = unsafe {
+            WaitForSingleObject(read_event, wait_millis(capture_wait_duration(remaining)))
+        };
         match wait_result {
-            WAIT_TIMEOUT => break,
+            WAIT_TIMEOUT => continue,
             WAIT_OBJECT_0 => {}
             WAIT_FAILED => {
                 return Err(npcap_error(
@@ -399,12 +451,9 @@ pub fn capture(interface: &str, request: &[u8], wait: Duration) -> Result<Vec<Ve
         if valid > receive_buffer.len() {
             return Err("Npcap returned an oversized capture buffer.".into());
         }
-        parse_bpf_records(&receive_buffer[..valid], &mut frames)?;
-        if frames.len() > MAX_CAPTURED_FRAMES {
-            return Err("Npcap capture exceeded the bounded packet limit.".into());
-        }
+        parse_bpf_records(&receive_buffer[..valid], &mut on_frame)?;
     }
-    Ok(frames)
+    Ok(())
 }
 
 fn allocate_packet(api: &Api) -> Result<PacketHandle, String> {
@@ -472,7 +521,10 @@ fn parse_multistring(buffer: &[i8]) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-fn parse_bpf_records(buffer: &[u8], frames: &mut Vec<Vec<u8>>) -> Result<(), String> {
+fn parse_bpf_records<F>(buffer: &[u8], on_frame: &mut F) -> Result<(), String>
+where
+    F: FnMut(&[u8]) -> Result<(), String>,
+{
     let mut offset = 0;
     while offset < buffer.len() {
         if buffer.len() - offset < BPF_HEADER_MINIMUM {
@@ -504,8 +556,8 @@ fn parse_bpf_records(buffer: &[u8], frames: &mut Vec<Vec<u8>>) -> Result<(), Str
             .filter(|end| *end <= buffer.len())
             .ok_or_else(|| "Npcap returned a truncated BPF packet.".to_string())?;
         let frame = &buffer[data_start..data_end];
-        if frame.len() >= 14 && frame[12..14] == [0x88, 0x92] {
-            frames.push(frame.to_vec());
+        if is_identify_response(frame) {
+            on_frame(frame)?;
         }
         let record_length = align_packet(header_length + caplen);
         if record_length == 0 || offset + record_length > buffer.len() {
@@ -516,8 +568,19 @@ fn parse_bpf_records(buffer: &[u8], frames: &mut Vec<Vec<u8>>) -> Result<(), Str
     Ok(())
 }
 
+fn is_identify_response(frame: &[u8]) -> bool {
+    frame.len() >= 18
+        && frame[12..14] == [0x88, 0x92]
+        && frame[14..16] == [0xfe, 0xff]
+        && frame[16..18] == [0x05, 0x01]
+}
+
 fn align_packet(length: usize) -> usize {
     (length + PACKET_ALIGNMENT - 1) & !(PACKET_ALIGNMENT - 1)
+}
+
+fn capture_wait_duration(remaining: Duration) -> Duration {
+    remaining.min(CAPTURE_POLL_INTERVAL)
 }
 
 fn wait_millis(duration: Duration) -> u32 {
@@ -563,7 +626,10 @@ fn symbol_name(name: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_adapter_name, is_npcap_name, parse_bpf_records, wait_millis};
+    use super::{
+        canonical_adapter_name, capture_wait_duration, is_npcap_name, parse_bpf_records,
+        wait_millis,
+    };
     use std::time::Duration;
 
     #[test]
@@ -587,23 +653,43 @@ mod tests {
         assert_eq!(wait_millis(Duration::ZERO), 1);
         assert_eq!(wait_millis(Duration::from_millis(250)), 250);
         assert_eq!(wait_millis(Duration::MAX), u32::MAX - 1);
+        assert_eq!(
+            capture_wait_duration(Duration::from_secs(60)),
+            Duration::from_millis(100)
+        );
     }
 
     #[test]
-    fn parses_bpf_records_and_keeps_only_profinet() {
-        let mut record = vec![0_u8; 36];
-        record[8..12].copy_from_slice(&14_u32.to_ne_bytes());
-        record[12..16].copy_from_slice(&14_u32.to_ne_bytes());
-        record[16..18].copy_from_slice(&20_u16.to_ne_bytes());
-        record[32..34].copy_from_slice(&[0x88, 0x92]);
+    fn parses_bpf_records_and_keeps_only_identify_responses() {
+        let mut response = vec![0_u8; 60];
+        response[12..14].copy_from_slice(&[0x88, 0x92]);
+        response[14..18].copy_from_slice(&[0xfe, 0xff, 0x05, 0x01]);
         let mut frames = Vec::new();
-        parse_bpf_records(&record, &mut frames).unwrap();
+        parse_bpf_records(&bpf_record(&response), &mut |frame| {
+            frames.push(frame.to_vec());
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(frames.len(), 1);
 
-        record[32..34].copy_from_slice(&[0x08, 0x00]);
+        response[14..16].copy_from_slice(&[0xfe, 0xfe]);
         frames.clear();
-        parse_bpf_records(&record, &mut frames).unwrap();
+        parse_bpf_records(&bpf_record(&response), &mut |frame| {
+            frames.push(frame.to_vec());
+            Ok(())
+        })
+        .unwrap();
         assert!(frames.is_empty());
+    }
+
+    fn bpf_record(frame: &[u8]) -> Vec<u8> {
+        let header_length = 20;
+        let mut record = vec![0_u8; super::align_packet(header_length + frame.len())];
+        record[8..12].copy_from_slice(&(frame.len() as u32).to_ne_bytes());
+        record[12..16].copy_from_slice(&(frame.len() as u32).to_ne_bytes());
+        record[16..18].copy_from_slice(&(header_length as u16).to_ne_bytes());
+        record[header_length..header_length + frame.len()].copy_from_slice(frame);
+        record
     }
 
     fn run_filter(filter: &[super::BpfInsn], frame: &[u8]) -> u32 {
@@ -615,6 +701,10 @@ mod tests {
                 0x28 => {
                     let offset = insn.k as usize;
                     accumulator = u16::from_be_bytes([frame[offset], frame[offset + 1]]) as u32;
+                    pc += 1;
+                }
+                0x30 => {
+                    accumulator = frame[insn.k as usize] as u32;
                     pc += 1;
                 }
                 0x15 => {
@@ -631,10 +721,15 @@ mod tests {
     }
 
     #[test]
-    fn dcp_filter_accepts_only_profinet_ethertype() {
-        let mut profinet = vec![0_u8; 60];
-        profinet[12..14].copy_from_slice(&[0x88, 0x92]);
-        assert!(run_filter(&super::DCP_FILTER, &profinet) > 0);
+    fn dcp_filter_accepts_only_successful_identify_responses() {
+        let mut identify = vec![0_u8; 60];
+        identify[12..14].copy_from_slice(&[0x88, 0x92]);
+        identify[14..18].copy_from_slice(&[0xfe, 0xff, 0x05, 0x01]);
+        assert!(run_filter(&super::DCP_FILTER, &identify) > 0);
+
+        let mut cyclic = identify.clone();
+        cyclic[14..16].copy_from_slice(&[0xfe, 0xfe]);
+        assert_eq!(run_filter(&super::DCP_FILTER, &cyclic), 0);
 
         let mut ipv4 = vec![0_u8; 60];
         ipv4[12..14].copy_from_slice(&[0x08, 0x00]);

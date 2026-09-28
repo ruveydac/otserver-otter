@@ -2,6 +2,9 @@ use crate::contract::{Device, Observation, Source, format_mac, hex, mac_bytes, n
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicBool;
+#[cfg(any(windows, target_os = "linux"))]
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 #[cfg(windows)]
 #[path = "profinet_npcap.rs"]
@@ -24,10 +27,14 @@ pub struct CaptureInterface {
 const DCP_MULTICAST: [u8; 6] = [0x01, 0x0e, 0xcf, 0x00, 0x00, 0x00];
 const PROFINET_ETHERTYPE: [u8; 2] = [0x88, 0x92];
 // Engineering tools must use a value from 0x0002 through 0x1900. A factor of 128 spreads
-// device responses over at most 1.27 seconds and gives the requester a three-second response
-// window. Never use zero: it is reserved and can make non-conforming devices reply at once.
+// device responses over at most 1.27 seconds. The collection window remains open independently
+// for slow devices. Never use zero: it is reserved and can make non-conforming devices reply at once.
 #[cfg(any(windows, target_os = "linux", test))]
 const DCP_RESPONSE_DELAY_FACTOR: u16 = 0x0080;
+
+/// Minimum time to collect replies after sending a PROFINET DCP Identify request.
+pub const DCP_RESPONSE_WINDOW: Duration = Duration::from_secs(60);
+const MAX_DCP_DEVICES: usize = 4_096;
 
 #[cfg(windows)]
 pub fn interfaces() -> Result<Vec<CaptureInterface>, String> {
@@ -179,7 +186,16 @@ pub fn interfaces() -> Result<Vec<CaptureInterface>, String> {
 }
 
 #[cfg(windows)]
-pub fn scan(interface: &str, source_mac: &str, wait: Duration) -> Result<Vec<Device>, String> {
+pub fn scan(
+    interface: &str,
+    source_mac: &str,
+    wait: Duration,
+    cancelled: &AtomicBool,
+) -> Result<Vec<Device>, String> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(Vec::new());
+    }
+    let wait = dcp_response_window(wait);
     let selected = windows_scan_interface(interface)?;
     let source = mac_bytes(source_mac)
         .ok_or_else(|| "A valid source MAC address is required.".to_string())?;
@@ -187,11 +203,17 @@ pub fn scan(interface: &str, source_mac: &str, wait: Duration) -> Result<Vec<Dev
     if npcap::available() {
         validate_source_mac(&selected, source_mac)?;
         let request = identify_request(source, xid);
-        let frames = npcap::capture(&selected.name, &request, wait)?;
-        return Ok(parse_active_frames(frames, source, xid));
+        let mut devices = BTreeMap::new();
+        npcap::capture(&selected.name, &request, wait, cancelled, |frame| {
+            collect_active_response(&mut devices, frame, source, xid)
+        })?;
+        return Ok(devices.into_values().collect());
     }
     let mut devices = BTreeMap::new();
-    for frame in windows_capture::capture(wait)? {
+    for frame in windows_capture::capture(wait, cancelled)? {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
         if frame.len() < 14 || frame[12..14] != PROFINET_ETHERTYPE || frame[6..12] == source {
             continue;
         }
@@ -202,7 +224,7 @@ pub fn scan(interface: &str, source_mac: &str, wait: Duration) -> Result<Vec<Dev
                 u32::from_be_bytes(frame[18..22].try_into().expect("four-byte slice")),
             )
         {
-            devices.insert(device.mac_address.clone(), device);
+            insert_dcp_device(&mut devices, device)?;
             continue;
         }
         let mac = format_mac(&frame[6..12]);
@@ -228,37 +250,69 @@ pub fn scan(interface: &str, source_mac: &str, wait: Duration) -> Result<Vec<Dev
                     .into(),
             ],
         };
-        devices.entry(mac.clone()).or_insert_with(|| Device {
-            mac_address: mac.clone(),
-            mac_addresses: vec![mac],
-            observations: vec![observation],
-            ..Device::default()
-        });
+        insert_passive_dcp_device(
+            &mut devices,
+            Device {
+                mac_address: mac.clone(),
+                mac_addresses: vec![mac],
+                observations: vec![observation],
+                ..Device::default()
+            },
+        )?;
     }
     Ok(devices.into_values().collect())
 }
 
-#[cfg(windows)]
-fn parse_active_frames(frames: Vec<Vec<u8>>, source: [u8; 6], xid: u32) -> Vec<Device> {
-    let mut devices = BTreeMap::new();
-    for frame in frames {
-        if frame.len() >= 14
-            && frame[6..12] != source
-            && let Some(device) = parse_response(&frame, xid)
-        {
-            devices.insert(device.mac_address.clone(), device);
-        }
+fn dcp_response_window(wait: Duration) -> Duration {
+    wait.max(DCP_RESPONSE_WINDOW)
+}
+
+fn collect_active_response(
+    devices: &mut BTreeMap<String, Device>,
+    frame: &[u8],
+    source: [u8; 6],
+    xid: u32,
+) -> Result<(), String> {
+    if frame.len() >= 14
+        && frame[6..12] != source
+        && let Some(device) = parse_response(frame, xid)
+    {
+        insert_dcp_device(devices, device)?;
     }
-    devices.into_values().collect()
+    Ok(())
+}
+
+fn insert_dcp_device(devices: &mut BTreeMap<String, Device>, device: Device) -> Result<(), String> {
+    if !devices.contains_key(&device.mac_address) && devices.len() >= MAX_DCP_DEVICES {
+        return Err(format!(
+            "PROFINET DCP discovery exceeded the bounded device limit of {MAX_DCP_DEVICES}."
+        ));
+    }
+    devices.insert(device.mac_address.clone(), device);
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn insert_passive_dcp_device(
+    devices: &mut BTreeMap<String, Device>,
+    device: Device,
+) -> Result<(), String> {
+    if !devices.contains_key(&device.mac_address) {
+        insert_dcp_device(devices, device)?;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
 mod windows_capture {
     use std::path::Path;
     use std::process::{Command, Output};
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
-    pub fn capture(wait: Duration) -> Result<Vec<Vec<u8>>, String> {
+    const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+    pub fn capture(wait: Duration, cancelled: &AtomicBool) -> Result<Vec<Vec<u8>>, String> {
         let id = format!(
             "{}-{}",
             std::process::id(),
@@ -275,7 +329,14 @@ mod windows_capture {
             .output()
             .map_err(|error| format!("Could not start pktmon: {error}"))?;
         command_result("Could not start pktmon capture", &started)?;
-        std::thread::sleep(wait);
+        let started_at = Instant::now();
+        while !cancelled.load(Ordering::Relaxed) {
+            let remaining = wait.saturating_sub(started_at.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(remaining.min(CANCELLATION_POLL_INTERVAL));
+        }
         let stopped = Command::new("pktmon")
             .arg("stop")
             .output()
@@ -382,12 +443,21 @@ mod windows_capture {
 }
 
 #[cfg(target_os = "linux")]
-pub fn scan(interface: &str, source_mac: &str, wait: Duration) -> Result<Vec<Device>, String> {
+pub fn scan(
+    interface: &str,
+    source_mac: &str,
+    wait: Duration,
+    cancelled: &AtomicBool,
+) -> Result<Vec<Device>, String> {
     use std::ffi::CString;
     use std::io;
     use std::mem::{size_of, zeroed};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(Vec::new());
+    }
+    let wait = dcp_response_window(wait);
     let source = mac_bytes(source_mac)
         .ok_or_else(|| "A valid source MAC address is required.".to_string())?;
     let xid = new_xid();
@@ -472,10 +542,15 @@ pub fn scan(interface: &str, source_mac: &str, wait: Duration) -> Result<Vec<Dev
     };
     send_request()?;
 
-    let deadline = Instant::now() + wait;
+    let deadline = Instant::now()
+        .checked_add(wait)
+        .ok_or_else(|| "PROFINET DCP response window is too large.".to_string())?;
     let mut buffer = [0_u8; 65_536];
     let mut devices = BTreeMap::new();
     while Instant::now() < deadline {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
         // SAFETY: buffer is writable for its full reported length and descriptor stays owned.
         let received = unsafe {
             libc::recv(
@@ -486,9 +561,7 @@ pub fn scan(interface: &str, source_mac: &str, wait: Duration) -> Result<Vec<Dev
             )
         };
         if received > 0 {
-            if let Some(device) = parse_response(&buffer[..received as usize], xid) {
-                devices.insert(device.mac_address.clone(), device);
-            }
+            collect_active_response(&mut devices, &buffer[..received as usize], source, xid)?;
             continue;
         }
         let error = io::Error::last_os_error();
@@ -505,7 +578,12 @@ pub fn scan(interface: &str, source_mac: &str, wait: Duration) -> Result<Vec<Dev
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-pub fn scan(_interface: &str, _source_mac: &str, _wait: Duration) -> Result<Vec<Device>, String> {
+pub fn scan(
+    _interface: &str,
+    _source_mac: &str,
+    _wait: Duration,
+    _cancelled: &AtomicBool,
+) -> Result<Vec<Device>, String> {
     Err("PROFINET capture is supported on Windows and Linux.".into())
 }
 
@@ -903,6 +981,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn enforces_a_one_minute_dcp_response_window() {
+        assert_eq!(
+            dcp_response_window(Duration::from_secs(4)),
+            DCP_RESPONSE_WINDOW
+        );
+    }
+
+    #[test]
+    fn deduplicates_active_identify_responses() {
+        let xid = 42;
+        let frame = response(xid, &[2, 2, 0, 5, 0, 0, b'p', b'l', b'c', 0]);
+        let mut devices = BTreeMap::new();
+        collect_active_response(&mut devices, &frame, [0, 1, 2, 3, 4, 5], xid).unwrap();
+        collect_active_response(&mut devices, &frame, [0, 1, 2, 3, 4, 5], xid).unwrap();
+        assert_eq!(devices.len(), 1);
+    }
+
+    #[test]
+    fn rejects_dcp_devices_beyond_the_memory_bound() {
+        let mut devices = BTreeMap::new();
+        for index in 0..MAX_DCP_DEVICES {
+            insert_dcp_device(
+                &mut devices,
+                Device {
+                    mac_address: index.to_string(),
+                    ..Device::default()
+                },
+            )
+            .unwrap();
+        }
+        let error = insert_dcp_device(
+            &mut devices,
+            Device {
+                mac_address: "overflow".into(),
+                ..Device::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("bounded device limit"));
+    }
+
+    #[test]
+    fn passive_profinet_traffic_keeps_a_parsed_dcp_identity() {
+        let mac = "00:11:22:33:44:55".to_string();
+        let mut devices = BTreeMap::new();
+        insert_dcp_device(
+            &mut devices,
+            Device {
+                mac_address: mac.clone(),
+                ip_addresses: vec!["192.0.2.1".into()],
+                ..Device::default()
+            },
+        )
+        .unwrap();
+        insert_passive_dcp_device(
+            &mut devices,
+            Device {
+                mac_address: mac.clone(),
+                ..Device::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(devices[&mac].ip_addresses, ["192.0.2.1"]);
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn cancelled_dcp_scan_skips_capture() {
+        let cancelled = AtomicBool::new(true);
+        assert!(
+            scan(
+                "invalid-interface",
+                "invalid-mac",
+                Duration::ZERO,
+                &cancelled
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn parses_identity_and_ip_blocks() {
         let xid = 0x1234_5678;
         let mut frame = identify_request([0, 1, 2, 3, 4, 5], xid);
@@ -1036,6 +1196,7 @@ mod tests {
 
     #[test]
     fn decodes_remaining_blocks_and_platform_input_errors() {
+        let cancelled = AtomicBool::new(false);
         let xid = 11;
         let mut blocks = Vec::new();
         add_block(&mut blocks, 1, 1, &[0, 1, 2, 3, 4, 6]);
@@ -1064,15 +1225,12 @@ mod tests {
             scan(
                 "missing-otserver-interface",
                 "00:11:22:33:44:55",
-                Duration::ZERO
+                Duration::ZERO,
+                &cancelled,
             )
             .is_err()
         );
-        assert!(scan("lo", "invalid", Duration::ZERO).is_err());
-        #[cfg(target_os = "linux")]
-        {
-            let _ = scan("lo", "00:11:22:33:44:55", Duration::ZERO);
-        }
+        assert!(scan("lo", "invalid", Duration::ZERO, &cancelled).is_err());
     }
 
     #[test]
@@ -1139,6 +1297,14 @@ mod tests {
     fn tests_windows_interfaces() {
         let result = interfaces();
         assert!(result.is_ok());
-        assert!(scan("invalid-iface", "invalid-mac", Duration::ZERO).is_err());
+        assert!(
+            scan(
+                "invalid-iface",
+                "invalid-mac",
+                Duration::ZERO,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
     }
 }

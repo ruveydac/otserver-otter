@@ -27,6 +27,9 @@ The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
   truncated, oversized, mismatched, or unsolicited responses.
 - Active DCP must verify that its source MAC belongs to the selected physical interface. Send
   Identify-All once with `ResponseDelayFactor` `0x0080`; never use zero or rapid retries.
+  After a successful send, collect replies for at least 60 seconds unless cancelled or capture
+  fails. Quiet reads do not end collection; filter and deduplicate confirmed Identify responses
+  as they arrive.
 - NetBIOS uses one unicast wildcard NBSTAT query to UDP 137. Keep the reported UNIT_ID as raw
   evidence, never as an override for ARP/DCP identity or a way to resolve MAC-less targets.
   It is enabled by default; `--no-netbios`, `noNetbios`, and the GUI toggle disable it.
