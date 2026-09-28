@@ -103,6 +103,7 @@ def start_snmp() -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         [
             "snmpsim-command-responder",
+            "--logging-method=null",
             "--v3-engine-id=80004FB8054F544C4142",
             "--data-dir=/lab/snmp-data",
             "--cache-dir=/tmp/snmpsim",
