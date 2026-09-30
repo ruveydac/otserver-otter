@@ -192,6 +192,13 @@ With ARP enabled, native protocols, SNMP, and LLDP probe only discovered, unambi
 from ARP or DCP. An unanswered target does not trigger a second IP-protocol sweep. To probe selected
 targets independently of ARP (for example, routed hosts), use `--no-arp` or turn off ARP in the GUI.
 MAC-less responses remain in `unresolved` and are never assigned a next-hop MAC.
+
+Use `--allow-dcp-source` (or `"allowDcpSource": true` / the GUI toggle) when DCP responders may be
+outside the configured target range. DCP runs first, its reported IPs are added to the ARP sweep, and
+the resulting ARP observation is merged with the DCP device by MAC, including OUI vendor resolution.
+Those unambiguous DCP identities are then eligible for all further IP protocol probes.
+DCP observations export the PROFINET vendor and device IDs as numeric `vendorId` and `deviceId`
+fields, while retaining the complete parsed block data under `raw`.
 EtherNet/IP preserves each valid List Identity transport response, and S7 preserves the accepted
 TSAP access path and both identity SZL payloads.
 
@@ -281,6 +288,7 @@ single-object form remains supported:
   },
   "noArp": false,
   "noProfinet": false,
+  "allowDcpSource": false,
   "noS7": false,
   "noEnip": false,
   "noBacnet": false,

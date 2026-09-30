@@ -12,7 +12,7 @@ use std::time::Instant;
 #[cfg(any(target_os = "linux", test))]
 const ARP_ETHERTYPE: [u8; 2] = [0x08, 0x06];
 const BROADCAST: [u8; 6] = [0xff; 6];
-const MAX_TARGETS: usize = 65_536;
+pub const MAX_TARGETS: usize = 65_536;
 
 #[derive(Clone, Copy)]
 struct Fingerprint {
@@ -759,6 +759,7 @@ mod tests {
             }),
         );
         assert_eq!(known.observations.len(), 2);
+        assert!(known.observations[0].fields.contains_key("vendor"));
         assert_eq!(
             known.observations[1].fields["operatingSystem"],
             "Linux/Unix family"

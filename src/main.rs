@@ -77,6 +77,8 @@ pub struct ScanArgs {
     #[arg(long)]
     pub no_profinet: bool,
     #[arg(long)]
+    pub allow_dcp_source: bool,
+    #[arg(long)]
     pub no_s7: bool,
     #[arg(long)]
     pub no_enip: bool,
@@ -125,6 +127,8 @@ pub struct ScannerConfig {
     pub no_arp: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_profinet: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_dcp_source: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_s7: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -251,6 +255,7 @@ pub struct ScanOptions {
     pub source_mac: String,
     pub output: PathBuf,
     pub protocols: ProtocolOptions,
+    pub allow_dcp_source: bool,
     pub snmp: Vec<snmp::Settings>,
     pub opcua: otserver_otter::protocols::OpcuaSettings,
     pub upload: Option<UploadOptions>,
@@ -542,6 +547,7 @@ pub fn resolve_scan(
             .or(config.output)
             .unwrap_or_else(|| PathBuf::from("otserver-scan.json")),
         protocols,
+        allow_dcp_source: args.allow_dcp_source || config.allow_dcp_source.unwrap_or(false),
         snmp: config
             .snmp
             .as_ref()
@@ -704,16 +710,22 @@ pub async fn scan(
 
     let target_addresses = discovery::expand_targets(&options.targets)?;
 
+    let dcp_first = options.allow_dcp_source && options.protocols.profinet;
+    if dcp_first && !cancelled.load(Ordering::Relaxed) {
+        match discover_profinet(&options.interface, &source_mac, logger, cancelled).await {
+            Ok(found) => devices.extend(found),
+            Err(error) => errors.push(error),
+        }
+    }
+
+    let arp_targets = if dcp_first {
+        dcp_arp_targets(&target_addresses, &devices)?
+    } else {
+        target_addresses.clone()
+    };
     if options.protocols.arp && !cancelled.load(Ordering::Relaxed) {
         logger.log("Executing ARP discovery...".into());
-        match discover(
-            &options.interface,
-            &source_mac,
-            &target_addresses,
-            cancelled,
-        )
-        .await
-        {
+        match discover(&options.interface, &source_mac, &arp_targets, cancelled).await {
             Ok(found) => {
                 logger.log(format!("ARP discovery found {} device(s).", found.len()));
                 for device in &found {
@@ -732,57 +744,10 @@ pub async fn scan(
         logger.log("ARP discovery disabled.".into());
     }
 
-    if options.protocols.profinet && !cancelled.load(Ordering::Relaxed) {
-        #[cfg(windows)]
-        if npcap_active {
-            logger.log(format!(
-                "Using Npcap {} for active PROFINET DCP; the selected adapter will be bound directly by GUID.",
-                npcap_version.as_deref().unwrap_or("(version unavailable)")
-            ));
-        } else {
-            logger.log(
-                "Npcap is not available. Windows will use passive pktmon PROFINET capture. Install Npcap explicitly from https://npcap.com/ to enable active DCP Identify. Driver installation is never a scan side effect."
-                    .into(),
-            );
-        }
-        logger.log(format!(
-            "Scanning PROFINET DCP; awaiting Identify replies for at least {} seconds...",
-            profinet::DCP_RESPONSE_WINDOW.as_secs()
-        ));
-        let selected = options.interface.clone();
-        let mac = source_mac.clone();
-        let cancellation = Arc::clone(cancelled);
-        let dcp_started = Instant::now();
-        match tokio::task::spawn_blocking(move || {
-            profinet::scan(
-                &selected,
-                &mac,
-                profinet::DCP_RESPONSE_WINDOW,
-                cancellation.as_ref(),
-            )
-        })
-        .await
-        .map_err(|error| error.to_string())?
-        {
-            Ok(found) => {
-                let elapsed = dcp_started.elapsed().as_secs();
-                if cancelled.load(Ordering::Relaxed) {
-                    logger.log(format!(
-                        "PROFINET DCP collection stopped after {elapsed}s; found {} device(s).",
-                        found.len()
-                    ));
-                } else {
-                    logger.log(format!(
-                        "PROFINET DCP collection completed after {elapsed}s; found {} device(s).",
-                        found.len()
-                    ));
-                }
-                devices.extend(found);
-            }
-            Err(error) => {
-                logger.log(format!("PROFINET DCP error: {error}"));
-                errors.push(error);
-            }
+    if options.protocols.profinet && !dcp_first && !cancelled.load(Ordering::Relaxed) {
+        match discover_profinet(&options.interface, &source_mac, logger, cancelled).await {
+            Ok(found) => devices.extend(found),
+            Err(error) => errors.push(error),
         }
     }
     devices = merge_devices(devices);
@@ -792,7 +757,12 @@ pub async fn scan(
     ));
     logger.devices(configuration, &devices);
 
-    let probe_targets = ip_probe_targets(&target_addresses, &devices, options.protocols.arp);
+    let probe_targets = ip_probe_targets(
+        &target_addresses,
+        &devices,
+        options.protocols.arp,
+        options.allow_dcp_source,
+    );
     logger.log(format!(
         "IP protocol targets: {} ({}).",
         probe_targets.len(),
@@ -1088,6 +1058,88 @@ async fn discover(
     .map_err(|error| error.to_string())?
 }
 
+async fn discover_profinet(
+    interface: &str,
+    source_mac: &str,
+    logger: &dyn LogOutput,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<Vec<Device>, String> {
+    #[cfg(windows)]
+    let npcap_active = profinet::npcap_available();
+    #[cfg(windows)]
+    let npcap_version = npcap_active.then(profinet::npcap_version).flatten();
+    #[cfg(windows)]
+    if npcap_active {
+        logger.log(format!(
+            "Using Npcap {} for active PROFINET DCP; the selected adapter will be bound directly by GUID.",
+            npcap_version.as_deref().unwrap_or("(version unavailable)")
+        ));
+    } else {
+        logger.log(
+            "Npcap is not available. Windows will use passive pktmon PROFINET capture. Install Npcap explicitly from https://npcap.com/ to enable active DCP Identify. Driver installation is never a scan side effect."
+                .into(),
+        );
+    }
+    logger.log(format!(
+        "Scanning PROFINET DCP; awaiting Identify replies for at least {} seconds...",
+        profinet::DCP_RESPONSE_WINDOW.as_secs()
+    ));
+    let selected = interface.to_owned();
+    let mac = source_mac.to_owned();
+    let cancellation = Arc::clone(cancelled);
+    let started = Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
+        profinet::scan(
+            &selected,
+            &mac,
+            profinet::DCP_RESPONSE_WINDOW,
+            cancellation.as_ref(),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    match &result {
+        Ok(found) => logger.log(format!(
+            "PROFINET DCP collection {} after {}s; found {} device(s).",
+            if cancelled.load(Ordering::Relaxed) {
+                "stopped"
+            } else {
+                "completed"
+            },
+            started.elapsed().as_secs(),
+            found.len()
+        )),
+        Err(error) => logger.log(format!("PROFINET DCP error: {error}")),
+    }
+    result
+}
+
+fn dcp_arp_targets(selected: &[Ipv4Addr], devices: &[Device]) -> Result<Vec<Ipv4Addr>, String> {
+    let mut targets = selected.iter().copied().collect::<BTreeSet<_>>();
+    for device in devices {
+        if !device
+            .observations
+            .iter()
+            .any(|observation| observation.source == Source::ProfinetDcp)
+        {
+            continue;
+        }
+        targets.extend(
+            device
+                .ip_addresses
+                .iter()
+                .filter_map(|ip| ip.parse::<Ipv4Addr>().ok()),
+        );
+    }
+    if targets.len() > discovery::MAX_TARGETS {
+        return Err(format!(
+            "The scan contains more than {} IPv4 addresses. Split it into smaller scans.",
+            discovery::MAX_TARGETS
+        ));
+    }
+    Ok(targets.into_iter().collect())
+}
+
 fn scan_source_mac(
     selected: &str,
     configured: &str,
@@ -1158,10 +1210,12 @@ fn ip_probe_targets(
     selected: &[Ipv4Addr],
     devices: &[Device],
     arp_enabled: bool,
+    allow_dcp_source: bool,
 ) -> BTreeSet<Ipv4Addr> {
     let mut targets = unique_ip_identities(devices)
         .keys()
         .filter_map(|ip| ip.parse::<Ipv4Addr>().ok())
+        .filter(|ip| allow_dcp_source || selected.contains(ip))
         .collect::<BTreeSet<_>>();
     if !arp_enabled {
         targets.extend(selected);
@@ -1446,6 +1500,7 @@ mod tests {
             no_protocols: false,
             no_arp: false,
             no_profinet: false,
+            allow_dcp_source: false,
             no_s7: false,
             no_enip: false,
             no_bacnet: false,
@@ -1472,6 +1527,7 @@ mod tests {
                 "output":"configured.json",
                 "snmp":[{"version":"3","username":"ops","authProtocol":"sha256","authPassword":"secret"}],
                 "noProtocols":true,
+                "allowDcpSource":true,
                 "serverUrl":"https://otserver.example/base/",
                 "site":"site-1",
                 "apiKey":"config-key"
@@ -1488,6 +1544,7 @@ mod tests {
         assert_eq!(resolved.output, PathBuf::from("configured.json"));
         assert!(resolved.protocols.arp);
         assert!(resolved.protocols.profinet);
+        assert!(resolved.allow_dcp_source);
         assert!(!resolved.protocols.s7);
         assert!(!resolved.protocols.enip);
         assert!(!resolved.protocols.bacnet);
@@ -1526,6 +1583,7 @@ mod tests {
             no_protocols: None,
             no_arp: Some(true),
             no_profinet: None,
+            allow_dcp_source: None,
             no_s7: Some(true),
             no_enip: None,
             no_bacnet: Some(true),
@@ -1729,6 +1787,7 @@ mod tests {
             "otserver-otter",
             "scan",
             "--ack-authorized",
+            "--allow-dcp-source",
             "--no-arp",
             "--no-profinet",
             "--no-s7",
@@ -1747,6 +1806,7 @@ mod tests {
         let Some(Commands::Scan(args)) = cli.command else {
             panic!("expected scan command");
         };
+        assert!(args.allow_dcp_source);
         assert!(args.no_arp);
         assert!(args.no_profinet);
         assert!(args.no_s7);
@@ -1792,6 +1852,7 @@ mod tests {
         cli.source_mac = Some("00:11:22:33:44:55".into());
         let resolved = resolve_scan(cli, ScannerConfig::default(), None).unwrap();
         assert_eq!(resolved.protocols, ProtocolOptions::default());
+        assert!(!resolved.allow_dcp_source);
         assert_eq!(resolved.snmp, vec![snmp::Settings::default()]);
         assert_eq!(snmp::resolved_version(&resolved.snmp[0]), "2c");
         assert!(snmp::auth(&resolved.snmp[0]).is_ok());
@@ -1806,17 +1867,17 @@ mod tests {
             ..Device::default()
         }];
         assert_eq!(
-            ip_probe_targets(&selected, &found, true),
+            ip_probe_targets(&selected, &found, true, false),
             [selected[0]].into()
         );
-        assert!(ip_probe_targets(&selected, &[], true).is_empty());
-        assert!(ip_probe_targets(&selected[1..], &[], true).is_empty());
+        assert!(ip_probe_targets(&selected, &[], true, false).is_empty());
+        assert!(ip_probe_targets(&selected[1..], &found, true, false).is_empty());
         assert_eq!(
-            ip_probe_targets(&selected, &found, false),
+            ip_probe_targets(&selected, &found, false, false),
             selected.iter().copied().collect()
         );
         assert_eq!(
-            ip_probe_targets(&selected, &[], false),
+            ip_probe_targets(&selected, &[], false, false),
             selected.iter().copied().collect()
         );
 
@@ -1825,7 +1886,35 @@ mod tests {
             ip_addresses: vec!["192.0.2.1".into()],
             ..Device::default()
         };
-        assert!(ip_probe_targets(&selected, &[found[0].clone(), conflict], true).is_empty());
+        assert!(ip_probe_targets(&selected, &[found[0].clone(), conflict], true, false).is_empty());
+    }
+
+    #[test]
+    fn allow_dcp_source_adds_out_of_range_ip_to_arp_and_probe_targets() {
+        let selected = [Ipv4Addr::new(12, 0, 0, 1)];
+        let dcp = Device {
+            mac_address: "00:11:22:33:44:55".into(),
+            ip_addresses: vec!["13.1.1.1".into()],
+            observations: vec![otserver_otter::contract::Observation {
+                source: Source::ProfinetDcp,
+                observed_at: String::new(),
+                ip_address: Some("13.1.1.1".into()),
+                mac_address: Some("00:11:22:33:44:55".into()),
+                fields: BTreeMap::new(),
+                raw: serde_json::Value::Null,
+                warnings: vec![],
+            }],
+            ..Device::default()
+        };
+        assert_eq!(
+            dcp_arp_targets(&selected, std::slice::from_ref(&dcp)).unwrap(),
+            [Ipv4Addr::new(12, 0, 0, 1), Ipv4Addr::new(13, 1, 1, 1)]
+        );
+        assert!(ip_probe_targets(&selected, std::slice::from_ref(&dcp), true, false).is_empty());
+        assert_eq!(
+            ip_probe_targets(&selected, std::slice::from_ref(&dcp), true, true),
+            [Ipv4Addr::new(13, 1, 1, 1)].into()
+        );
     }
 
     #[test]
@@ -2030,6 +2119,7 @@ mod tests {
             source_mac: "00:11:22:33:44:55".into(),
             output: output.clone(),
             protocols: ProtocolOptions::default(),
+            allow_dcp_source: false,
             snmp: vec![snmp::Settings::default()],
             opcua: protocols::OpcuaSettings::default(),
             upload: None,
@@ -2057,6 +2147,7 @@ mod tests {
             source_mac: "00:11:22:33:44:55".into(),
             output: output.clone(),
             protocols: ProtocolOptions::default(),
+            allow_dcp_source: false,
             snmp: vec![snmp::Settings::default()],
             opcua: protocols::OpcuaSettings::default(),
             upload: None,

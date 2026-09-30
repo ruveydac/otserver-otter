@@ -704,14 +704,12 @@ pub fn parse_response(frame: &[u8], expected_xid: u32) -> Option<Device> {
                 if payload.len() < 4 {
                     return None;
                 }
-                raw.insert(
-                    "vendorId".into(),
-                    json!(u16::from_be_bytes([payload[0], payload[1]])),
-                );
-                raw.insert(
-                    "deviceId".into(),
-                    json!(u16::from_be_bytes([payload[2], payload[3]])),
-                );
+                let vendor_id = u16::from_be_bytes([payload[0], payload[1]]);
+                let device_id = u16::from_be_bytes([payload[2], payload[3]]);
+                fields.insert("vendorId".into(), json!(vendor_id));
+                fields.insert("deviceId".into(), json!(device_id));
+                raw.insert("vendorId".into(), json!(vendor_id));
+                raw.insert("deviceId".into(), json!(device_id));
             }
             (2, 4) => {
                 if payload.len() < 2 {
@@ -1112,6 +1110,7 @@ mod tests {
                 0, 0, 0, 0, 0, 0,
             ],
         );
+        add_block(&mut blocks, 2, 3, &[0, 42, 0, 7]);
         add_block(&mut blocks, 2, 4, &[3, 0]);
         add_block(&mut blocks, 2, 6, b"port-001.plc");
         add_block(&mut blocks, 2, 7, &[0x12, 0x34]);
@@ -1123,6 +1122,11 @@ mod tests {
             .unwrap()
             .observations[0];
         assert_eq!(observation.fields["ipAddress"], "192.0.2.1");
+        assert_eq!(observation.fields["vendorId"], 42);
+        assert_eq!(observation.fields["deviceId"], 7);
+        let exported = serde_json::to_value(observation).unwrap();
+        assert_eq!(exported["fields"]["vendorId"], 42);
+        assert_eq!(exported["fields"]["deviceId"], 7);
         assert_eq!(observation.raw["dnsServers"][0], "192.0.2.53");
         assert_eq!(observation.raw["deviceRole"]["roles"][1], "io-controller");
         assert_eq!(observation.raw["aliasName"], "port-001.plc");
@@ -1213,6 +1217,8 @@ mod tests {
         add_block(&mut blocks, 99, 99, &[1]);
         let device = parse_response(&response(xid, &blocks), xid).unwrap();
         let raw = &device.observations[0].raw;
+        assert_eq!(device.observations[0].fields["vendorId"], 42);
+        assert_eq!(device.observations[0].fields["deviceId"], 7);
         assert_eq!(raw["vendorId"], 42);
         assert_eq!(raw["deviceOptions"][1]["suboption"], 4);
         assert_eq!(raw["deviceInitiative"], 1);
