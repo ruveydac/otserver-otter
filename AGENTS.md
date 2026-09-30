@@ -20,6 +20,9 @@ The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
   log stale configured MACs and export the actual sender MAC. With ARP enabled, native protocols,
   SNMP, and LLDP use discovered, unambiguous MAC/IP pairs. Only explicit ARP disablement enables
   IP probing independently of Layer-2 discovery; never substitute a gateway MAC for a routed target.
+- `--allow-dcp-source`, `allowDcpSource`, and the GUI toggle run DCP before ARP, add reported DCP IPs
+  to the ARP sweep, and allow unambiguous DCP identities outside the configured range into later IP
+  probes; preserve MAC correlation and OUI vendor resolution.
 - Keep discovery read-only. Do not add configuration writes, DCP Set, SNMP SET, DNP3 writes,
   operates, class assignment, freezes, or restarts, brute force, exploits, vulnerability scripts, or
   Modbus requests without an explicit product decision and safety review.

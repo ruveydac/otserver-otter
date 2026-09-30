@@ -237,6 +237,7 @@ pub struct GuiApp {
     opcua_password: String,
     arp_enabled: bool,
     profinet_enabled: bool,
+    allow_dcp_source: bool,
     s7_enabled: bool,
     enip_enabled: bool,
     bacnet_enabled: bool,
@@ -302,6 +303,7 @@ impl GuiApp {
             opcua_password: String::new(),
             arp_enabled: true,
             profinet_enabled: true,
+            allow_dcp_source: false,
             s7_enabled: true,
             enip_enabled: true,
             bacnet_enabled: true,
@@ -378,6 +380,7 @@ impl GuiApp {
         let legacy_native_disabled = config.no_protocols.unwrap_or(false);
         self.arp_enabled = !config.no_arp.unwrap_or(false);
         self.profinet_enabled = !config.no_profinet.unwrap_or(false);
+        self.allow_dcp_source = config.allow_dcp_source.unwrap_or(false);
         self.s7_enabled = !(legacy_native_disabled || config.no_s7.unwrap_or(false));
         self.enip_enabled = !(legacy_native_disabled || config.no_enip.unwrap_or(false));
         self.bacnet_enabled = !(legacy_native_disabled || config.no_bacnet.unwrap_or(false));
@@ -515,6 +518,7 @@ impl GuiApp {
         config.no_protocols = None;
         config.no_arp = (!self.arp_enabled).then_some(true);
         config.no_profinet = (!self.profinet_enabled).then_some(true);
+        config.allow_dcp_source = self.allow_dcp_source.then_some(true);
         config.no_s7 = (!self.s7_enabled).then_some(true);
         config.no_enip = (!self.enip_enabled).then_some(true);
         config.no_bacnet = (!self.bacnet_enabled).then_some(true);
@@ -975,6 +979,9 @@ impl eframe::App for GuiApp {
                                 ui.toggle_value(&mut self.arp_enabled, "ARP").changed();
                             protocol_changed |= ui
                                 .toggle_value(&mut self.profinet_enabled, "PROFINET DCP")
+                                .changed();
+                            protocol_changed |= ui
+                                .toggle_value(&mut self.allow_dcp_source, "Allow DCP source")
                                 .changed();
                             protocol_changed |=
                                 ui.toggle_value(&mut self.s7_enabled, "S7").changed();
@@ -1713,6 +1720,21 @@ mod tests {
             app.netbios_enabled = !app.netbios_enabled;
             assert_eq!(app.to_config().no_netbios, (!disabled).then_some(true));
             assert_eq!(app.to_config().no_protocols, None);
+        }
+    }
+
+    #[test]
+    fn allow_dcp_source_toggle_roundtrips() {
+        for enabled in [false, true] {
+            let config = ScannerConfig {
+                allow_dcp_source: enabled.then_some(true),
+                ..ScannerConfig::default()
+            };
+            let mut app = GuiApp::new(ScannerConfigs::Single(Box::new(config)));
+            assert_eq!(app.allow_dcp_source, enabled);
+            assert_eq!(app.to_config().allow_dcp_source, enabled.then_some(true));
+            app.allow_dcp_source = !enabled;
+            assert_eq!(app.to_config().allow_dcp_source, (!enabled).then_some(true));
         }
     }
 
