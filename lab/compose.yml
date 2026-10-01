@@ -7,7 +7,7 @@ services:
       dockerfile: devices/Dockerfile.siemens
     cap_add: [NET_RAW]
     environment:
-      OTTER_DCP_RESPONSE_DELAY_SECONDS: "55"
+      OTTER_DCP_RESPONSE_DELAY_SECONDS: "${OTTER_DCP_RESPONSE_DELAY_SECONDS:-55}"
     healthcheck: &process-health
       test: [CMD-SHELL, "kill -0 1"]
       interval: 1s

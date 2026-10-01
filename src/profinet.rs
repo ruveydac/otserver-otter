@@ -9,6 +9,10 @@ use std::time::Duration;
 #[cfg(windows)]
 #[path = "profinet_npcap.rs"]
 mod npcap;
+#[path = "profinet_pnio.rs"]
+mod pnio;
+#[cfg(any(windows, target_os = "linux"))]
+use std::net::Ipv4Addr;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
 #[cfg(any(windows, target_os = "linux", test))]
@@ -207,6 +211,13 @@ pub fn scan(
         npcap::capture(&selected.name, &request, wait, cancelled, |frame| {
             collect_active_response(&mut devices, frame, source, xid)
         })?;
+        if let Ok(source_ip) = crate::discovery::source_ipv4(&selected.name) {
+            if let Err(error) =
+                enrich_windows_pnio(&selected.name, source, source_ip, &mut devices, cancelled)
+            {
+                add_pnio_warning(&mut devices, error);
+            }
+        }
         return Ok(devices.into_values().collect());
     }
     let mut devices = BTreeMap::new();
@@ -299,6 +310,330 @@ fn insert_passive_dcp_device(
 ) -> Result<(), String> {
     if !devices.contains_key(&device.mac_address) {
         insert_dcp_device(devices, device)?;
+    }
+    Ok(())
+}
+
+fn add_pnio_warning(devices: &mut BTreeMap<String, Device>, error: String) {
+    for device in devices.values_mut() {
+        if let Some(observation) = device
+            .observations
+            .iter_mut()
+            .find(|observation| observation.source == Source::ProfinetDcp)
+        {
+            observation
+                .warnings
+                .push(format!("PROFINET PNIO record scan skipped: {error}"));
+        }
+    }
+}
+
+fn attach_pnio_records(device: &mut Device, records: Vec<pnio::RecordRead>) {
+    if records.is_empty() {
+        return;
+    }
+    let observed_at = crate::now();
+    let ip_address = device.ip_addresses.first().cloned();
+    let mut fields = BTreeMap::from([
+        ("lastSeen".into(), json!(observed_at.clone())),
+        ("macAddress".into(), json!(device.mac_address.clone())),
+        ("protocols".into(), json!(["profinet", "profinet-pnio"])),
+        ("status".into(), json!("online")),
+    ]);
+    if let Some(software_revision) = records
+        .iter()
+        .find(|record| record.target.index == 0xAFF0)
+        .and_then(|record| record.parsed["softwareRevision"].as_str())
+    {
+        fields.insert("softwareRevision".into(), json!(software_revision));
+    }
+    let raw_records = records
+        .iter()
+        .map(|record| {
+            json!({
+                "api": record.target.api,
+                "slot": record.target.slot,
+                "subslot": record.target.subslot,
+                "index": format!("0x{:04X}", record.target.index),
+                "parsed": record.parsed,
+                "raw": hex(&record.data),
+            })
+        })
+        .collect::<Vec<_>>();
+    device.observations.push(Observation {
+        source: Source::ProfinetDcp,
+        observed_at,
+        ip_address: ip_address.clone(),
+        mac_address: Some(device.mac_address.clone()),
+        fields,
+        raw: json!({ "pnioRecords": raw_records }),
+        warnings: vec![],
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn enrich_linux_pnio(
+    interface: &str,
+    source_mac: [u8; 6],
+    source_ip: Ipv4Addr,
+    devices: &mut BTreeMap<String, Device>,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::io;
+    use std::mem::{size_of, zeroed};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    if devices.is_empty() {
+        return Ok(());
+    }
+    let name = CString::new(interface)
+        .map_err(|_| "The Linux interface name contains an invalid null byte.".to_string())?;
+    // SAFETY: name is a valid C string for this call.
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    if index == 0 {
+        return Err(format!("Could not find Linux interface {interface}."));
+    }
+    let protocol = u16::from_be_bytes([0x08, 0x00]).to_be();
+    // SAFETY: socket returns a new descriptor which is owned immediately below.
+    let descriptor = unsafe {
+        libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            i32::from(protocol),
+        )
+    };
+    if descriptor < 0 {
+        return Err(format!(
+            "Could not open the Linux PROFINET RPC raw socket: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: descriptor was returned by socket and has not been transferred elsewhere.
+    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    // SAFETY: zero is a valid initial state for sockaddr_ll.
+    let mut address: libc::sockaddr_ll = unsafe { zeroed() };
+    address.sll_family = libc::AF_PACKET as u16;
+    address.sll_protocol = protocol;
+    address.sll_ifindex = index as i32;
+    address.sll_halen = 6;
+    let bound = unsafe {
+        libc::bind(
+            descriptor.as_raw_fd(),
+            (&raw const address).cast(),
+            size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+        )
+    };
+    if bound < 0 {
+        return Err(format!(
+            "Could not bind Linux PROFINET RPC interface {interface}: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let mut send = |frame: &[u8]| {
+        if frame.len() < 6 {
+            return Err("PROFINET RPC frame was shorter than an Ethernet address.".into());
+        }
+        address.sll_addr[..6].copy_from_slice(&frame[..6]);
+        crate::discovery::send_with_retry(|| {
+            crate::traffic::send_blocking(crate::traffic::Kind::Other, || {
+                // SAFETY: frame and address remain valid during sendto.
+                let sent = unsafe {
+                    libc::sendto(
+                        descriptor.as_raw_fd(),
+                        frame.as_ptr().cast(),
+                        frame.len(),
+                        0,
+                        (&raw const address).cast(),
+                        size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+                    )
+                };
+                if sent == frame.len() as isize {
+                    Ok(())
+                } else if sent < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "short RPC frame send",
+                    ))
+                }
+            })
+        })
+        .map_err(|error| format!("Could not send complete PROFINET RPC frame: {error}"))
+    };
+    let mut buffer = [0_u8; 65_536];
+    let mut receive = || {
+        // SAFETY: buffer is writable for its full length and descriptor remains owned.
+        let received = unsafe {
+            libc::recv(
+                descriptor.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0,
+            )
+        };
+        if received > 0 {
+            Ok(Some(buffer[..received as usize].to_vec()))
+        } else {
+            let error = io::Error::last_os_error();
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) {
+                Ok(None)
+            } else {
+                Err(format!("Linux PROFINET RPC capture failed: {error}"))
+            }
+        }
+    };
+
+    for device in devices.values_mut() {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        let Some(target_ip) = device
+            .ip_addresses
+            .iter()
+            .find_map(|value| value.parse::<Ipv4Addr>().ok())
+        else {
+            continue;
+        };
+        let Some(target_mac) = mac_bytes(&device.mac_address) else {
+            continue;
+        };
+        let result = pnio::read_records(
+            Duration::from_secs(2),
+            cancelled,
+            |target_port, request, timeout, cancelled| {
+                pnio::exchange(
+                    source_mac,
+                    source_ip,
+                    target_mac,
+                    target_ip,
+                    target_port,
+                    request,
+                    timeout,
+                    cancelled,
+                    &mut send,
+                    &mut receive,
+                )
+            },
+        );
+        match result {
+            Ok(records) => attach_pnio_records(device, records),
+            Err(error) => {
+                if let Some(observation) = device
+                    .observations
+                    .iter_mut()
+                    .find(|observation| observation.source == Source::ProfinetDcp)
+                {
+                    observation.warnings.push(format!(
+                        "PROFINET PNIO record scan failed for {target_ip}: {error}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn enrich_windows_pnio(
+    interface: &str,
+    source_mac: [u8; 6],
+    source_ip: Ipv4Addr,
+    devices: &mut BTreeMap<String, Device>,
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    for device in devices.values_mut() {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        let Some(target_ip) = device
+            .ip_addresses
+            .iter()
+            .find_map(|value| value.parse::<Ipv4Addr>().ok())
+        else {
+            continue;
+        };
+        let Some(target_mac) = mac_bytes(&device.mac_address) else {
+            continue;
+        };
+        let result = pnio::read_records(
+            Duration::from_millis(500),
+            cancelled,
+            |target_port, request, timeout, cancelled| {
+                let (request_header, _) = pnio::parse_rpc_fragment(request)?;
+                let raw_request = pnio::ethernet_ipv4_udp_frame(
+                    source_mac,
+                    target_mac,
+                    source_ip,
+                    target_ip,
+                    pnio::rpc_port(),
+                    target_port,
+                    request,
+                )?;
+                let mut fragments = Vec::new();
+                npcap::capture_raw(interface, &raw_request, timeout, cancelled, |frame| {
+                    let Some(udp) = pnio::parse_ipv4_udp_frame(frame) else {
+                        return Ok(None);
+                    };
+                    if udp.source_mac != target_mac
+                        || udp.destination_mac != source_mac
+                        || udp.source_ip != target_ip
+                        || udp.destination_ip != source_ip
+                        || udp.source_port != target_port
+                        || udp.destination_port != pnio::rpc_port()
+                    {
+                        return Ok(None);
+                    }
+                    let Ok((header, body)) = pnio::parse_rpc_fragment(udp.payload) else {
+                        return Ok(None);
+                    };
+                    if header.packet_type != 2
+                        || header.object_uuid != request_header.object_uuid
+                        || header.interface_uuid != request_header.interface_uuid
+                        || header.activity_uuid != request_header.activity_uuid
+                        || header.sequence != request_header.sequence
+                        || header.operation != request_header.operation
+                    {
+                        return Ok(None);
+                    }
+                    let ack = if header.requires_fragment_ack() {
+                        let payload = pnio::build_fragment_ack(&header);
+                        Some(pnio::ethernet_ipv4_udp_frame(
+                            source_mac,
+                            target_mac,
+                            source_ip,
+                            target_ip,
+                            pnio::rpc_port(),
+                            target_port,
+                            &payload,
+                        )?)
+                    } else {
+                        None
+                    };
+                    fragments.push((header, body));
+                    Ok(ack)
+                })?;
+                pnio::reassemble_rpc_fragments(fragments)
+            },
+        );
+        match result {
+            Ok(records) => attach_pnio_records(device, records),
+            Err(error) => {
+                if let Some(observation) = device
+                    .observations
+                    .iter_mut()
+                    .find(|observation| observation.source == Source::ProfinetDcp)
+                {
+                    observation.warnings.push(format!(
+                        "PROFINET PNIO record scan failed for {target_ip}: {error}"
+                    ));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -573,6 +908,11 @@ pub fn scan(
             continue;
         }
         return Err(format!("Linux PROFINET capture failed: {error}"));
+    }
+    if let Ok(source_ip) = crate::discovery::source_ipv4(interface)
+        && let Err(error) = enrich_linux_pnio(interface, source, source_ip, &mut devices, cancelled)
+    {
+        add_pnio_warning(&mut devices, error);
     }
     Ok(devices.into_values().collect())
 }

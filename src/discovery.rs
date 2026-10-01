@@ -187,7 +187,7 @@ fn reply(
 }
 
 #[cfg(windows)]
-fn source_ipv4(interface: &str) -> Result<Ipv4Addr, String> {
+pub(crate) fn source_ipv4(interface: &str) -> Result<Ipv4Addr, String> {
     crate::profinet::interfaces()?
         .into_iter()
         .find(|item| item.name == interface || item.friendly_name == interface)
@@ -200,7 +200,7 @@ fn source_ipv4(interface: &str) -> Result<Ipv4Addr, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn source_ipv4(interface: &str) -> Result<Ipv4Addr, String> {
+pub(crate) fn source_ipv4(interface: &str) -> Result<Ipv4Addr, String> {
     use std::ffi::{CStr, CString};
     use std::net::Ipv4Addr;
     use std::ptr::{self, NonNull};
@@ -245,7 +245,7 @@ fn source_ipv4(interface: &str) -> Result<Ipv4Addr, String> {
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-fn source_ipv4(_interface: &str) -> Result<Ipv4Addr, String> {
+pub(crate) fn source_ipv4(_interface: &str) -> Result<Ipv4Addr, String> {
     Err("Native discovery is supported on Windows and Linux.".into())
 }
 

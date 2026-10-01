@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
-"""Siemens lab device: Snap7 server, PROFINET DCP, and SNMP Simulator."""
+"""Siemens lab device: Snap7, PROFINET DCP/PNIO, and SNMP Simulator."""
 
 import os
 import signal
+from uuid import UUID
 import subprocess
 import threading
 import time
 
-from scapy.all import Ether, get_if_hwaddr, sendp, sniff
+from scapy.all import Ether, IP, Raw, UDP, get_if_hwaddr, sendp, sniff
 from snap7.server import Server
 
 INTERFACE = "eth0"
 DCP_MULTICAST = bytes.fromhex("010ECF000000")
 ETHERTYPE = bytes.fromhex("8892")
+EPM_PORT = 34964
+PNIO_PORT = 49155
+NIL_UUID = "00000000-0000-0000-0000-000000000000"
+EPM_INTERFACE_UUID = "e1af8308-5d1f-11c9-91a4-08002b14a0fa"
+PNIO_INTERFACE_UUID = "dea00001-6c97-11d1-8271-00a02442df7d"
+PNIO_OBJECT_UUID = "dea00000-6c97-11d1-8271-0001002a0007"
 RESPONSE_DELAY_SECONDS = float(os.environ.get("OTTER_DCP_RESPONSE_DELAY_SECONDS", "0"))
 
 
@@ -99,6 +106,236 @@ def run_dcp() -> None:
     )
 
 
+def wire_uuid(value: str) -> bytes:
+    raw = UUID(value).bytes
+    return raw[3::-1] + raw[5:3:-1] + raw[7:5:-1] + raw[8:]
+
+
+def record_block(block_type: int, payload: bytes, version: tuple[int, int] = (1, 0)) -> bytes:
+    return (
+        block_type.to_bytes(2, "big")
+        + (len(payload) + 2).to_bytes(2, "big")
+        + bytes(version)
+        + payload
+    )
+
+
+def module_record(block_type: int, version: tuple[int, int]) -> bytes:
+    payload = (
+        (1).to_bytes(2, "big")
+        + (0).to_bytes(4, "big")
+        + (1).to_bytes(2, "big")
+        + (1).to_bytes(2, "big")
+        + (0x1111).to_bytes(4, "big")
+        + (1).to_bytes(2, "big")
+        + (1).to_bytes(2, "big")
+        + (0x2222).to_bytes(4, "big")
+    )
+    return record_block(block_type, payload, version)
+
+
+def im5_record() -> bytes:
+    payload = bytearray(b" " * 152)
+    payload[0:64] = b"A" * 64
+    payload[64:128] = b"B" * 64
+    payload[128:130] = (0x1234).to_bytes(2, "big")
+    payload[130:146] = b"C" * 16
+    payload[146:148] = (3).to_bytes(2, "big")
+    payload[148:152] = b"V\x01\x02\x03"
+    entries = [
+        record_block(0x0034, bytes(payload)),
+        record_block(0x0036, b""),
+        record_block(0x0037, b""),
+        record_block(0x0038, b""),
+    ]
+    return record_block(0x0025, (4).to_bytes(2, "big") + b"".join(entries))
+
+
+def pnio_record(index: int) -> bytes:
+    if index == 0xF821:
+        return record_block(0x001A, (1).to_bytes(2, "big") + (0).to_bytes(4, "big"))
+    if index == 0xF840:
+        return module_record(0x0030, (1, 0))
+    if index == 0xF000:
+        return module_record(0x0013, (1, 1))
+    if index == 0xAFF0:
+        payload = bytearray(54)
+        payload[0:2] = (0x1234).to_bytes(2, "big")
+        payload[2:7] = b"ORD-1"
+        payload[22:28] = b"SERIAL"
+        payload[38:40] = (3).to_bytes(2, "big")
+        payload[40:44] = b"V\x01\x02\x03"
+        payload[44:46] = (4).to_bytes(2, "big")
+        payload[46:48] = (0x0102).to_bytes(2, "big")
+        payload[48:50] = (7).to_bytes(2, "big")
+        payload[50:52] = b"\x01\x02"
+        payload[52:54] = (0x003E).to_bytes(2, "big")
+        return record_block(0x0020, bytes(payload))
+    if index == 0xAFF1:
+        return record_block(0x0021, b"FUNCTION" + b" " * 46)
+    if index == 0xAFF2:
+        return record_block(0x0022, b"2026-10-01" + b" " * 6)
+    if index == 0xAFF3:
+        return record_block(0x0023, b"DESCRIPTOR" + b" " * 44)
+    if index == 0xAFF4:
+        payload = bytearray(54)
+        payload[0:4] = b"crc1"
+        for index, value in enumerate(range(1, 11)):
+            offset = 4 + index * 4
+            payload[offset : offset + 4] = value.to_bytes(4, "big")
+        return record_block(0x0024, bytes(payload))
+    if index == 0xAFF5:
+        return im5_record()
+    raise ValueError(f"unsupported PNIO record 0x{index:04X}")
+
+
+def pnio_header(request: bytes, body_length: int, flags: int, fragment_number: int) -> bytes:
+    return (
+        bytes((4, 2, flags, 0, 0x10, 0, 0, 0))
+        + request[8:24]
+        + request[24:40]
+        + request[40:56]
+        + request[56:68]
+        + request[68:74]
+        + body_length.to_bytes(2, "little")
+        + fragment_number.to_bytes(2, "little")
+        + b"\0\0"
+    )
+
+
+def epm_floor_uuid(value: str) -> bytes:
+    return (
+        (19).to_bytes(2, "little")
+        + b"\x0D"
+        + wire_uuid(value)
+        + (1).to_bytes(2, "little")
+        + (2).to_bytes(2, "little")
+        + (1).to_bytes(2, "little")
+    )
+
+
+def epm_body() -> bytes:
+    floors = (
+        epm_floor_uuid(PNIO_INTERFACE_UUID)
+        + epm_floor_uuid("8a885d04-1ceb-11c9-9fe8-08002b104860")
+        + (1).to_bytes(2, "little")
+        + b"\x0A"
+        + (2).to_bytes(2, "little")
+        + (0).to_bytes(2, "little")
+        + (1).to_bytes(2, "little")
+        + b"\x08"
+        + (2).to_bytes(2, "little")
+        + PNIO_PORT.to_bytes(2, "big")
+        + (1).to_bytes(2, "little")
+        + b"\x09"
+        + (4).to_bytes(2, "little")
+        + bytes((172, 30, 0, 10))
+    )
+    tower = (
+        (1).to_bytes(4, "little")
+        + (0).to_bytes(4, "little")
+        + (0).to_bytes(4, "little")
+        + (len(floors) + 2).to_bytes(4, "little")
+        + (len(floors) + 2).to_bytes(4, "little")
+        + (5).to_bytes(2, "little")
+        + floors
+    )
+    body = (
+        (0).to_bytes(4, "little")
+        + wire_uuid(NIL_UUID)
+        + (1).to_bytes(4, "little")
+        + (1).to_bytes(4, "little")
+        + (0).to_bytes(4, "little")
+        + (1).to_bytes(4, "little")
+        + wire_uuid(PNIO_OBJECT_UUID)
+        + tower
+    )
+    if len(body) % 2:
+        body += b"\0"
+    return body + (0).to_bytes(4, "little")
+
+
+def read_body(request: bytes) -> bytes:
+    api = int.from_bytes(request[124:128], "big")
+    slot = int.from_bytes(request[128:130], "big")
+    subslot = int.from_bytes(request[130:132], "big")
+    index = int.from_bytes(request[134:136], "big")
+    record = pnio_record(index)
+    iod = (
+        (0x8009).to_bytes(2, "big")
+        + (60).to_bytes(2, "big")
+        + b"\x01\0"
+        + (0).to_bytes(2, "big")
+        + UUID(NIL_UUID).bytes
+        + api.to_bytes(4, "big")
+        + slot.to_bytes(2, "big")
+        + subslot.to_bytes(2, "big")
+        + (0).to_bytes(2, "big")
+        + index.to_bytes(2, "big")
+        + len(record).to_bytes(4, "big")
+        + (0).to_bytes(2, "big")
+        + (0).to_bytes(2, "big")
+        + b"\0" * 20
+        + record
+    )
+    count = 64 + len(record)
+    return (
+        (0).to_bytes(4, "little")
+        + count.to_bytes(4, "little")
+        + count.to_bytes(4, "little")
+        + (0).to_bytes(4, "little")
+        + count.to_bytes(4, "little")
+        + iod
+    )
+
+
+def send_rpc_response(packet: Ether, request: bytes, body: bytes) -> None:
+    fragments = []
+    if len(body) > 64:
+        split = len(body) // 2
+        fragments = [(body[:split], 0x04, 0), (body[split:], 0x06, 1)]
+    else:
+        fragments = [(body, 0x02, 0)]
+    mac = get_if_hwaddr(INTERFACE)
+    for fragment, flags, number in fragments:
+        payload = pnio_header(request, len(fragment), flags, number) + fragment
+        response = (
+            Ether(dst=packet.src, src=mac)
+            / IP(src=packet[IP].dst, dst=packet[IP].src)
+            / UDP(sport=packet[UDP].dport, dport=packet[UDP].sport)
+            / Raw(load=payload)
+        )
+        sendp(response, iface=INTERFACE, verbose=False)
+
+
+def respond_pnio(packet: Ether) -> None:
+    if not packet.haslayer(IP) or not packet.haslayer(UDP):
+        return
+    request = bytes(packet[UDP].payload)
+    if len(request) < 80 or request[0] != 4 or request[1] & 0x1F != 0:
+        return
+    operation = int.from_bytes(request[68:70], "little")
+    if packet[UDP].dport == EPM_PORT and operation == 2:
+        body = epm_body()
+    elif packet[UDP].dport == PNIO_PORT and operation == 5:
+        body = read_body(request)
+    else:
+        return
+    send_rpc_response(packet, request, body)
+
+
+def run_pnio() -> None:
+    sniff(
+        iface=INTERFACE,
+        store=False,
+        prn=respond_pnio,
+        lfilter=lambda packet: packet.haslayer(Ether)
+        and packet.haslayer(IP)
+        and packet.haslayer(UDP)
+        and packet[UDP].dport in (EPM_PORT, PNIO_PORT),
+    )
+
+
 def start_snmp() -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         [
@@ -128,6 +365,7 @@ def main() -> None:
     s7.start(tcp_port=102)
     snmp = start_snmp()
     threading.Thread(target=run_dcp, daemon=True).start()
+    threading.Thread(target=run_pnio, daemon=True).start()
     try:
         while not stop.wait(0.5):
             if snmp.poll() is not None:
