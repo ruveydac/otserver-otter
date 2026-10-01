@@ -6,10 +6,11 @@ contract, or safety boundary.
 ## Project Summary
 
 OTserver Otter is a read-only Rust discovery CLI and GUI for Windows and Linux. It discovers OT
-assets with native ARP, PROFINET DCP Identify, S7 identity, EtherNet/IP List Identity, BACnet
-ReadProperty, Omron FINS identity, Niagara Fox hello, DNP3 Group 0 device attributes, NetBIOS Node
-Status, OPC UA asset discovery, SNMP GET/WALK, and LLDP. It exports `otserver-scan`
-schema-version-2 JSON for OTserver.
+assets with native ARP, PROFINET DCP Identify and PNIO I&M record reads (EPM endpoint mapping,
+bounded read requests, and DCE/RPC fragmentation/FACK handling), S7 identity, EtherNet/IP List
+Identity, BACnet ReadProperty, Omron FINS identity, Niagara Fox hello, DNP3 Group 0 device
+attributes, NetBIOS Node Status, OPC UA asset discovery, SNMP GET/WALK, and LLDP. It exports
+`otserver-scan` schema-version-2 JSON for OTserver.
 
 The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
 
@@ -73,6 +74,7 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo llvm-cov --lib --fail-under-lines 90 --summary-only -- --test-threads=1
 ./lab/test.sh
+./lab/test-pnio.sh
 git diff --check
 ```
 

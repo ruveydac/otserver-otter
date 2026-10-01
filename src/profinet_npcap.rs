@@ -314,6 +314,30 @@ pub fn capture(
     cancelled: &AtomicBool,
     mut on_frame: impl FnMut(&[u8]) -> Result<(), String>,
 ) -> Result<(), String> {
+    capture_inner(interface, request, wait, cancelled, true, |frame| {
+        on_frame(frame)?;
+        Ok(None)
+    })
+}
+
+pub fn capture_raw(
+    interface: &str,
+    request: &[u8],
+    wait: Duration,
+    cancelled: &AtomicBool,
+    on_frame: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>, String>,
+) -> Result<(), String> {
+    capture_inner(interface, request, wait, cancelled, false, on_frame)
+}
+
+fn capture_inner(
+    interface: &str,
+    request: &[u8],
+    wait: Duration,
+    cancelled: &AtomicBool,
+    dcp_only: bool,
+    mut on_frame: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>, String>,
+) -> Result<(), String> {
     if cancelled.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -362,15 +386,17 @@ pub fn capture(
     }
     // Best effort: restrict the driver to DCP Identify responses. If the filter cannot be
     // installed, the same filtering is applied before frames reach the callback.
-    if let Some(set_bpf) = api.set_bpf {
-        let mut instructions = DCP_FILTER;
-        let mut program = BpfProgram {
-            length: instructions.len() as u32,
-            instructions: instructions.as_mut_ptr(),
-        };
-        // SAFETY: adapter is open; program and instructions outlive the call, and the
-        // driver copies the filter rather than retaining the pointer.
-        unsafe { (set_bpf)(adapter.handle, &mut program) };
+    if dcp_only {
+        if let Some(set_bpf) = api.set_bpf {
+            let mut instructions = DCP_FILTER;
+            let mut program = BpfProgram {
+                length: instructions.len() as u32,
+                instructions: instructions.as_mut_ptr(),
+            };
+            // SAFETY: adapter is open; program and instructions outlive the call, and the
+            // driver copies the filter rather than retaining the pointer.
+            unsafe { (set_bpf)(adapter.handle, &mut program) };
+        }
     }
     let tx_packet = allocate_packet(&api)?;
     let rx_packet = allocate_packet(&api)?;
@@ -451,7 +477,37 @@ pub fn capture(
         if valid > receive_buffer.len() {
             return Err("Npcap returned an oversized capture buffer.".into());
         }
-        parse_bpf_records(&receive_buffer[..valid], &mut on_frame)?;
+        let mut deliver = |frame: &[u8]| {
+            if dcp_only && !is_identify_response(frame) {
+                return Ok(());
+            }
+            if let Some(response) = on_frame(frame)? {
+                let response_length = u32::try_from(response.len())
+                    .map_err(|_| "Npcap response frame is too large.".to_string())?;
+                // SAFETY: Packet.dll reads the caller-owned response synchronously.
+                unsafe {
+                    (api.init_packet)(
+                        tx_packet.packet,
+                        response.as_ptr().cast_mut().cast(),
+                        response_length,
+                    )
+                };
+                if crate::traffic::send_blocking(crate::traffic::Kind::Other, || unsafe {
+                    (api.send_packet)(adapter.handle, tx_packet.packet, 1)
+                }) == 0
+                {
+                    return Err(format!(
+                        "Npcap could not transmit a response on {interface}."
+                    ));
+                }
+            }
+            Ok(())
+        };
+        if dcp_only {
+            parse_bpf_records(&receive_buffer[..valid], &mut deliver)?;
+        } else {
+            parse_bpf_records_raw(&receive_buffer[..valid], &mut deliver)?;
+        }
     }
     Ok(())
 }
@@ -525,6 +581,20 @@ fn parse_bpf_records<F>(buffer: &[u8], on_frame: &mut F) -> Result<(), String>
 where
     F: FnMut(&[u8]) -> Result<(), String>,
 {
+    parse_bpf_records_impl(buffer, on_frame, true)
+}
+
+fn parse_bpf_records_raw<F>(buffer: &[u8], on_frame: &mut F) -> Result<(), String>
+where
+    F: FnMut(&[u8]) -> Result<(), String>,
+{
+    parse_bpf_records_impl(buffer, on_frame, false)
+}
+
+fn parse_bpf_records_impl<F>(buffer: &[u8], on_frame: &mut F, dcp_only: bool) -> Result<(), String>
+where
+    F: FnMut(&[u8]) -> Result<(), String>,
+{
     let mut offset = 0;
     while offset < buffer.len() {
         if buffer.len() - offset < BPF_HEADER_MINIMUM {
@@ -556,7 +626,7 @@ where
             .filter(|end| *end <= buffer.len())
             .ok_or_else(|| "Npcap returned a truncated BPF packet.".to_string())?;
         let frame = &buffer[data_start..data_end];
-        if is_identify_response(frame) {
+        if !dcp_only || is_identify_response(frame) {
             on_frame(frame)?;
         }
         let record_length = align_packet(header_length + caplen);

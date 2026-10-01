@@ -129,6 +129,25 @@ def assert_full(result: dict) -> None:
         and link["raw"]["remotePno"]["portNoS"] == "eth0"
         for link in result["links"]
     )
+    pnio = next(
+        item
+        for item in siemens["observations"]
+        if "pnioRecords" in (item.get("raw") or {})
+    )
+    pnio_records = pnio["raw"]["pnioRecords"]
+    assert len(pnio_records) >= 15
+    assert {
+        "0xF821",
+        "0xF840",
+        "0xF000",
+        "0xAFF0",
+        "0xAFF1",
+        "0xAFF2",
+        "0xAFF3",
+        "0xAFF4",
+        "0xAFF5",
+    } <= {record["index"] for record in pnio_records}
+    assert pnio["fields"]["protocols"] == ["profinet", "profinet-pnio"]
 
     ethernet_ip = observation(by_mac(result, DEVICES["ethernet_ip"]), "ethernet-ip")
     assert ethernet_ip["fields"] | {
@@ -271,9 +290,59 @@ def assert_v3(result: dict) -> None:
     assert snmp["fields"]["serialNumber"] == "S7LAB0001"
 
 
+def assert_pnio(result: dict) -> None:
+    assert result["format"] == "otserver-scan" and result["schemaVersion"] == 2
+    assert result["scan"].get("partial", False) is False
+    assert result["errors"] == []
+    assert len(result["devices"]) == 1
+    device = by_mac(result, DEVICES["siemens"])
+    pnio = next(
+        item
+        for item in device["observations"]
+        if "pnioRecords" in (item.get("raw") or {})
+    )
+    records = pnio["raw"]["pnioRecords"]
+    assert len(records) >= 15
+    assert {
+        "0xF821",
+        "0xF840",
+        "0xF000",
+        "0xAFF0",
+        "0xAFF1",
+        "0xAFF2",
+        "0xAFF3",
+        "0xAFF4",
+        "0xAFF5",
+    } <= {record["index"] for record in records}
+    assert pnio["fields"]["protocols"] == ["profinet", "profinet-pnio"]
+    by_index = {record["index"]: record["parsed"] for record in records}
+    assert by_index["0xF821"]["apis"][0]["api"] == 0
+    assert by_index["0xF000"]["apis"][0]["modules"][0]["slot"] == 1
+    assert by_index["0xAFF0"]["softwareRevision"] == "V1.2.3"
+    assert by_index["0xAFF0"]["imSupported"] == 0x003E
+    assert by_index["0xAFF1"]["function"] == "FUNCTION"
+    assert by_index["0xAFF5"]["im5Data"][0]["imSoftwareRevision"] == "V1.2.3"
+    assert len(by_index["0xAFF5"]["assetManagementBlocks"]) == 3
+
+
 def main() -> None:
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
     run_id = uuid.uuid4().hex[:8]
+    if os.environ.get("OTTER_PNIO_ONLY") == "1":
+        path = ARTIFACTS / f"pnio-{run_id}.otserver.json"
+        assert_pnio(
+            scan(
+                path,
+                ["172.30.0.10"],
+                "--no-arp",
+                "--no-protocols",
+                "--no-snmp",
+                "--no-lldp",
+            )
+        )
+        os.chmod(path, 0o666)
+        print("OTserver Otter PNIO virtual lab passed.", flush=True)
+        return
     full_path = ARTIFACTS / f"full-scan-{run_id}.otserver.json"
     v3_path = ARTIFACTS / f"snmp-v3-{run_id}.otserver.json"
     netbios_disabled_path = ARTIFACTS / f"netbios-disabled-{run_id}.otserver.json"
