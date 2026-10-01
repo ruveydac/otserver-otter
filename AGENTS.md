@@ -62,6 +62,9 @@ The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
 ## Generated Files
 
 - Commit `Cargo.lock` when `Cargo.toml` changes.
+- Regenerate `src/profinet_database.rs` with `python3 databases/generate_database.py` whenever
+  `databases/Man_ID_Table.xml` or `databases/Profile_ID_Table.xml` changes; the compiled tables
+  keep the binary standalone.
 - Never commit `otter.json`, legacy `otscanner.json`, scan output, build output, Docker lab
   artifacts, packet captures, credentials, or Python/Rust caches.
 

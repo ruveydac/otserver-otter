@@ -148,6 +148,10 @@ def assert_full(result: dict) -> None:
         "0xAFF5",
     } <= {record["index"] for record in pnio_records}
     assert pnio["fields"]["protocols"] == ["profinet", "profinet-pnio"]
+    assert (
+        pnio["fields"]["manufacturer"]
+        == "Chengdu Zongheng Intelligence Control Technology Co., Ltd."
+    )
 
     ethernet_ip = observation(by_mac(result, DEVICES["ethernet_ip"]), "ethernet-ip")
     assert ethernet_ip["fields"] | {
@@ -315,13 +319,29 @@ def assert_pnio(result: dict) -> None:
         "0xAFF5",
     } <= {record["index"] for record in records}
     assert pnio["fields"]["protocols"] == ["profinet", "profinet-pnio"]
+    assert (
+        pnio["fields"]["manufacturer"]
+        == "Chengdu Zongheng Intelligence Control Technology Co., Ltd."
+    )
     by_index = {record["index"]: record["parsed"] for record in records}
     assert by_index["0xF821"]["apis"][0]["api"] == 0
     assert by_index["0xF000"]["apis"][0]["modules"][0]["slot"] == 1
     assert by_index["0xAFF0"]["softwareRevision"] == "V1.2.3"
     assert by_index["0xAFF0"]["imSupported"] == 0x003E
+    assert (
+        by_index["0xAFF0"]["manufacturerName"]
+        == "Chengdu Zongheng Intelligence Control Technology Co., Ltd."
+    )
+    assert (
+        by_index["0xAFF0"]["profileName"]
+        == "PROFIBUS: reserved for Device IDs; PROFINET: reserved for Profile IDs"
+    )
     assert by_index["0xAFF1"]["function"] == "FUNCTION"
     assert by_index["0xAFF5"]["im5Data"][0]["imSoftwareRevision"] == "V1.2.3"
+    assert (
+        by_index["0xAFF5"]["im5Data"][0]["vendorName"]
+        == "Chengdu Zongheng Intelligence Control Technology Co., Ltd."
+    )
     assert len(by_index["0xAFF5"]["assetManagementBlocks"]) == 3
 
 
