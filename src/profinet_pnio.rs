@@ -817,19 +817,28 @@ pub(crate) fn parse_record(index: u16, data: &[u8]) -> Result<Value, String> {
 
 fn parse_im0(data: &[u8]) -> Result<Value, String> {
     validate_fixed_block(data, 0x0020, 56, "I&M0")?;
-    Ok(json!({
+    let manufacturer_id = read_be16(data, 6)?;
+    let profile_id = read_be16(data, 52)?;
+    let mut result = json!({
         "blockType": 0x0020,
-        "manufacturerId": format!("{:04X}", read_be16(data, 6)?),
+        "manufacturerId": format!("{:04X}", manufacturer_id),
         "orderId": clean_text(&data[8..28]),
         "serialNumber": clean_text(&data[28..44]),
         "hardwareRevision": read_be16(data, 44)?.to_string(),
         "softwareRevision": software_revision(&data[46..50]),
         "revisionCounter": read_be16(data, 50)?.to_string(),
-        "profileId": format!("{:04X}", read_be16(data, 52)?),
+        "profileId": format!("{:04X}", profile_id),
         "profileDetails": read_be16(data, 54)?.to_string(),
         "imVersion": format!("{}.{}", data[56], data[57]),
         "imSupported": read_be16(data, 58)?,
-    }))
+    });
+    if let Some(name) = crate::profinet_database::manufacturer_name(manufacturer_id) {
+        result["manufacturerName"] = json!(name);
+    }
+    if let Some(name) = crate::profinet_database::profile_name(profile_id) {
+        result["profileName"] = json!(name);
+    }
+    Ok(result)
 }
 
 fn parse_im1(data: &[u8]) -> Result<Value, String> {
@@ -934,15 +943,20 @@ fn parse_im5_data(data: &[u8]) -> Result<Value, String> {
     if data.len() < 158 {
         return Err("I&M5 data entry was truncated.".into());
     }
-    Ok(json!({
+    let vendor_id = read_be16(data, 134)?;
+    let mut result = json!({
         "blockType": 0x0034,
         "imAnnotation": clean_text(&data[6..70]),
         "imOrderId": clean_text(&data[70..134]),
-        "vendorId": format!("{:04X}", read_be16(data, 134)?),
+        "vendorId": format!("{:04X}", vendor_id),
         "imSerialNumber": clean_text(&data[136..152]),
         "imHardwareRevision": read_be16(data, 152)?.to_string(),
         "imSoftwareRevision": software_revision(&data[154..158]),
-    }))
+    });
+    if let Some(name) = crate::profinet_database::manufacturer_name(vendor_id) {
+        result["vendorName"] = json!(name);
+    }
+    Ok(result)
 }
 
 fn parse_api_record(data: &[u8], expected_type: u16) -> Result<Value, String> {
@@ -1970,12 +1984,17 @@ mod tests {
         record[44..46].copy_from_slice(&3_u16.to_be_bytes());
         record[46..50].copy_from_slice(b"A\x01\x02\x03");
         record[50..52].copy_from_slice(&4_u16.to_be_bytes());
-        record[52..54].copy_from_slice(&0x0102_u16.to_be_bytes());
+        record[52..54].copy_from_slice(&0x3B00_u16.to_be_bytes());
         record[54..56].copy_from_slice(&7_u16.to_be_bytes());
         record[56..58].copy_from_slice(&[1, 2]);
         record[58..60].copy_from_slice(&0x002E_u16.to_be_bytes());
         let parsed = parse_record(0xAFF0, &record).unwrap();
         assert_eq!(parsed["manufacturerId"], "1234");
+        assert_eq!(
+            parsed["manufacturerName"],
+            "Chengdu Zongheng Intelligence Control Technology Co., Ltd."
+        );
+        assert_eq!(parsed["profileName"], "Robot and Numeric Controls");
         assert_eq!(parsed["softwareRevision"], "A1.2.3");
         assert_eq!(parsed["imSupported"], 0x2E);
         assert!(parse_record(0xAFF0, &record[..59]).is_err());
@@ -2025,6 +2044,38 @@ mod tests {
         im5_record.extend(im5_data);
         let parsed = parse_record(0xAFF5, &im5_record).unwrap();
         assert_eq!(parsed["im5Data"][0]["imSoftwareRevision"], "V1.2.3");
+        assert_eq!(
+            parsed["im5Data"][0]["vendorName"],
+            "Chengdu Zongheng Intelligence Control Technology Co., Ltd."
+        );
+    }
+
+    #[test]
+    fn resolves_manufacturer_and_profile_names() {
+        assert_eq!(
+            crate::profinet_database::manufacturer_name(42),
+            Some("SIEMENS AG")
+        );
+        assert_eq!(crate::profinet_database::manufacturer_name(0xFDE8), None);
+        assert_eq!(
+            crate::profinet_database::profile_name(0x3B00),
+            Some("Robot and Numeric Controls")
+        );
+        assert_eq!(
+            crate::profinet_database::profile_name(0),
+            Some("Unspecified")
+        );
+
+        let mut record = vec![0; 60];
+        record[..6].copy_from_slice(&[0, 0x20, 0, 56, 1, 0]);
+        record[6..8].copy_from_slice(&0xFDE8_u16.to_be_bytes());
+        record[52..54].copy_from_slice(&0xFFFF_u16.to_be_bytes());
+        let parsed = parse_record(0xAFF0, &record).unwrap();
+        assert!(parsed.get("manufacturerName").is_none());
+        assert_eq!(
+            parsed["profileName"],
+            "PROFIBUS: reserved for Device IDs; PROFINET: reserved for Profile IDs"
+        );
     }
 
     #[test]

@@ -347,6 +347,13 @@ fn attach_pnio_records(device: &mut Device, records: Vec<pnio::RecordRead>) {
     {
         fields.insert("softwareRevision".into(), json!(software_revision));
     }
+    if let Some(manufacturer) = records
+        .iter()
+        .find(|record| record.target.index == 0xAFF0)
+        .and_then(|record| record.parsed["manufacturerName"].as_str())
+    {
+        fields.insert("manufacturer".into(), json!(manufacturer));
+    }
     let raw_records = records
         .iter()
         .map(|record| {

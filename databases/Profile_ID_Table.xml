@@ -1,0 +1,263 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?xml-stylesheet type="text/xsl" href="Profile_ID_Table.xsl"?>
+<Profile_ID_Table xmlns="http://www.profibus.com/IM/2003/11/Profile_ID" xmlns:doc="http://www.profibus.com/Document" xmlns:prim="http://www.profibus.com/Common/2003/11/Primitives" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.profibus.com/IM/2003/11/Profile_ID
+IM-Profile_ID-v1.0.xsd" DefaultLanguage="en">
+		<doc:DocumentInfo Version="12" ReleaseType="Version" ReleaseDate="2025-10-20">
+		<prim:LastModified Tool="PROFIBUS I&amp;M Functions" User="PNO" Timestamp="2011-09-26T08:10:00+01:00"></prim:LastModified>
+		<doc:DocumentType>Table</doc:DocumentType>
+		<doc:DocumentTitle xml:lang="en">Profile ID Table</doc:DocumentTitle>
+		<doc:DocumentTitle xml:lang="de">Profil-ID-Tabelle</doc:DocumentTitle>
+		<doc:DocumentNumber>6.022</doc:DocumentNumber>
+		<doc:Author TC="4" TC_Name="System Integration" WG="6" WG_Name="XML@PROFIBUS"/>
+		<doc:Copyright>(C) Copyright PNO 2009 - All Rights Reserved</doc:Copyright>
+		<doc:Comment>This file contains the list of manufacturers/profiles within PNO. This XML document may be downloaded by any PROFIBUS or PROFINET engineering or service tools as long as its manufacturer is a member of the PROFIBUS International organization.</doc:Comment>
+	</doc:DocumentInfo>
+
+  <Profile ID="00001" EndID="14847">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">PROFIBUS: reserved for Device IDs; PROFINET: reserved for Profile IDs</ProfileName>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="19968" EndID="20223">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">IO-Link Master</ProfileName>
+		 <Info Tag="order_no" URI="2.812"/>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI="IM-Runtime_IOLinkMaster.xml"/>
+  </IM_Info>
+</Profile>
+<Profile ID="62976" EndID="63231">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">Generic Device (deprecated); PROFIBUS: strongly recommended to use 0x0000 instead; PROFINET: shall not be used</ProfileName>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI="Profile_specific_type_table_6102.xml"/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="15104" EndID="15359">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">Robot and Numeric Controls</ProfileName>
+		 <Info Tag="order_no" URI="3.051"/>
+    <Info xml:lang="en" Tag="spec" URI="3051_v10.pdf"/>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="15360" EndID="15615">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">Display &amp; Panel Devices</ProfileName>
+		 <Info Tag="order_no" URI="3.081"/>
+    <Info xml:lang="en" Tag="spec" URI="3081_v10.pdf"/>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="38656" EndID="38911">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">PA Devices (for Process Control)</ProfileName>
+		 <Info Tag="order_no" URI="3.042"/>
+    <Info xml:lang="en" Tag="spec" URI="3042_v30.pdf"/>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI="IM-Runtime_PA.xml"/>
+  </IM_Info>
+</Profile>
+<Profile ID="15616" EndID="15871">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">Encoder</ProfileName>
+		 <Info Tag="order_no" URI="3.162"/>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="15872" EndID="16127">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">Optical Safety Devices</ProfileName>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="14848" EndID="15103">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">PROFIdrive</ProfileName>
+		 <Info Tag="order_no" URI="3.172"/>
+    <Info xml:lang="de" Tag="spec" URI="3172_d30.pdf"/>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="16128" EndID="16383">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">Fluid Power / Hydraulics</ProfileName>
+		 <Info Tag="order_no" URI="3.112"/>
+    <Info xml:lang="en" Tag="spec" URI="3112_v15.pdf"/>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="23040" EndID="23295">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">SEMI Devices</ProfileName>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="23296" EndID="23551">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">Identification Systems</ProfileName>
+		 <Info Tag="order_no" URI="3.142"/>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="23552" EndID="23807">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">Weighing &amp; Dosage Devices</ProfileName>
+		 <Info Tag="order_no" URI="3.182"/>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="23808" EndID="24063">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">Intelligent Pumps</ProfileName>
+		 <Info Tag="order_no" URI="2.422"/>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="24064" EndID="24319">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">Low Voltage Switchgear</ProfileName>
+		 <Info Tag="order_no" URI="3.122"/>
+    <Info xml:lang="en" Tag="spec" URI="3122_v10.pdf"/>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="24320" EndID="24575">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">Remote I/O for Process Automation</ProfileName>
+		 <Info Tag="order_no" URI="3.132"/>
+    <Info xml:lang="en" Tag="spec" URI="3132_d10.pdf"/>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="18688" EndID="18943">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">Water Treatment</ProfileName>
+		 <Info Tag="order_no" URI="3.042"/>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="25088" EndID="25343">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">Laboratory Devices</ProfileName>
+		 <Info Tag="order_no" URI="2.412"/>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="00000" EndID="00000">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">Unspecified</ProfileName>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI="Profile_specific_type_table_6282.xml"/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="17920" EndID="18175">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">Fieldbus Integration (API)</ProfileName>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="19200" EndID="19455">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">Train Applications</ProfileName>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="19456" EndID="19711">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">Remote I/O for Factory Automation</ProfileName>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<!--<Profile ID="45824" EndID="46079">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">PA Devices (for Process Control) only PA Profile Version 4.0</ProfileName>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>-->
+<Profile ID="63232" EndID="65535">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">PROFIBUS: reserved for Device IDs; PROFINET: reserved for Profile IDs</ProfileName>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+<Profile ID="65536" EndID="4294967295">
+  <ProfileInfo>
+    <ProfileName xml:lang="en">PROFIBUS: not relevant; PROFINET: reserved for Profile IDs</ProfileName>
+  </ProfileInfo>
+  <IM_Info>
+    <IM_Device_ID_Table URI=""/>
+    <IM_Definitions URI=""/>
+  </IM_Info>
+</Profile>
+
+</Profile_ID_Table>

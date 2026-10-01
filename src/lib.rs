@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub mod contract;
 pub mod discovery;
 pub mod profinet;
+pub(crate) mod profinet_database;
 pub mod protocols;
 pub mod snmp;
 pub mod traffic;
