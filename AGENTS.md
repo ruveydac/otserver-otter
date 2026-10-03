@@ -29,6 +29,9 @@ The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
   Modbus requests without an explicit product decision and safety review.
 - Keep protocol framing and parsing in `src/protocols/` or the existing dedicated modules. Reject
   truncated, oversized, mismatched, or unsolicited responses.
+- PNIO record replies may use the advertised endpoint port or EPM port 34964 as their UDP source.
+  In either case, require the target MAC/IP, client UDP port, and matching RPC object, interface,
+  activity, sequence, and operation before accepting or acknowledging fragments.
 - Active DCP must verify that its source MAC belongs to the selected physical interface. Send
   Identify-All once with `ResponseDelayFactor` `0x0080`; never use zero or rapid retries.
   After a successful send, collect replies for at least 60 seconds unless cancelled or capture
@@ -83,3 +86,7 @@ git diff --check
 
 Scanner branch, loop, and parser logic needs a focused Rust unit test. Protocol interoperability
 belongs in the Docker lab.
+
+On Windows, the Fox TLS retry test requires a process context that can acquire Schannel outbound
+credentials. A restricted sandbox may return `SEC_E_NO_CREDENTIALS` before sending ClientHello;
+verify that failure in a normal user context rather than weakening or skipping the test.

@@ -163,6 +163,12 @@ pub(crate) fn rpc_port() -> u16 {
     RPC_CLIENT_PORT
 }
 
+pub(crate) fn response_source_port_matches(request_port: u16, response_port: u16) -> bool {
+    // Some PNIO devices reply from their EPM socket after advertising a separate record port.
+    // The exchange still requires the expected MAC/IP pair and matching RPC identifiers.
+    response_port == request_port || response_port == EPM_PORT
+}
+
 pub(crate) fn read_records(
     timeout: Duration,
     cancelled: &AtomicBool,
@@ -312,6 +318,13 @@ fn collect_module_targets(value: &Value, api: u32, targets: &mut BTreeSet<(u32, 
     clippy::too_many_arguments,
     reason = "The raw-frame callback keeps platform socket ownership outside this module."
 )]
+#[cfg_attr(
+    all(windows, not(test)),
+    expect(
+        dead_code,
+        reason = "Only the Linux raw capture path calls this exchange."
+    )
+)]
 pub(crate) fn exchange(
     source_mac: [u8; 6],
     source_ip: Ipv4Addr,
@@ -355,7 +368,7 @@ pub(crate) fn exchange(
             || udp.destination_mac != source_mac
             || udp.source_ip != target_ip
             || udp.destination_ip != source_ip
-            || udp.source_port != target_port
+            || !response_source_port_matches(target_port, udp.source_port)
             || udp.destination_port != client_port
         {
             continue;
@@ -1829,7 +1842,17 @@ mod tests {
             source_mac,
             target_ip,
             source_ip,
-            PNIO_PORT,
+            EPM_PORT,
+            rpc_port(),
+            &first,
+        )
+        .unwrap();
+        let wrong_port_frame = ethernet_ipv4_udp_frame(
+            target_mac,
+            source_mac,
+            target_ip,
+            source_ip,
+            41_000,
             rpc_port(),
             &first,
         )
@@ -1846,7 +1869,7 @@ mod tests {
         .unwrap();
         assert!(parse_ipv4_udp_frame(&first_frame).is_some());
         assert!(parse_rpc_fragment(&first).is_ok());
-        let mut incoming = vec![wrong_frame, first_frame, second_frame];
+        let mut incoming = vec![wrong_frame, wrong_port_frame, first_frame, second_frame];
         let mut sent = Vec::new();
         let mut send = |frame: &[u8]| {
             sent.push(frame.to_vec());
