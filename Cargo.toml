@@ -52,3 +52,6 @@ winresource = { version = "0.1", default-features = false }
 [dev-dependencies]
 async-opcua = { version = "0.19", features = ["server"] }
 iec61850-server = { version = "0.2", default-features = false, features = ["std", "full-server"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Security"] }

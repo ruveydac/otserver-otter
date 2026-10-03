@@ -211,12 +211,11 @@ pub fn scan(
         npcap::capture(&selected.name, &request, wait, cancelled, |frame| {
             collect_active_response(&mut devices, frame, source, xid)
         })?;
-        if let Ok(source_ip) = crate::discovery::source_ipv4(&selected.name) {
-            if let Err(error) =
+        if let Ok(source_ip) = crate::discovery::source_ipv4(&selected.name)
+            && let Err(error) =
                 enrich_windows_pnio(&selected.name, source, source_ip, &mut devices, cancelled)
-            {
-                add_pnio_warning(&mut devices, error);
-            }
+        {
+            add_pnio_warning(&mut devices, error);
         }
         return Ok(devices.into_values().collect());
     }
@@ -590,7 +589,7 @@ fn enrich_windows_pnio(
                         || udp.destination_mac != source_mac
                         || udp.source_ip != target_ip
                         || udp.destination_ip != source_ip
-                        || udp.source_port != target_port
+                        || !pnio::response_source_port_matches(target_port, udp.source_port)
                         || udp.destination_port != pnio::rpc_port()
                     {
                         return Ok(None);

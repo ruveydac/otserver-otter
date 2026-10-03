@@ -24,6 +24,9 @@ const RECEIVE_BUFFER_SIZE: usize = 1024 * 1024;
 const BPF_HEADER_MINIMUM: usize = 18;
 const PACKET_ALIGNMENT: usize = 4;
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+// Match libpcap's non-promiscuous NPF setup. An opened adapter needs both the packet filter and
+// a nonzero kernel capture buffer before it can deliver received frames.
+const CAPTURE_HW_FILTER: u32 = 0x0080 | 0x0001 | 0x0002 | 0x0008;
 
 // Public bpf_insn/bpf_program layout from the Npcap SDK's Packet32.h.
 #[repr(C)]
@@ -129,6 +132,8 @@ type SendPacket = unsafe extern "C" fn(*mut Adapter, *mut Packet, c_uchar) -> c_
 type ReceivePacket = unsafe extern "C" fn(*mut Adapter, *mut Packet, c_uchar) -> c_uchar;
 type SetReadTimeout = unsafe extern "C" fn(*mut Adapter, c_int) -> c_uchar;
 type SetMinToCopy = unsafe extern "C" fn(*mut Adapter, c_int) -> c_uchar;
+type SetBuff = unsafe extern "C" fn(*mut Adapter, c_int) -> c_uchar;
+type SetHwFilter = unsafe extern "C" fn(*mut Adapter, u32) -> c_uchar;
 type SetBpf = unsafe extern "C" fn(*mut Adapter, *mut BpfProgram) -> c_uchar;
 type GetReadEvent = unsafe extern "C" fn(*mut Adapter) -> HANDLE;
 
@@ -145,6 +150,8 @@ struct Api {
     receive_packet: ReceivePacket,
     set_read_timeout: SetReadTimeout,
     set_min_to_copy: SetMinToCopy,
+    set_buff: SetBuff,
+    set_hw_filter: SetHwFilter,
     set_bpf: Option<SetBpf>,
     get_read_event: GetReadEvent,
 }
@@ -203,6 +210,10 @@ impl Api {
                 set_read_timeout: unsafe { symbol(module, b"PacketSetReadTimeout\0")? },
                 // SAFETY: see above.
                 set_min_to_copy: unsafe { symbol(module, b"PacketSetMinToCopy\0")? },
+                // SAFETY: see above.
+                set_buff: unsafe { symbol(module, b"PacketSetBuff\0")? },
+                // SAFETY: see above.
+                set_hw_filter: unsafe { symbol(module, b"PacketSetHwFilter\0")? },
                 // Optional: older Packet.dll builds may omit it, in which case capture
                 // stays unfiltered and frames are filtered in user space as before.
                 // SAFETY: see above.
@@ -336,13 +347,27 @@ fn capture_inner(
     wait: Duration,
     cancelled: &AtomicBool,
     dcp_only: bool,
-    mut on_frame: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>, String>,
+    on_frame: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>, String>,
 ) -> Result<(), String> {
     if cancelled.load(Ordering::Relaxed) {
         return Ok(());
     }
     let api = Api::load()?;
-    let device = CString::new(find_device(&api, interface)?)
+    capture_with_api(
+        &api, interface, request, wait, cancelled, dcp_only, on_frame,
+    )
+}
+
+fn capture_with_api(
+    api: &Api,
+    interface: &str,
+    request: &[u8],
+    wait: Duration,
+    cancelled: &AtomicBool,
+    dcp_only: bool,
+    mut on_frame: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>, String>,
+) -> Result<(), String> {
+    let device = CString::new(find_device(api, interface)?)
         .map_err(|_| "Npcap returned an invalid adapter name.".to_string())?;
     // SAFETY: device is NUL-terminated and remains alive throughout the call.
     let adapter = unsafe { (api.open_adapter)(device.as_ptr()) };
@@ -355,6 +380,26 @@ fn capture_inner(
         handle: adapter,
         close: api.close_adapter,
     };
+    // Receive only frames delivered to this interface, including DCP multicast. Packet.dll
+    // requires an explicit NDIS packet filter before its read event can receive traffic.
+    // SAFETY: adapter is open and the call only configures this handle.
+    unsafe { SetLastError(0) };
+    if unsafe { (api.set_hw_filter)(adapter.handle, CAPTURE_HW_FILTER) } == 0 {
+        return Err(npcap_error(
+            &format!("Npcap could not enable capture on interface {interface}"),
+            // SAFETY: read immediately after the failed Win32 API call.
+            unsafe { GetLastError() },
+        ));
+    }
+    // SAFETY: adapter is open and the call configures its bounded kernel buffer.
+    unsafe { SetLastError(0) };
+    if unsafe { (api.set_buff)(adapter.handle, RECEIVE_BUFFER_SIZE as c_int) } == 0 {
+        return Err(npcap_error(
+            &format!("Npcap could not allocate capture buffer on interface {interface}"),
+            // SAFETY: read immediately after the failed Win32 API call.
+            unsafe { GetLastError() },
+        ));
+    }
     // Immediate reads are issued only after Npcap's read event is signalled. This avoids treating
     // an ordinary quiet-network timeout as a failed capture and keeps the overall wait bounded.
     // SAFETY: adapter is open and both calls only configure this handle.
@@ -386,20 +431,18 @@ fn capture_inner(
     }
     // Best effort: restrict the driver to DCP Identify responses. If the filter cannot be
     // installed, the same filtering is applied before frames reach the callback.
-    if dcp_only {
-        if let Some(set_bpf) = api.set_bpf {
-            let mut instructions = DCP_FILTER;
-            let mut program = BpfProgram {
-                length: instructions.len() as u32,
-                instructions: instructions.as_mut_ptr(),
-            };
-            // SAFETY: adapter is open; program and instructions outlive the call, and the
-            // driver copies the filter rather than retaining the pointer.
-            unsafe { (set_bpf)(adapter.handle, &mut program) };
-        }
+    if dcp_only && let Some(set_bpf) = api.set_bpf {
+        let mut instructions = DCP_FILTER;
+        let mut program = BpfProgram {
+            length: instructions.len() as u32,
+            instructions: instructions.as_mut_ptr(),
+        };
+        // SAFETY: adapter is open; program and instructions outlive the call, and the
+        // driver copies the filter rather than retaining the pointer.
+        unsafe { (set_bpf)(adapter.handle, &mut program) };
     }
-    let tx_packet = allocate_packet(&api)?;
-    let rx_packet = allocate_packet(&api)?;
+    let tx_packet = allocate_packet(api)?;
+    let rx_packet = allocate_packet(api)?;
     let request_length = u32::try_from(request.len()).map_err(|_| "DCP request is too large.")?;
     let mut receive_buffer = vec![0_u8; RECEIVE_BUFFER_SIZE];
     let receive_length = u32::try_from(receive_buffer.len()).expect("bounded receive buffer");
@@ -695,6 +738,10 @@ fn symbol_name(name: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[path = "profinet_npcap_tests.rs"]
+mod capture_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         canonical_adapter_name, capture_wait_duration, is_npcap_name, parse_bpf_records,
@@ -752,7 +799,7 @@ mod tests {
         assert!(frames.is_empty());
     }
 
-    fn bpf_record(frame: &[u8]) -> Vec<u8> {
+    pub(super) fn bpf_record(frame: &[u8]) -> Vec<u8> {
         let header_length = 20;
         let mut record = vec![0_u8; super::align_packet(header_length + frame.len())];
         record[8..12].copy_from_slice(&(frame.len() as u32).to_ne_bytes());
