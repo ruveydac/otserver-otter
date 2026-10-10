@@ -13,6 +13,14 @@ const REQUEST_TIMEOUT_MS: u64 = 2_000;
 const MAX_LOGICAL_DEVICES: usize = 64;
 const MAX_LOGICAL_NODES: usize = 256;
 const MAX_VARIABLES_PER_NODE: usize = 4096;
+const IDENTITY_FIELDS: [&str; 6] = [
+    "vendor",
+    "model",
+    "serialNumber",
+    "hardwareVersion",
+    "firmwareVersion",
+    "location",
+];
 
 #[derive(Clone, Copy)]
 enum ValueKind {
@@ -106,7 +114,7 @@ async fn collect(
         logical_nodes.insert(logical_device.clone(), Value::Object(node_values));
     }
 
-    let mut fields = BTreeMap::from([("protocols".into(), json!(["iec61850"]))]);
+    let mut node_fields = BTreeMap::<(String, String), BTreeMap<String, Value>>::new();
     let mut evidence = Evidence {
         raw_values: Map::new(),
         warnings: Vec::new(),
@@ -141,8 +149,13 @@ async fn collect(
                 &mut evidence,
             )
             .await
+            .filter(|value| value.as_str().is_some_and(|text| !text.trim().is_empty()))
             {
-                fields.entry(field.into()).or_insert(value);
+                node_fields
+                    .entry((logical_device.clone(), logical_node.into()))
+                    .or_default()
+                    .entry(field.into())
+                    .or_insert(value);
             }
         }
     }
@@ -170,26 +183,45 @@ async fn collect(
             )
             .await
             {
-                fields.entry(field.into()).or_insert(value);
+                node_fields
+                    .entry((logical_device.clone(), logical_node.clone()))
+                    .or_default()
+                    .entry(field.into())
+                    .or_insert(value);
             }
         }
     }
 
+    let (selected_device, mut fields, field_sources) =
+        normalized_fields(&logical_devices, &node_fields);
+    fields.insert("protocols".into(), json!(["iec61850"]));
     if let Some(model) = fields.get("model").cloned() {
         fields.entry("name".into()).or_insert(model);
     } else if let Some(vendor) = fields.get("vendor").cloned() {
         fields.entry("name".into()).or_insert(vendor);
     }
 
-    let raw = Value::Object(Map::from_iter([
+    let node_observations = node_fields
+        .iter()
+        .map(|((device, node), fields)| node_observation(device, node, fields))
+        .collect::<Vec<_>>();
+    let mut raw = Map::from_iter([
         ("logicalDevices".into(), json!(logical_devices)),
         ("logicalNodes".into(), Value::Object(logical_nodes)),
         ("values".into(), Value::Object(evidence.raw_values)),
-    ]));
+        ("nodeObservations".into(), json!(node_observations)),
+        ("normalizedLogicalDevice".into(), json!(selected_device)),
+        ("fieldSources".into(), json!(field_sources)),
+    ]);
+    if let Some(source) = field_sources.get("serialNumber")
+        && let Some(node) = node_observations.iter().find(|node| node["ref"] == *source)
+    {
+        raw.insert("serialClaim".into(), node["serialClaim"].clone());
+    }
     Ok(Finding {
         source: Source::Iec61850,
         fields,
-        raw,
+        raw: Value::Object(raw),
         ports: vec![super::port(
             "tcp",
             port,
@@ -197,6 +229,72 @@ async fn collect(
             json!({ "state": "open" }),
         )],
         warnings: evidence.warnings,
+    })
+}
+
+fn normalized_fields(
+    devices: &[String],
+    nodes: &BTreeMap<(String, String), BTreeMap<String, Value>>,
+) -> (
+    Option<String>,
+    BTreeMap<String, Value>,
+    BTreeMap<String, String>,
+) {
+    let selected = devices
+        .iter()
+        .find(|device| {
+            nodes.iter().any(|((ld, _), fields)| {
+                ld == *device && IDENTITY_FIELDS.iter().any(|key| fields.contains_key(*key))
+            })
+        })
+        .or_else(|| {
+            devices
+                .iter()
+                .find(|device| nodes.keys().any(|(ld, _)| ld == *device))
+        });
+    let mut fields = BTreeMap::new();
+    let mut sources = BTreeMap::new();
+    if let Some(device) = selected {
+        // Retain the established PhyNam-before-NamPlt identity and alphabetical status priority,
+        // but never fill missing fields from another logical device.
+        for node in ["LPHD1", "LLN0"] {
+            if let Some(values) = nodes.get(&(device.clone(), node.into())) {
+                for key in IDENTITY_FIELDS {
+                    if let Some(value) = values.get(key)
+                        && !fields.contains_key(key)
+                    {
+                        fields.insert(key.into(), value.clone());
+                        sources.insert(key.into(), format!("mms:{device}/{node}"));
+                    }
+                }
+            }
+        }
+        for ((ld, node), values) in nodes.iter().filter(|((ld, _), _)| ld == device) {
+            for (key, value) in values {
+                if !fields.contains_key(key) {
+                    fields.insert(key.clone(), value.clone());
+                    sources.insert(key.clone(), format!("mms:{ld}/{node}"));
+                }
+            }
+        }
+    }
+    (selected.cloned(), fields, sources)
+}
+
+fn node_observation(device: &str, node: &str, fields: &BTreeMap<String, Value>) -> Value {
+    let reference = format!("mms:{device}/{node}");
+    json!({
+        "ref": reference,
+        "subject": { "kind": "logical-node", "logicalDevice": device, "logicalNode": node },
+        "fields": fields,
+        "serialClaim": fields.get("serialNumber").map(|serial| json!({
+            "scope": if node == "LPHD1" { "physical-device" } else { "logical-node" },
+            "componentRef": reference,
+            "issuer": fields.get("vendor"),
+            "original": serial,
+            "encoding": "mms-string",
+            "normalizationVersion": 1,
+        })),
     })
 }
 
@@ -486,6 +584,20 @@ mod tests {
         assert_eq!(fields["blockedOpen"], false);
         assert_eq!(fields["blockedClose"], false);
         assert_eq!(fields["operationCount"], 42);
+        assert_eq!(finding.raw["normalizedLogicalDevice"], "TESTIEDLD0");
+        assert_eq!(
+            finding.raw["fieldSources"]["serialNumber"],
+            "mms:TESTIEDLD0/LPHD1"
+        );
+        assert_eq!(finding.raw["serialClaim"]["scope"], "physical-device");
+        let node = finding.raw["nodeObservations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["ref"] == "mms:TESTIEDLD0/XCBR1")
+            .unwrap();
+        assert_eq!(node["fields"]["operationCount"], 42);
+        assert_eq!(node["subject"]["logicalNode"], "XCBR1");
 
         assert_eq!(finding.raw["logicalDevices"], json!(["TESTIEDLD0"]));
         let nodes = &finding.raw["logicalNodes"]["TESTIEDLD0"];
@@ -531,6 +643,64 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_multi_device_server_does_not_mix_nameplate_fields() {
+        let mut builder = IedModelBuilder::new("MULTI");
+        for (ld, options) in [
+            ("LD0", CdcOptions::DPL_SERNUM),
+            ("LD1", CdcOptions::DPL_SERNUM | CdcOptions::DPL_MODEL),
+        ] {
+            let device = LogicalDeviceBuilder::new(ld)
+                .add_ln(LogicalNodeBuilder::lln0().build().unwrap())
+                .add_ln(
+                    LogicalNodeBuilder::new("", "LPHD", "1")
+                        .add_do(cdc::dpl("PhyNam", options))
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap();
+            builder = builder.add_ld(device).unwrap();
+        }
+        let model = builder.build().unwrap();
+        for (ld, name, value) in [
+            ("LD0", "vendor", "Vendor A"),
+            ("LD0", "serNum", "SERIAL-A"),
+            ("LD1", "vendor", "Vendor B"),
+            ("LD1", "serNum", "SERIAL-B"),
+            ("LD1", "model", "Device B"),
+        ] {
+            let DoChild::Da(attribute) = model
+                .ld_by_inst(ld)
+                .unwrap()
+                .ln_by_name("LPHD1")
+                .unwrap()
+                .do_by_name("PhyNam")
+                .unwrap()
+                .child_by_name(name)
+                .unwrap()
+            else {
+                panic!("missing identity attribute")
+            };
+            attribute.store(MmsValue::VisibleString(value.into()));
+        }
+        let (handle, port) = spawn_server(Arc::new(model)).await;
+        let finding = probe(Ipv4Addr::LOCALHOST, port).await.unwrap().unwrap();
+        assert_eq!(finding.fields["vendor"], "Vendor A");
+        assert_eq!(finding.fields["serialNumber"], "SERIAL-A");
+        assert!(!finding.fields.contains_key("model"));
+        assert_eq!(finding.raw["normalizedLogicalDevice"], "MULTILD0");
+        let node = finding.raw["nodeObservations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["ref"] == "mms:MULTILD1/LPHD1")
+            .unwrap();
+        assert_eq!(node["fields"]["model"], "Device B");
+        assert_eq!(node["serialClaim"]["original"], "SERIAL-B");
+        handle.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closed_port_probes_as_absent_service() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -549,6 +719,69 @@ mod tests {
     fn builds_mms_variable_tail() {
         assert_eq!(variable_tail("NamPlt.vendor", FC::Dc), "DC$NamPlt$vendor");
         assert_eq!(variable_tail("Pos.stVal", FC::St), "ST$Pos$stVal");
+    }
+
+    #[test]
+    fn multiple_logical_devices_keep_independent_identity_and_state() {
+        let devices = vec!["IEDLD0".into(), "IEDLD1".into()];
+        let nodes = BTreeMap::from([
+            (
+                ("IEDLD0".into(), "LPHD1".into()),
+                BTreeMap::from([
+                    ("vendor".into(), json!("Vendor A")),
+                    ("serialNumber".into(), json!("SERIAL-A")),
+                ]),
+            ),
+            (
+                ("IEDLD0".into(), "LLN0".into()),
+                BTreeMap::from([
+                    ("vendor".into(), json!("Logical vendor")),
+                    ("health".into(), json!("ok")),
+                ]),
+            ),
+            (
+                ("IEDLD1".into(), "LPHD1".into()),
+                BTreeMap::from([
+                    ("vendor".into(), json!("Vendor B")),
+                    ("model".into(), json!("Device B")),
+                    ("serialNumber".into(), json!("SERIAL-B")),
+                ]),
+            ),
+            (
+                ("IEDLD1".into(), "XCBR1".into()),
+                BTreeMap::from([("position".into(), json!("on"))]),
+            ),
+        ]);
+        let (selected, fields, sources) = normalized_fields(&devices, &nodes);
+        assert_eq!(selected.as_deref(), Some("IEDLD0"));
+        assert_eq!(fields["vendor"], "Vendor A");
+        assert_eq!(fields["serialNumber"], "SERIAL-A");
+        assert_eq!(fields["health"], "ok");
+        assert!(!fields.contains_key("model"));
+        assert!(!fields.contains_key("position"));
+        assert_eq!(sources["health"], "mms:IEDLD0/LLN0");
+        let child = node_observation(
+            "IEDLD1",
+            "LPHD1",
+            &nodes[&("IEDLD1".into(), "LPHD1".into())],
+        );
+        assert_eq!(child["fields"]["model"], "Device B");
+        assert_eq!(child["serialClaim"]["original"], "SERIAL-B");
+        assert_eq!(child["serialClaim"]["componentRef"], child["ref"]);
+        assert_eq!(
+            node_observation(
+                "IEDLD0",
+                "LLN0",
+                &BTreeMap::from([("serialNumber".into(), json!("LOGICAL"))])
+            )["serialClaim"]["scope"],
+            "logical-node"
+        );
+        assert!(normalized_fields(&[], &BTreeMap::new()).1.is_empty());
+        let status = BTreeMap::from([(
+            ("IEDLD1".into(), "LLN0".into()),
+            BTreeMap::from([("health".into(), json!("alarm"))]),
+        )]);
+        assert_eq!(normalized_fields(&devices, &status).1["health"], "alarm");
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 ### Read-only OT discovery for the [OTserver inventory](https://github.com/ruveydac/OTserver)
 
-Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Fox · DNP3 · IEC 61850 · NetBIOS · OPC UA · SNMP · LLDP
+Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Fox · DNP3 · IEC 61850 · NetBIOS · SMB · RPC · OPC UA · SNMP · LLDP
 
 [![Website](https://img.shields.io/badge/otserver.org-111111?logo=firefoxbrowser&logoColor=white)](https://otserver.org)
 [![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
@@ -21,7 +21,7 @@ Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Fox · DNP3
 OTserver Otter is a cross-platform Rust CLI (with an optional GUI) built specifically for identifying
 industrial devices through fixed, read-only protocol requests. It discovers IPv4/MAC pairs with ARP
 and directly queries PROFINET DCP, S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, DNP3,
-IEC 61850, NetBIOS, OPC UA, and optional SNMP/LLDP. It collects structured evidence and exports observations, interfaces, ports,
+IEC 61850, NetBIOS, SMB, RPC, OPC UA, and optional SNMP/LLDP. It collects structured evidence and exports observations, interfaces, ports,
 and topology through the schema-version-2 `otserver-scan` contract understood directly by
 [OTserver](https://github.com/ruveydac/OTserver).
 
@@ -140,7 +140,7 @@ Validate an export before uploading it:
 ## Protocols and safety
 
 The scanner sends PROFINET DCP Identify, read-only SNMP requests, and fixed read-only identity
-requests for S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, DNP3, IEC 61850, NetBIOS, and
+requests for S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, DNP3, IEC 61850, NetBIOS, SMB, RPC, and
 OPC UA. It never runs SNMP SET, DCP Set, brute-force, exploit, vulnerability, or Modbus requests.
 
 Discovery uses process-wide pacing based on the supplied site ceilings of 50 ARP frames/s and
@@ -168,7 +168,7 @@ capture. Otter does not change host QoS, neighbor tables, or network-device conf
 
 All discovery protocols are enabled by default. Disable individual protocols on the CLI with
 `--no-arp`, `--no-profinet`, `--no-s7`, `--no-enip`, `--no-bacnet`, `--no-fins`, `--no-fox`,
-`--no-dnp3`, `--no-iec61850`, `--no-netbios`, `--no-opcua`, or `--no-snmp` and `--no-lldp`.
+`--no-dnp3`, `--no-iec61850`, `--no-netbios`, `--no-smb`, `--no-rpc`, `--no-opcua`, or `--no-snmp` and `--no-lldp`.
 SNMP inventory and LLDP topology queries share the same SNMP settings but can be enabled
 independently. The GUI exposes the same choices as highlighted on/off toggle buttons.
 
@@ -187,6 +187,9 @@ a valid MAC from an interface, bridge, or LLDP chassis identity. Forwarding-tabl
 evidence only and never asset identities. ENTITY-MIB observations preserve every reported component, containment position,
 serial claim, and supported component-to-interface mapping; ENTITY and interface indexes remain
 observation-local references.
+Only a unique root chassis or stack supplies normalized ENTITY-MIB device identity; module-only
+or ambiguous inventories remain component evidence. SNMP observations include scan-local observation
+IDs, subjects, and component-scoped serial claims.
 
 With ARP enabled, native protocols, SNMP, and LLDP probe only discovered, unambiguous MAC/IP pairs
 from ARP or DCP. An unanswered target does not trigger a second IP-protocol sweep. To probe selected
@@ -201,10 +204,21 @@ DCP observations export the PROFINET vendor and device IDs as numeric `vendorId`
 fields, while retaining the complete parsed block data under `raw`.
 EtherNet/IP preserves each valid List Identity transport response, and S7 preserves the accepted
 TSAP access path and both identity SZL payloads.
+PNIO observations retain every original record and additionally expose `raw.physicalEntities`,
+using observation-local `pnio:<api>:<slot>[:<subslot>]` references, module/submodule containment,
+identification numbers, I&M identity/revisions, and scoped serial claims. Module I&M identities
+never become device serials; the existing device-level manufacturer/software fields come only from
+the primary access point at API 0, slot 0, subslot 1. Scan metadata includes the selected interface's
+current IPv4 addresses on both platforms.
 
 OPC UA discovery connects to ports 4840, 4841, and 48400 by default (configurable via `opcuaPorts`).
 The scanner prefers anonymous authentication and reads only asset identification, health, and
 location variables; it never writes values or calls methods that modify server state.
+Each OPC UA asset retains its own normalized fields and scoped serial claim under `raw.assets`.
+The root identity comes from a single entry identified by `raw.normalizedAssetRef`, so multiple
+represented devices cannot fill one another's missing identity fields. Hardware revisions and
+reported patch identifiers are exported alongside the original identification data; patch identifiers
+are inventory evidence, not a patch-compliance verdict.
 
 DNP3 (IEEE 1815) discovery connects to TCP port 20000 and sends one read-only cold start: a link
 reset followed by a Read of Object Group 0 Variation 0 device attributes with the "all objects"
@@ -214,10 +228,19 @@ Reported attributes include software and hardware version, product name, manufac
 number, user-assigned name, ID code, location, and DNP3 conformance level. Discovery never writes or
 operates points, assigns classes, freezes counters, restarts a device, or uses Secure Authentication;
 DNP3/UDP and TLS-wrapped DNP3 are not probed.
+DNP3 hardware revisions are normalized as `hardwareVersion`, separately from software/firmware.
 
 IEC 61850 discovery connects to MMS/TCP port 102, browses the logical-device model, and reads only
 advertised identity, health, breaker-position, blocking, and operation-count attributes. It does not
 access control, report, setting-group, file, or write services.
+IEC 61850 preserves per-node normalized identity and status evidence under `raw.nodeObservations`.
+Root fields stay within one logical device, identified by `raw.normalizedLogicalDevice`;
+`raw.fieldSources` records the reporting node, and serial claims remain scoped to their nameplate.
+
+BACnet application software is exported as `applicationSoftwareVersion`, independently of
+`firmwareVersion`. Fox exposes `applicationName`, `applicationSoftwareVersion`, `runtimeName`, and
+`runtimeVersion`; it preserves both listener responses under `raw.transportResponses` and retains
+successful identity evidence when another listener fails.
 
 NetBIOS discovery sends one unicast wildcard Node Status (`NBSTAT`) query to UDP port 137
 (RFC 1002). It exports the active computer name, preferring the workstation name over the server
@@ -227,6 +250,58 @@ identity uses the shared ARP/DCP correlation. With `--no-arp`, responses without
 remain in `unresolved`. Discovery uses no credentials, broadcasts, registration requests, or SMB
 sessions. Disable it with `--no-netbios`, `"noNetbios": true`, or the GUI NetBIOS toggle.
 OTserver importers must recognize the `netbios` source added to the schema-version-2 contract.
+
+### Windows discovery without credentials
+
+SMB and RPC probes work from both Linux and Windows and need no credentials or capture driver.
+They use the same authorized, paced, MAC-correlated target path as the other native probes.
+
+| Probe | Requests | Evidence |
+| --- | --- | --- |
+| SMB, TCP 445 | SMB2 NEGOTIATE (dialects 2.02, 2.10, 3.0, 3.02), one SPNEGO/NTLM Type 1 SESSION_SETUP | Negotiated dialect, signing mode, server GUID, computer/domain names, optional reported NT major/minor/build |
+| SMB1 fallback, TCP 445 | One fresh connection, NT LM 0.12 NEGOTIATE, at most one extended-security Type 1 SESSION_SETUP_ANDX | Same NTLM names/build evidence where reported; native OS/LAN-manager strings; classic-security negotiation/domain evidence |
+| RPC, TCP 135 | One endpoint-mapper v3 bind, NDR transfer syntax, NTLM Type 1 | Accepted EPM service, computer/domain names, optional reported NT major/minor/build |
+
+Both stop at the server challenge: no NTLM Type 3, RPC AUTH3, completed login, share enumeration,
+endpoint enumeration, DCOM activation, or WMI/WinRM commands.
+SMB keeps validated negotiation evidence if identity is refused or times out. Each SMB phase has
+a two-second deadline; the RPC exchange has a two-second deadline. Responses and NTLM strings
+are bounded and validated before use.
+
+SMB2/3 is always attempted first. SMB1 fallback reconnects **once**, only after a correlated SMB2
+`STATUS_NOT_SUPPORTED` or a close/reset before any negotiation response bytes. Malformed, partial,
+mismatched, or timed-out responses do not trigger fallback, and accepted SMB2 negotiation never
+falls back because authentication was refused. SMB1 negotiation and its optional identity phase
+each have a two-second deadline. It uses the same pacing, cancellation, and SMB disable controls.
+No Windows SMB1 component is enabled or installed; the scanner implements the bounded wire probe
+directly on both platforms.
+
+For SMB1 with extended security, the scanner sends only the first SPNEGO/NTLM Type 1 token and
+closes after the challenge. Older NTLM challenges may omit target-info/version fields; any reported
+native Windows OS string can still supply OS evidence, with original strings retained separately.
+`raw.smbVersion` is 1, `raw.dialect` is `NT LM 0.12`, and `raw.serverStrings` retains native OS,
+LAN-manager and optional domain strings. Non-ASCII OEM bytes remain in the original raw response
+instead of being assigned a guessed codepage. Without extended security, the scanner retains
+negotiation/domain evidence and stops: it does not attempt a classic, anonymous, or guest login,
+send LM/NT challenge responses, or chain AndX commands. Such servers may therefore provide no OS
+version. The fallback uses direct TCP 445, not NetBIOS sessions on TCP 139.
+
+The observations retain schema version 2 and the existing `os-fingerprint` source. `raw.protocol`
+identifies `smb` or `rpc`; `raw.ntlm` retains names, the original challenge, `reportedVersion`, and
+`windowsCandidates`. A version is normalized as, for example,
+`Windows-compatible NT 10.0 build 17763`. That build can represent **Windows 10 1809 or Windows
+Server 2019**, so both remain candidates. Similarly, build 26100 is shared by Windows 11 24H2 and
+Windows Server 2025. Unknown builds retain their reported numeric version without a guessed release.
+NTLM-compatible implementations such as Samba can synthesize Windows version values; a reported
+version is not authenticated proof of Windows. SMB dialects never supply OS identity. Missing version
+data leaves OS identity unset, and these requests cannot establish edition, cumulative-update revision
+(UBR), installed KBs, or patch compliance. Exact installed caption/release/patch inventory requires
+a separately authorized authenticated inventory path.
+
+Disable the probes with `--no-smb` / `--no-rpc`, `"noSmb": true` / `"noRpc": true`, or their GUI
+toggles. Legacy `--no-protocols` / `noProtocols` disables them too. Existing configurations need no
+new fields. With ARP explicitly disabled, MAC-less replies remain in `unresolved`; names and server
+GUIDs never replace MAC correlation.
 
 ### GUI
 
@@ -296,6 +371,8 @@ single-object form remains supported:
   "noFox": false,
   "noDnp3": false,
   "noNetbios": false,
+  "noSmb": false,
+  "noRpc": false,
   "noOpcua": false,
   "opcuaPorts": [4840, 4841, 48400],
   "opcuaCredentials": [{ "username": "inventory", "password": "..." }],
@@ -391,13 +468,17 @@ OTSERVER_API_KEY='...' otserver-otter scan \
   --ack-authorized
 ```
 
+Uploads use a 10-second connection timeout and a five-minute total deadline, including response
+body reads. OTserver responses are limited to 16 MiB, including chunked responses; upload failures
+retain the completed local scan JSON.
+
 `--ack-authorized` is intentionally never read from configuration and remains mandatory for every
 scan.
 
 ## Virtual OT lab
 
 The Docker lab exercises the complete Linux scanner against deterministic virtual devices for ARP,
-PROFINET DCP, S7, EtherNet/IP, BACnet/IP, Omron FINS, Niagara Fox, DNP3, IEC 61850, NetBIOS,
+PROFINET DCP, S7, EtherNet/IP, BACnet/IP, Omron FINS, Niagara Fox, DNP3, IEC 61850, NetBIOS, SMB, RPC,
 OPC UA, SNMPv2c, SNMPv3, and LLDP:
 
 ```bash
@@ -436,6 +517,16 @@ sources; the repository's small FINS, Fox, and DNP3 responders implement only th
 identity requests sent by this scanner. The OPC UA responder uses the maintained asyncua (opcua-asyncio)
 Python stack.
 NetBIOS interoperability uses Samba's `nmbd` with a fixed computer name and workgroup.
+SMB and RPC interoperability use real Samba `smbd` and `samba-dcerpcd` services, without completing
+authentication. Rust tests cover synthetic Windows build challenges, shared client/server builds,
+missing versions, malformed frames, split TCP reads, and stopping before authentication. The Linux
+lab does not establish interoperability with every Windows release; validate actual Windows targets
+with their configured firewalls and NTLM policies. The Docker Desktop Windows smoke harness excludes
+SMB/RPC because host Windows services already own TCP 445/135.
+An additional isolated Samba service offers **SMB1 only** (`server min/max protocol = NT1`), so
+the lab verifies the real fallback, NTLM names, native strings, independent disablement, and
+MAC-less unresolved export. Classic-security handling and old short NTLM challenges have focused
+Rust wire fixtures; they are not represented as live legacy-Windows interoperability results.
 
 ## Development
 

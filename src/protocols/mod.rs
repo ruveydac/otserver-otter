@@ -11,8 +11,12 @@ mod fins;
 mod fox;
 mod iec61850;
 mod netbios;
+mod ntlm;
 mod opcua;
+mod rpc;
 mod s7;
+mod smb;
+mod smb1;
 
 pub use opcua::{
     Credential as OpcuaCredential, Credentials as OpcuaCredentials, ProbeSettings as OpcuaSettings,
@@ -25,6 +29,8 @@ pub struct ProbeResult {
     pub ports: Vec<Port>,
     pub warnings: Vec<String>,
     pub outcomes: Vec<(Source, bool)>,
+    /// Transport protocol labels aligned with outcomes (separate from export source).
+    pub outcome_protocols: Vec<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +43,8 @@ pub struct Selection {
     pub dnp3: bool,
     pub iec61850: bool,
     pub netbios: bool,
+    pub smb: bool,
+    pub rpc: bool,
     pub opcua: bool,
 }
 
@@ -50,6 +58,8 @@ impl Selection {
             || self.dnp3
             || self.iec61850
             || self.netbios
+            || self.smb
+            || self.rpc
             || self.opcua
     }
 
@@ -63,6 +73,8 @@ impl Selection {
             (self.dnp3, "DNP3"),
             (self.iec61850, "IEC 61850"),
             (self.netbios, "NetBIOS"),
+            (self.smb, "SMB"),
+            (self.rpc, "RPC"),
             (self.opcua, "OPC UA"),
         ]
         .into_iter()
@@ -82,6 +94,8 @@ impl Default for Selection {
             dnp3: true,
             iec61850: true,
             netbios: true,
+            smb: true,
+            rpc: true,
             opcua: true,
         }
     }
@@ -104,7 +118,7 @@ pub async fn scan(
     if selection.any() {
         crate::traffic::wait().await;
     }
-    let (s7, enip, bacnet, fins, fox, dnp3, iec61850, netbios, ua) = tokio::join!(
+    let (s7, enip, bacnet, fins, fox, dnp3, iec61850, netbios, smb, rpc, ua) = tokio::join!(
         probe_if(selection.s7, s7::probe(target)),
         probe_if(selection.enip, enip::probe(target)),
         probe_if(selection.bacnet, bacnet::probe(target)),
@@ -113,28 +127,34 @@ pub async fn scan(
         probe_if(selection.dnp3, dnp3::probe(target)),
         probe_if(selection.iec61850, iec61850::probe(target, iec61850::PORT)),
         probe_if(selection.netbios, netbios::probe(target)),
+        probe_if(selection.smb, smb::probe(target)),
+        probe_if(selection.rpc, rpc::probe(target)),
         probe_if(selection.opcua, opcua::probe(target, opcua)),
     );
     let mut observations = Vec::new();
     let mut ports = Vec::new();
     let mut warnings = Vec::new();
     let mut outcomes = Vec::new();
+    let mut outcome_protocols = Vec::new();
     let results = [
-        (selection.s7, Source::S7, s7),
-        (selection.enip, Source::EthernetIp, enip),
-        (selection.bacnet, Source::Bacnet, bacnet),
-        (selection.fins, Source::OmronFins, fins),
-        (selection.fox, Source::NiagaraFox, fox),
-        (selection.dnp3, Source::Dnp3, dnp3),
-        (selection.iec61850, Source::Iec61850, iec61850),
-        (selection.netbios, Source::Netbios, netbios),
-        (selection.opcua, Source::OpcUa, ua),
+        (selection.s7, Source::S7, "s7", s7),
+        (selection.enip, Source::EthernetIp, "ethernet-ip", enip),
+        (selection.bacnet, Source::Bacnet, "bacnet", bacnet),
+        (selection.fins, Source::OmronFins, "omron-fins", fins),
+        (selection.fox, Source::NiagaraFox, "niagara-fox", fox),
+        (selection.dnp3, Source::Dnp3, "dnp3", dnp3),
+        (selection.iec61850, Source::Iec61850, "iec61850", iec61850),
+        (selection.netbios, Source::Netbios, "netbios", netbios),
+        (selection.smb, Source::OsFingerprint, "smb", smb),
+        (selection.rpc, Source::OsFingerprint, "rpc", rpc),
+        (selection.opcua, Source::OpcUa, "opc-ua", ua),
     ];
-    for (enabled, source, result) in results {
+    for (enabled, source, protocol, result) in results {
         if !enabled {
             continue;
         }
         outcomes.push((source, matches!(result, Ok(Some(_)))));
+        outcome_protocols.push(protocol);
         match result {
             Ok(Some(mut finding)) => {
                 let observed_at = crate::now();
@@ -218,6 +238,7 @@ pub async fn scan(
         ports,
         warnings,
         outcomes,
+        outcome_protocols,
     }
 }
 
@@ -256,19 +277,34 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
 
+    // Windows itself can answer SMB, RPC, and NetBIOS on loopback, so only a
+    // Linux loopback target is genuinely empty.
+    fn loopback_selection() -> Selection {
+        Selection {
+            netbios: !cfg!(windows),
+            smb: !cfg!(windows),
+            rpc: !cfg!(windows),
+            ..Selection::default()
+        }
+    }
+
     #[tokio::test]
     async fn empty_loopback_scan_is_safe() {
         let _network = crate::network_test_lock().await;
+        let selection = loopback_selection();
         let result = scan(
             Ipv4Addr::LOCALHOST,
             Some("00:11:22:33:44:55"),
-            Selection::default(),
+            selection,
             &opcua::ProbeSettings::default(),
         )
         .await;
         assert!(result.observations.is_empty());
         assert!(result.ports.is_empty());
-        assert_eq!(result.outcomes.len(), 9);
+        assert_eq!(result.outcomes.len(), selection.labels().len());
+        assert_eq!(result.outcome_protocols.len(), result.outcomes.len());
+        assert_eq!(result.outcome_protocols.contains(&"smb"), selection.smb);
+        assert_eq!(result.outcome_protocols.contains(&"rpc"), selection.rpc);
         assert!(result.outcomes.iter().all(|(_, success)| !success));
         assert!(text(b"  value\0ignored").as_deref() == Some("value"));
         assert_eq!(text(b" \0"), None);
@@ -286,6 +322,8 @@ mod tests {
             dnp3: false,
             iec61850: false,
             netbios: false,
+            smb: false,
+            rpc: false,
             opcua: false,
         };
         assert!(!selection.any());
@@ -301,6 +339,7 @@ mod tests {
         assert!(result.ports.is_empty());
         assert!(result.warnings.is_empty());
         assert!(result.outcomes.is_empty());
+        assert!(result.outcome_protocols.is_empty());
     }
 
     #[tokio::test]
@@ -327,7 +366,7 @@ mod tests {
         let result = scan(
             Ipv4Addr::LOCALHOST,
             None,
-            Selection::default(),
+            loopback_selection(),
             &opcua::ProbeSettings::default(),
         )
         .await;

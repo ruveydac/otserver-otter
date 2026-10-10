@@ -246,6 +246,8 @@ pub struct GuiApp {
     dnp3_enabled: bool,
     iec61850_enabled: bool,
     netbios_enabled: bool,
+    smb_enabled: bool,
+    rpc_enabled: bool,
     opcua_enabled: bool,
     snmp_enabled: bool,
     lldp_enabled: bool,
@@ -312,6 +314,8 @@ impl GuiApp {
             dnp3_enabled: true,
             iec61850_enabled: true,
             netbios_enabled: true,
+            smb_enabled: true,
+            rpc_enabled: true,
             opcua_enabled: true,
             snmp_enabled: true,
             lldp_enabled: true,
@@ -389,6 +393,8 @@ impl GuiApp {
         self.dnp3_enabled = !(legacy_native_disabled || config.no_dnp3.unwrap_or(false));
         self.iec61850_enabled = !(legacy_native_disabled || config.no_iec61850.unwrap_or(false));
         self.netbios_enabled = !(legacy_native_disabled || config.no_netbios.unwrap_or(false));
+        self.smb_enabled = !(legacy_native_disabled || config.no_smb.unwrap_or(false));
+        self.rpc_enabled = !(legacy_native_disabled || config.no_rpc.unwrap_or(false));
         self.opcua_enabled = !(legacy_native_disabled || config.no_opcua.unwrap_or(false));
         self.snmp_enabled = !config.no_snmp.unwrap_or(false);
         self.lldp_enabled = !config.no_lldp.unwrap_or(false);
@@ -527,6 +533,8 @@ impl GuiApp {
         config.no_dnp3 = (!self.dnp3_enabled).then_some(true);
         config.no_iec61850 = (!self.iec61850_enabled).then_some(true);
         config.no_netbios = (!self.netbios_enabled).then_some(true);
+        config.no_smb = (!self.smb_enabled).then_some(true);
+        config.no_rpc = (!self.rpc_enabled).then_some(true);
         config.no_opcua = (!self.opcua_enabled).then_some(true);
         config.no_snmp = (!self.snmp_enabled).then_some(true);
         config.no_lldp = (!self.lldp_enabled).then_some(true);
@@ -1004,6 +1012,12 @@ impl eframe::App for GuiApp {
                                 .toggle_value(&mut self.netbios_enabled, "NetBIOS")
                                 .changed();
                             protocol_changed |= ui
+                                .toggle_value(&mut self.smb_enabled, "SMB")
+                                .changed();
+                            protocol_changed |= ui
+                                .toggle_value(&mut self.rpc_enabled, "RPC")
+                                .changed();
+                            protocol_changed |= ui
                                 .toggle_value(&mut self.opcua_enabled, "OPC UA")
                                 .changed();
                             protocol_changed |=
@@ -1334,6 +1348,7 @@ impl eframe::App for GuiApp {
             let selected = self.selected_asset.clone();
             let mut open = self.asset_window_open;
             egui::Window::new(format!("Discovered Assets ({})", assets.len()))
+                .id(egui::Id::new("discovered-assets"))
                 .open(&mut open)
                 .default_size([1080.0, 600.0])
                 .min_size([560.0, 360.0])
@@ -1396,8 +1411,6 @@ impl eframe::App for GuiApp {
                         });
                         ui.separator();
                         ui.vertical(|ui| {
-                            ui.set_width(ui.available_width());
-                            ui.set_min_height(ui.available_height());
                             egui::ScrollArea::both()
                                 .id_salt("asset-detail")
                                 .auto_shrink([false, false])
@@ -1735,6 +1748,34 @@ mod tests {
             assert_eq!(app.to_config().allow_dcp_source, enabled.then_some(true));
             app.allow_dcp_source = !enabled;
             assert_eq!(app.to_config().allow_dcp_source, (!enabled).then_some(true));
+        }
+    }
+
+    #[test]
+    fn windows_toggles_roundtrip_independently_and_honor_legacy_disable() {
+        for (smb, rpc, legacy) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let config = ScannerConfig {
+                no_smb: Some(smb),
+                no_rpc: Some(rpc),
+                no_protocols: Some(legacy),
+                ..ScannerConfig::default()
+            };
+            let mut app = GuiApp::new(ScannerConfigs::Single(Box::new(config)));
+            assert_eq!(
+                (app.smb_enabled, app.rpc_enabled),
+                (!(smb || legacy), !(rpc || legacy))
+            );
+            app.smb_enabled = !app.smb_enabled;
+            app.rpc_enabled = !app.rpc_enabled;
+            let saved = app.to_config();
+            assert_eq!(saved.no_smb, (!app.smb_enabled).then_some(true));
+            assert_eq!(saved.no_rpc, (!app.rpc_enabled).then_some(true));
+            assert_eq!(saved.no_protocols, None);
         }
     }
 

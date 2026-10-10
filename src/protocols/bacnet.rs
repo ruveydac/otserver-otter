@@ -47,6 +47,7 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
         ("objectName", "name"),
         ("model", "model"),
         ("firmware", "firmwareVersion"),
+        ("applicationSoftware", "applicationSoftwareVersion"),
         ("description", "description"),
         ("location", "location"),
         ("vendor", "vendor"),
@@ -276,15 +277,19 @@ mod tests {
                 let (_, peer) = socket.recv_from(&mut request).await.unwrap();
                 let property = request[16];
                 let invoke = request[8];
-                socket
-                    .send_to(&response(property, invoke, property == 0x4b), peer)
-                    .await
-                    .unwrap();
+                let mut answer = response(property, invoke, property == 0x4b);
+                if property == 0x0c {
+                    answer[20..23].copy_from_slice(b"APP");
+                }
+                socket.send_to(&answer, peer).await.unwrap();
             }
         });
         let finding = probe(Ipv4Addr::LOCALHOST).await.unwrap().unwrap();
         assert_eq!(finding.fields["name"], "PLC");
         assert_eq!(finding.fields["vendor"], "PLC");
+        assert_eq!(finding.fields["firmwareVersion"], "PLC");
+        assert_eq!(finding.fields["applicationSoftwareVersion"], "APP");
+        assert_eq!(finding.raw["applicationSoftware"], "APP");
         responder.await.unwrap();
     }
 

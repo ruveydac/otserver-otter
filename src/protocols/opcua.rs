@@ -719,7 +719,8 @@ fn insert_once(fields: &mut BTreeMap<String, Value>, key: &str, value: Option<St
 
 fn asset_fields(entries: &[AssetEntry]) -> BTreeMap<String, Value> {
     let mut fields = BTreeMap::new();
-    for entry in entries {
+    // One normalized identity must never combine fields from different represented assets.
+    if let Some(entry) = entries.first() {
         let identification = &entry.identification;
         let asset_id = identification.get("AssetId").and_then(text_of);
         let product_uri = identification.get("ProductInstanceUri").and_then(text_of);
@@ -750,6 +751,20 @@ fn asset_fields(entries: &[AssetEntry]) -> BTreeMap<String, Value> {
             "firmwareVersion",
             identification.get("SoftwareRevision").and_then(text_of),
         );
+        insert_once(
+            &mut fields,
+            "hardwareVersion",
+            identification.get("HardwareRevision").and_then(text_of),
+        );
+        if let Some(patches) = identification
+            .get("PatchIdentifiers")
+            .and_then(Value::as_array)
+        {
+            let patches = patches.iter().filter_map(text_of).collect::<Vec<_>>();
+            if !patches.is_empty() {
+                fields.insert("patchIdentifiers".into(), json!(patches));
+            }
+        }
         insert_once(
             &mut fields,
             "description",
@@ -789,6 +804,17 @@ fn asset_raw(entry: &AssetEntry) -> Value {
         })
     });
     json!({
+        "ref": format!("opcua:{}", entry.node_id),
+        "subject": { "kind": "opc-ua-asset", "nodeId": entry.node_id.to_string() },
+        "fields": asset_fields(std::slice::from_ref(entry)),
+        "serialClaim": entry.identification.get("SerialNumber").filter(|serial| serial.as_str().is_some_and(|text| !text.trim().is_empty())).map(|serial| json!({
+            "scope": "asset",
+            "componentRef": format!("opcua:{}", entry.node_id),
+            "issuer": entry.identification.get("Manufacturer"),
+            "original": serial,
+            "encoding": "opcua-string",
+            "normalizationVersion": 1,
+        })),
         "nodeId": entry.node_id.to_string(),
         "displayName": entry.display_name,
         "identification": entry.identification,
@@ -811,6 +837,18 @@ fn finding(
     warnings: Vec<String>,
 ) -> Finding {
     raw.insert("endpointUrl".into(), json!(endpoint_url));
+    if let Some(asset) = raw
+        .get("assets")
+        .and_then(Value::as_array)
+        .and_then(|assets| assets.first())
+    {
+        let reference = asset["ref"].clone();
+        let serial_claim = asset["serialClaim"].clone();
+        raw.insert("normalizedAssetRef".into(), reference);
+        if !serial_claim.is_null() {
+            raw.insert("serialClaim".into(), serial_claim);
+        }
+    }
     Finding {
         source: Source::OpcUa,
         fields,
@@ -878,11 +916,13 @@ mod tests {
     }
 
     #[test]
-    fn maps_asset_fields_with_first_value_priority() {
+    fn maps_one_asset_identity_without_filling_from_another_asset() {
         let mut identification = Map::new();
         identification.insert("AssetId".into(), json!("LAB-ASSET-1"));
         identification.insert("Manufacturer".into(), json!("Lab Manufacturer"));
         identification.insert("DeviceHealth".into(), json!(4));
+        identification.insert("HardwareRevision".into(), json!("HW-A"));
+        identification.insert("PatchIdentifiers".into(), json!(["PATCH-1", " ", 42]));
         let mut locations = Map::new();
         locations.insert("HierarchicalLocation".into(), json!("Plant1/Line3"));
         let first = AssetEntry {
@@ -898,6 +938,7 @@ mod tests {
         let mut identification = Map::new();
         identification.insert("Model".into(), json!("Lab Model 42"));
         identification.insert("AssetId".into(), json!("ignored"));
+        identification.insert("SerialNumber".into(), json!("SERIAL-B"));
         let second = AssetEntry {
             node_id: NodeId::new(1, 301),
             display_name: "Second".into(),
@@ -908,10 +949,18 @@ mod tests {
             health: None,
             health_timestamp: None,
         };
+        let secondary = asset_raw(&second);
         let fields = asset_fields(&[first, second]);
         assert_eq!(fields["name"], "LAB-ASSET-1");
         assert_eq!(fields["vendor"], "Lab Manufacturer");
-        assert_eq!(fields["model"], "Lab Model 42");
+        assert!(!fields.contains_key("model"));
+        assert!(!fields.contains_key("serialNumber"));
+        assert_eq!(fields["hardwareVersion"], "HW-A");
+        assert_eq!(fields["patchIdentifiers"], json!(["PATCH-1"]));
+        assert_eq!(secondary["fields"]["model"], "Lab Model 42");
+        assert_eq!(secondary["serialClaim"]["scope"], "asset");
+        assert_eq!(secondary["serialClaim"]["original"], "SERIAL-B");
+        assert_eq!(secondary["serialClaim"]["componentRef"], secondary["ref"]);
         assert_eq!(fields["location"], "Plant1/Line3");
         assert_eq!(fields["status"], "maintenance");
 
@@ -1310,6 +1359,13 @@ mod tests {
         assert_eq!(finding.fields["model"], "Lab Model 42");
         assert_eq!(finding.fields["serialNumber"], "SN12345");
         assert_eq!(finding.fields["firmwareVersion"], "2.1.0");
+        assert_eq!(finding.fields["hardwareVersion"], "A1");
+        assert_eq!(finding.raw["normalizedAssetRef"], "opcua:ns=2;i=300");
+        assert_eq!(finding.raw["serialClaim"]["scope"], "asset");
+        assert_eq!(
+            finding.raw["serialClaim"]["componentRef"],
+            finding.raw["normalizedAssetRef"]
+        );
         assert_eq!(finding.fields["location"], "Plant1/Line3/Cell2");
         assert_eq!(finding.fields["description"], "Test Device");
         assert_eq!(finding.fields["status"], "online");

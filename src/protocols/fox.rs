@@ -10,15 +10,35 @@ use tokio::time::timeout;
 use tokio_native_tls::TlsConnector;
 
 const HELLO: &[u8] = b"fox a 1 -1 fox hello\n{\nfox.version=s:1.0\nid=i:1\n};;\n";
+type HelloResult = Result<Option<(String, bool)>, String>;
 
 pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
+    let mut responses = Vec::new();
+    for port_number in [1911, 4911] {
+        responses.push((port_number, exchange(target, port_number).await));
+    }
+    finding(target, responses)
+}
+
+fn finding(
+    target: Ipv4Addr,
+    responses: Vec<(u16, HelloResult)>,
+) -> Result<Option<Finding>, String> {
     let mut findings = Vec::new();
     let mut ports = Vec::new();
-    for port_number in [1911, 4911] {
-        if let Some((response, tls)) = exchange(target, port_number).await?
+    let mut warnings = Vec::new();
+    for (port_number, result) in responses {
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                warnings.push(format!("Niagara Fox {target}:{port_number}: {error}"));
+                continue;
+            }
+        };
+        if let Some((response, tls)) = result
             && let Some(values) = parse(&response)
         {
-            findings.push((values, tls, response));
+            findings.push((port_number, values, tls, response));
             ports.push(port(
                 "tcp",
                 port_number,
@@ -27,7 +47,10 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
             ));
         }
     }
-    let Some((values, tls, response)) = findings.into_iter().next() else {
+    let Some((_, values, tls, response)) = findings.first() else {
+        if let Some(error) = warnings.into_iter().next() {
+            return Err(error);
+        }
         return Ok(None);
     };
     let mut fields = BTreeMap::from([("protocols".into(), json!(["niagara-fox"]))]);
@@ -40,15 +63,39 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
             fields.insert(field.into(), value.clone());
         }
     }
-    let mut raw = values;
+    for (source, field) in [
+        ("app.name", "applicationName"),
+        ("app.version", "applicationSoftwareVersion"),
+        ("vm.name", "runtimeName"),
+        ("vm.version", "runtimeVersion"),
+    ] {
+        if let Some(value) = values
+            .get(source)
+            .filter(|value| value.as_str().is_some_and(|text| !text.trim().is_empty()))
+        {
+            fields.insert(field.into(), value.clone());
+        }
+    }
+    let mut raw = values.clone();
     raw.insert("response".into(), json!(response));
     raw.insert("tls".into(), json!(tls));
+    raw.insert(
+        "transportResponses".into(),
+        findings
+            .into_iter()
+            .map(|(number, values, tls, response)| {
+                json!({
+                    "port": number, "tls": tls, "identity": values, "response": response,
+                })
+            })
+            .collect(),
+    );
     Ok(Some(Finding {
         source: Source::NiagaraFox,
         fields,
         raw: Value::Object(raw),
         ports,
-        warnings: vec![],
+        warnings,
     }))
 }
 
@@ -189,15 +236,57 @@ mod tests {
             stream.read_exact(&mut hello).await.unwrap();
             stream
                 .write_all(
-                    b"fox a 0\n{\nhostName=s:station-1\nos.name=s:Linux\nbrandId=s:Tridium\n};;\n",
+                    b"fox a 0\n{\nhostName=s:station-1\nos.name=s:Linux\nbrandId=s:Tridium\napp.name=s:Niagara\napp.version=s:4.13.1\nvm.name=s:Java\nvm.version=s:17\n};;\n",
                 )
                 .await
                 .unwrap();
         });
         let finding = probe(Ipv4Addr::LOCALHOST).await.unwrap().unwrap();
         assert_eq!(finding.fields["name"], "station-1");
+        assert_eq!(finding.fields["applicationName"], "Niagara");
+        assert_eq!(finding.fields["applicationSoftwareVersion"], "4.13.1");
+        assert_eq!(finding.fields["runtimeName"], "Java");
+        assert_eq!(finding.fields["runtimeVersion"], "17");
+        assert!(!finding.fields.contains_key("firmwareVersion"));
+        assert_eq!(finding.raw["app.version"], "4.13.1");
+        assert_eq!(finding.raw["transportResponses"][0]["port"], 1911);
         assert_eq!(finding.ports.len(), 1);
         responder.await.unwrap();
+    }
+
+    #[test]
+    fn hello_evidence_keeps_both_responses_and_success_when_another_listener_fails() {
+        let primary = "fox a 0\n{\nhostName=s:station-1\napp.version=s: \nvm.version=s:\n};;\n";
+        let secondary = "fox a 0\n{\nhostName=s:station-2\napp.version=s:4.14.0\n};;\n";
+        let replies = vec![
+            (1911, Ok(Some((primary.into(), false)))),
+            (4911, Ok(Some((secondary.into(), true)))),
+        ];
+        let finding = finding(Ipv4Addr::LOCALHOST, replies.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(finding.fields["name"], "station-1");
+        assert!(!finding.fields.contains_key("applicationSoftwareVersion"));
+        assert!(!finding.fields.contains_key("runtimeVersion"));
+        assert_eq!(
+            finding.raw["transportResponses"][1]["identity"]["app.version"],
+            "4.14.0"
+        );
+        assert_eq!(finding.raw["transportResponses"][1]["response"], secondary);
+        let partial = super::finding(
+            Ipv4Addr::LOCALHOST,
+            vec![replies[0].clone(), (4911, Err("secondary failed".into()))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(partial.fields["name"], "station-1");
+        assert!(partial.warnings[0].ends_with("secondary failed"));
+        assert!(
+            super::finding(Ipv4Addr::LOCALHOST, vec![(1911, Ok(None))])
+                .unwrap()
+                .is_none()
+        );
+        assert!(super::finding(Ipv4Addr::LOCALHOST, vec![(1911, Err("failed".into()))]).is_err());
     }
 
     #[tokio::test]

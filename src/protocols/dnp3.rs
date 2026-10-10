@@ -122,6 +122,7 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
         ("productName", "model"),
         ("manufacturer", "vendor"),
         ("softwareVersion", "firmwareVersion"),
+        ("hardwareVersion", "hardwareVersion"),
         ("serialNumber", "serialNumber"),
         ("location", "location"),
     ] {
@@ -860,6 +861,7 @@ mod tests {
         assert_eq!(finding.fields["model"], "FB3000");
         assert_eq!(finding.fields["vendor"], "Emerson");
         assert_eq!(finding.fields["firmwareVersion"], "5.2.1");
+        assert_eq!(finding.fields["hardwareVersion"], "HW-2");
         assert_eq!(finding.fields["serialNumber"], "SN-000123");
         assert_eq!(finding.fields["location"], "Cell 1");
         assert_eq!(finding.fields["protocols"], json!(["dnp3"]));

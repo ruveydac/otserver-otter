@@ -95,6 +95,10 @@ pub struct ScanArgs {
     #[arg(long)]
     pub no_netbios: bool,
     #[arg(long)]
+    pub no_smb: bool,
+    #[arg(long)]
+    pub no_rpc: bool,
+    #[arg(long)]
     pub no_opcua: bool,
     #[arg(long)]
     pub no_snmp: bool,
@@ -145,6 +149,10 @@ pub struct ScannerConfig {
     pub no_iec61850: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_netbios: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_smb: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_rpc: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_opcua: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -286,6 +294,8 @@ pub struct ProtocolOptions {
     pub dnp3: bool,
     pub iec61850: bool,
     pub netbios: bool,
+    pub smb: bool,
+    pub rpc: bool,
     pub opcua: bool,
     pub snmp: bool,
     pub lldp: bool,
@@ -304,6 +314,8 @@ impl Default for ProtocolOptions {
             dnp3: true,
             iec61850: true,
             netbios: true,
+            smb: true,
+            rpc: true,
             opcua: true,
             snmp: true,
             lldp: true,
@@ -505,6 +517,8 @@ pub fn resolve_scan(
         dnp3: !(no_native_protocols || args.no_dnp3 || config.no_dnp3.unwrap_or(false)),
         iec61850: !(no_native_protocols || args.no_iec61850 || config.no_iec61850.unwrap_or(false)),
         netbios: !(no_native_protocols || args.no_netbios || config.no_netbios.unwrap_or(false)),
+        smb: !(no_native_protocols || args.no_smb || config.no_smb.unwrap_or(false)),
+        rpc: !(no_native_protocols || args.no_rpc || config.no_rpc.unwrap_or(false)),
         opcua: !(no_native_protocols || args.no_opcua || config.no_opcua.unwrap_or(false)),
         snmp: !(args.no_snmp || config.no_snmp.unwrap_or(false)),
         lldp: !(args.no_lldp || config.no_lldp.unwrap_or(false)),
@@ -681,18 +695,28 @@ pub async fn scan(
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
     let mut protocol_failed = false;
+    let interfaces = if cancelled.load(Ordering::Relaxed) {
+        Ok(Vec::new())
+    } else {
+        profinet::interfaces()
+    };
     let source_mac = if (options.protocols.arp || options.protocols.profinet)
         && !cancelled.load(Ordering::Relaxed)
     {
         scan_source_mac(
             &options.interface,
             &options.source_mac,
-            &profinet::interfaces()?,
+            interfaces.as_ref().map_err(Clone::clone)?,
             logger,
         )?
     } else {
         options.source_mac.clone()
     };
+    let interface = scan_interface_ref(
+        &options.interface,
+        &source_mac,
+        interfaces.as_deref().unwrap_or_default(),
+    );
 
     logger.log(format!(
         "Starting discovery for target(s): {}",
@@ -781,6 +805,8 @@ pub async fn scan(
         dnp3: options.protocols.dnp3,
         iec61850: options.protocols.iec61850,
         netbios: options.protocols.netbios,
+        smb: options.protocols.smb,
+        rpc: options.protocols.rpc,
         opcua: options.protocols.opcua,
     };
     if native_selection.any() && !cancelled.load(Ordering::Relaxed) {
@@ -861,12 +887,7 @@ pub async fn scan(
             started_at,
             finished_at: otserver_otter::now(),
             targets: options.targets.clone(),
-            interface: InterfaceRef {
-                id: options.interface.clone(),
-                name: options.interface.clone(),
-                mac_address: otserver_otter::contract::normalize_mac(&source_mac),
-                addresses: vec![],
-            },
+            interface,
             partial: stopped || protocol_failed || !errors.is_empty(),
         },
         devices,
@@ -983,6 +1004,12 @@ pub async fn upload_scan(
     Ok(())
 }
 
+const MAX_IMPORT_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(not(test))]
+const IMPORT_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(test)]
+const IMPORT_TIMEOUT: Duration = Duration::from_secs(2);
+
 async fn send_import(
     options: &UploadOptions,
     data: Vec<u8>,
@@ -1004,7 +1031,11 @@ async fn send_import(
             .to_string(),
         )
         .part("file", file);
-    let response = reqwest::Client::new()
+    let mut response = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(IMPORT_TIMEOUT)
+        .build()
+        .map_err(|error| format!("Could not initialize OTserver upload: {error}"))?
         .post(options.endpoint.clone())
         .header(
             reqwest::header::AUTHORIZATION,
@@ -1015,17 +1046,34 @@ async fn send_import(
         .await
         .map_err(|error| format!("Could not upload scan: {error}"))?;
     let status = response.status();
-    let body = response
-        .text()
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_IMPORT_RESPONSE_BYTES as u64)
+    {
+        return Err("OTserver response exceeded the 16 MiB limit.".into());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|error| format!("Could not read OTserver response: {error}"))?;
+        .map_err(|error| format!("Could not read OTserver response: {error}"))?
+    {
+        if chunk.len() > MAX_IMPORT_RESPONSE_BYTES - body.len() {
+            return Err("OTserver response exceeded the 16 MiB limit.".into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&body);
     if !status.is_success() {
         return Err(format!(
             "OTserver import failed ({status}): {}",
-            body.chars().take(500).collect::<String>()
+            String::from_utf8_lossy(body)
+                .chars()
+                .take(500)
+                .collect::<String>()
         ));
     }
-    let response: CreateImportResponse = serde_json::from_str(&body)
+    let response: CreateImportResponse = serde_json::from_slice(body)
         .map_err(|error| format!("OTserver returned an invalid import response: {error}"))?;
     if response.doc.status != "completed" {
         return Err(response.doc.error.clone().unwrap_or_else(|| {
@@ -1146,15 +1194,7 @@ fn scan_source_mac(
     interfaces: &[profinet::CaptureInterface],
     logger: &dyn LogOutput,
 ) -> Result<String, String> {
-    let actual = interfaces
-        .iter()
-        .find(|interface| {
-            interface.name == selected
-                || interface.friendly_name == selected
-                || cfg!(windows)
-                    && (interface.name.eq_ignore_ascii_case(selected)
-                        || interface.friendly_name.eq_ignore_ascii_case(selected))
-        })
+    let actual = selected_interface(selected, interfaces)
         .and_then(profinet::interface_mac)
         .ok_or_else(|| format!("Could not determine the current MAC of interface {selected}."))?;
     if otserver_otter::contract::normalize_mac(configured).as_deref() != Some(&actual) {
@@ -1163,6 +1203,40 @@ fn scan_source_mac(
         ));
     }
     Ok(actual)
+}
+
+fn selected_interface<'a>(
+    selected: &str,
+    interfaces: &'a [profinet::CaptureInterface],
+) -> Option<&'a profinet::CaptureInterface> {
+    interfaces.iter().find(|interface| {
+        interface.name == selected
+            || interface.friendly_name == selected
+            || cfg!(windows)
+                && (interface.name.eq_ignore_ascii_case(selected)
+                    || interface.friendly_name.eq_ignore_ascii_case(selected))
+    })
+}
+
+fn scan_interface_ref(
+    selected: &str,
+    source_mac: &str,
+    interfaces: &[profinet::CaptureInterface],
+) -> InterfaceRef {
+    let addresses = selected_interface(selected, interfaces)
+        .into_iter()
+        .flat_map(|interface| &interface.addresses)
+        .filter_map(|address| address.parse::<std::net::IpAddr>().ok())
+        .map(|address| address.to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    InterfaceRef {
+        id: selected.into(),
+        name: selected.into(),
+        mac_address: otserver_otter::contract::normalize_mac(source_mac),
+        addresses,
+    }
 }
 
 #[expect(
@@ -1417,8 +1491,13 @@ fn apply_probe(
         warnings.push("A native protocol probe task failed.".into());
         return;
     };
-    for (source, success) in &result.outcomes {
-        log_probe(logger, &ip.to_string(), source.label(), *success);
+    for (index, (source, success)) in result.outcomes.iter().enumerate() {
+        let protocol = result
+            .outcome_protocols
+            .get(index)
+            .copied()
+            .unwrap_or(source.label());
+        log_probe(logger, &ip.to_string(), protocol, *success);
     }
     warnings.append(&mut result.warnings);
     if let Some(device) = mac
@@ -1509,6 +1588,8 @@ mod tests {
             no_dnp3: false,
             no_iec61850: false,
             no_netbios: false,
+            no_smb: false,
+            no_rpc: false,
             no_opcua: false,
             no_snmp: false,
             no_lldp: false,
@@ -1592,6 +1673,8 @@ mod tests {
             no_dnp3: Some(true),
             no_iec61850: Some(true),
             no_netbios: Some(true),
+            no_smb: Some(true),
+            no_rpc: Some(true),
             no_opcua: Some(true),
             no_snmp: Some(true),
             no_lldp: Some(true),
@@ -1859,6 +1942,48 @@ mod tests {
     }
 
     #[test]
+    fn windows_probes_honor_cli_config_and_legacy_disables() {
+        for (smb, rpc, legacy) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let mut cli = args();
+            cli.no_smb = smb;
+            cli.no_rpc = rpc;
+            cli.no_protocols = legacy;
+            let options =
+                resolve_scan(cli, complete_config("Test", "192.0.2.1", "test.json"), None).unwrap();
+            assert_eq!(
+                (options.protocols.smb, options.protocols.rpc),
+                (!(smb || legacy), !(rpc || legacy))
+            );
+            let mut config = complete_config("Test", "192.0.2.1", "test.json");
+            config.no_smb = Some(smb);
+            config.no_rpc = Some(rpc);
+            config.no_protocols = Some(legacy);
+            let options = resolve_scan(args(), config, None).unwrap();
+            assert_eq!(
+                (options.protocols.smb, options.protocols.rpc),
+                (!(smb || legacy), !(rpc || legacy))
+            );
+        }
+        let cli = Cli::try_parse_from([
+            "otserver-otter",
+            "scan",
+            "--ack-authorized",
+            "--no-smb",
+            "--no-rpc",
+        ])
+        .unwrap();
+        let Some(Commands::Scan(args)) = cli.command else {
+            panic!("scan arguments");
+        };
+        assert!(args.no_smb && args.no_rpc);
+    }
+
+    #[test]
     fn all_ip_protocols_use_discovery_unless_arp_is_explicitly_disabled() {
         let selected = discovery::expand_targets(&["192.0.2.0/30".into()]).unwrap();
         let found = vec![Device {
@@ -2041,6 +2166,7 @@ mod tests {
                     ports: vec![],
                     warnings: vec![],
                     outcomes: vec![(Source::EthernetIp, true)],
+                    outcome_protocols: vec![],
                 },
             ))),
         );
@@ -2136,6 +2262,40 @@ mod tests {
         tokio::fs::remove_file(output).await.unwrap();
 
         assert!(export.scan.partial);
+        assert!(export.scan.interface.addresses.is_empty());
+    }
+
+    #[test]
+    fn scan_metadata_keeps_only_selected_interface_ip_addresses() {
+        let interfaces = [
+            profinet::CaptureInterface {
+                name: "eth0".into(),
+                friendly_name: "Cell A".into(),
+                description: String::new(),
+                addresses: vec![
+                    "00:11:22:33:44:55".into(),
+                    "192.0.2.10".into(),
+                    "192.0.2.10".into(),
+                    "2001:db8::1".into(),
+                    "invalid".into(),
+                ],
+            },
+            profinet::CaptureInterface {
+                name: "eth1".into(),
+                friendly_name: "Cell B".into(),
+                description: String::new(),
+                addresses: vec!["198.51.100.10".into()],
+            },
+        ];
+        let metadata = scan_interface_ref("Cell A", "00-11-22-33-44-55", &interfaces);
+        assert_eq!(metadata.addresses, ["192.0.2.10", "2001:db8::1"]);
+        assert_eq!(metadata.mac_address.as_deref(), Some("00:11:22:33:44:55"));
+        assert_eq!(metadata.id, "Cell A");
+        assert!(
+            scan_interface_ref("missing", "00:11:22:33:44:55", &interfaces)
+                .addresses
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2234,5 +2394,114 @@ mod tests {
         assert_eq!(imported.status, "completed");
         assert_eq!(imported.created_assets, Some(2));
         server.await.unwrap();
+    }
+
+    async fn import_test_response(response: Vec<u8>) -> Result<ImportDocument, String> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            // The client may stop reading as soon as the body limit is exceeded.
+            let _ = socket.write_all(&response).await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let result = send_import(
+            &UploadOptions {
+                endpoint: reqwest::Url::parse(&format!("http://{address}/api/asset-imports"))
+                    .unwrap(),
+                site: "site-1".into(),
+                api_key: "test-key".into(),
+            },
+            b"{}".to_vec(),
+            "scan.json",
+        )
+        .await;
+        server.abort();
+        result
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_announced_and_chunked_oversized_responses() {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            MAX_IMPORT_RESPONSE_BYTES + 1
+        );
+        assert!(
+            import_test_response(response.into_bytes())
+                .await
+                .err()
+                .unwrap()
+                .contains("16 MiB")
+        );
+        let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        response.extend(format!("{:X}\r\n", MAX_IMPORT_RESPONSE_BYTES + 1).as_bytes());
+        response.resize(response.len() + MAX_IMPORT_RESPONSE_BYTES + 1, b'x');
+        response.extend(b"\r\n0\r\n\r\n");
+        assert!(
+            import_test_response(response)
+                .await
+                .err()
+                .unwrap()
+                .contains("16 MiB")
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_deadline_and_error_responses_preserve_failure_diagnostics() {
+        let started = Instant::now();
+        assert!(
+            import_test_response(vec![])
+                .await
+                .err()
+                .unwrap()
+                .contains("Could not upload scan")
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            import_test_response(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n".to_vec())
+                .await
+                .err()
+                .unwrap()
+                .contains("Could not read OTserver response")
+        );
+        for (status, body, expected) in [
+            ("403 Forbidden", "denied", "403 Forbidden"),
+            ("200 OK", "not-json", "invalid import response"),
+            (
+                "200 OK",
+                r#"{"doc":{"id":"1","status":"failed","error":"validation failed"}}"#,
+                "validation failed",
+            ),
+        ] {
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            assert!(
+                import_test_response(response.into_bytes())
+                    .await
+                    .err()
+                    .unwrap()
+                    .contains(expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_accepts_chunked_json_with_a_utf8_bom() {
+        let body = "\u{feff}{\"doc\":{\"id\":\"1\",\"status\":\"completed\"}}";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{body}\r\n0\r\n\r\n",
+            body.len()
+        );
+        assert_eq!(
+            import_test_response(response.into_bytes())
+                .await
+                .unwrap()
+                .status,
+            "completed"
+        );
     }
 }
