@@ -44,8 +44,10 @@ pub(super) fn unicode(bytes: &[u8]) -> Result<String, String> {
         return Err("odd NTLM Unicode length".into());
     }
     let words = bytes
-        .chunks_exact(2)
-        .map(|v| u16::from_le_bytes([v[0], v[1]]));
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|v| u16::from_le_bytes(*v));
     let value: String = char::decode_utf16(words)
         .collect::<Result<_, _>>()
         .map_err(|_| "invalid NTLM Unicode")?;
