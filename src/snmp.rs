@@ -734,7 +734,24 @@ async fn query_inner(
         }
         raw.insert("physicalEntities".into(), physical_entities_json(&entities));
         raw.insert("entityInterfaceMappings".into(), interface_mappings.into());
-        if let Some(entity) = preferred_entity(&entities) {
+        if let Some((index, entity)) = preferred_entity(&entities) {
+            raw.insert(
+                "identityComponentRef".into(),
+                json!(format!("entity:{index}")),
+            );
+            if let Some(serial) = &entity.serial {
+                raw.insert(
+                    "serialClaim".into(),
+                    json!({
+                        "scope": entity.class.map(entity_class),
+                        "componentRef": format!("entity:{index}"),
+                        "issuer": entity.vendor,
+                        "original": serial,
+                        "encoding": "snmp-display-string",
+                        "normalizationVersion": 1,
+                    }),
+                );
+            }
             for (field, value) in [
                 ("vendor", entity.vendor.as_ref()),
                 ("model", entity.model.as_ref()),
@@ -1278,9 +1295,22 @@ async fn query_inner(
             source: Source::Snmp,
             observed_at,
             ip_address: Some(target.into()),
-            mac_address: identity_mac,
+            mac_address: identity_mac.clone(),
             fields,
-            raw: raw.into(),
+            raw: {
+                raw.insert(
+                    "observationId".into(),
+                    json!(uuid::Uuid::new_v4().to_string()),
+                );
+                raw.insert(
+                    "subject".into(),
+                    identity_mac.as_ref().map_or_else(
+                        || json!({ "kind": "endpoint", "ipAddress": target }),
+                        |mac| json!({ "kind": "device", "macAddress": mac }),
+                    ),
+                );
+                raw.into()
+            },
             warnings: warnings.clone(),
         }),
         interfaces: interfaces.into_values().collect(),
@@ -1409,6 +1439,7 @@ fn physical_entities_json(entities: &BTreeMap<String, PhysicalEntity>) -> serde_
                 "isFru": entity.is_fru,
                 "serialClaim": entity.serial.as_ref().map(|serial| json!({
                     "scope": class.unwrap_or("unknown"),
+                    "componentRef": format!("entity:{index}"),
                     "issuer": entity.vendor,
                     "original": serial,
                     "encoding": "snmp-display-string",
@@ -1441,30 +1472,15 @@ fn entity_alias_if_index(value: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn preferred_entity(entities: &BTreeMap<String, PhysicalEntity>) -> Option<&PhysicalEntity> {
-    entities.values().max_by_key(|entity| {
-        let root = u8::from(entity.contained_in == Some(0));
-        let class = match entity.class {
-            Some(3) => 3,  // chassis
-            Some(11) => 2, // stack
-            Some(9) => 1,  // module
-            _ => 0,
-        };
-        let populated = [
-            &entity.firmware,
-            &entity.hardware,
-            &entity.software,
-            &entity.serial,
-            &entity.vendor,
-            &entity.model,
-            &entity.asset_id,
-            &entity.manufactured_at,
-        ]
-        .into_iter()
-        .filter(|value| value.is_some())
-        .count();
-        (root, class, populated)
-    })
+fn preferred_entity(
+    entities: &BTreeMap<String, PhysicalEntity>,
+) -> Option<(&str, &PhysicalEntity)> {
+    // A module or an ambiguous collection of chassis is not the managed device's identity.
+    let mut roots = entities.iter().filter(|(_, entity)| {
+        entity.contained_in == Some(0) && matches!(entity.class, Some(3 | 11))
+    });
+    let (index, entity) = roots.next()?;
+    roots.next().is_none().then_some((index.as_str(), entity))
 }
 
 #[derive(Default)]
@@ -1718,6 +1734,49 @@ mod tests {
             Some("VxWorks")
         );
         assert_eq!(reported_os("Generic managed switch"), None);
+    }
+
+    #[test]
+    fn only_a_unique_root_chassis_or_stack_supplies_device_identity() {
+        let mut entities = BTreeMap::from([
+            (
+                "1".into(),
+                PhysicalEntity {
+                    class: Some(3),
+                    contained_in: Some(0),
+                    serial: Some("CHASSIS".into()),
+                    ..PhysicalEntity::default()
+                },
+            ),
+            (
+                "2".into(),
+                PhysicalEntity {
+                    class: Some(9),
+                    contained_in: Some(1),
+                    serial: Some("MODULE".into()),
+                    ..PhysicalEntity::default()
+                },
+            ),
+        ]);
+        assert_eq!(preferred_entity(&entities).unwrap().0, "1");
+        let raw = physical_entities_json(&entities);
+        assert_eq!(raw[1]["parentRef"], "entity:1");
+        assert_eq!(raw[1]["serialClaim"]["scope"], "module");
+        assert_eq!(raw[1]["serialClaim"]["componentRef"], "entity:2");
+        assert_eq!(raw[1]["serialClaim"]["original"], "MODULE");
+        entities.get_mut("2").unwrap().class = Some(3);
+        entities.get_mut("2").unwrap().contained_in = Some(0);
+        assert!(preferred_entity(&entities).is_none());
+        entities.remove("1");
+        entities.get_mut("2").unwrap().class = Some(9);
+        assert!(preferred_entity(&entities).is_none());
+        entities.get_mut("2").unwrap().class = Some(3);
+        entities.get_mut("2").unwrap().contained_in = None;
+        assert!(preferred_entity(&entities).is_none());
+        assert_eq!(
+            physical_entities_json(&entities)[0]["serialClaim"]["original"],
+            "MODULE"
+        );
     }
 
     #[test]
@@ -2206,6 +2265,13 @@ mod tests {
         assert_eq!(observation.fields["operatingSystem"], "Linux");
         assert_eq!(observation.fields["model"], "SCALANCE stack");
         assert_eq!(observation.fields["firmwareVersion"], "FW8.1");
+        assert_eq!(observation.raw["identityComponentRef"], "entity:3");
+        assert!(observation.raw.get("serialClaim").is_none());
+        assert_eq!(
+            observation.raw["subject"]["macAddress"],
+            "00:11:22:33:44:55"
+        );
+        assert!(uuid::Uuid::parse_str(observation.raw["observationId"].as_str().unwrap()).is_ok());
         assert!(result.inventory_complete);
         assert!(result.lldp_complete);
         assert_eq!(result.interfaces[0].name.as_deref(), Some("port-1"));

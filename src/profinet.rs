@@ -172,11 +172,18 @@ pub fn interfaces() -> Result<Vec<CaptureInterface>, String> {
                 .ok()
                 .map(|value| value.trim().to_ascii_uppercase())
                 .filter(|value| normalize_mac(value).is_some());
+            let mut addresses = mac.into_iter().collect::<Vec<_>>();
+            addresses.extend(
+                crate::discovery::interface_ipv4_addresses(&name)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|address| address.to_string()),
+            );
             Some(CaptureInterface {
                 name: name.clone(),
                 friendly_name: name.clone(),
                 description: name,
-                addresses: mac.into_iter().collect(),
+                addresses,
             })
         })
         .collect::<Vec<_>>();
@@ -340,17 +347,22 @@ fn attach_pnio_records(device: &mut Device, records: Vec<pnio::RecordRead>) {
         ("protocols".into(), json!(["profinet", "profinet-pnio"])),
         ("status".into(), json!("online")),
     ]);
-    if let Some(software_revision) = records
-        .iter()
-        .find(|record| record.target.index == 0xAFF0)
-        .and_then(|record| record.parsed["softwareRevision"].as_str())
+    // Only the primary access point supplies these legacy device-level fields.
+    let primary = records.iter().find(|record| {
+        (
+            record.target.api,
+            record.target.slot,
+            record.target.subslot,
+            record.target.index,
+        ) == (0, 0, 1, 0xAFF0)
+    });
+    if let Some(software_revision) =
+        primary.and_then(|record| record.parsed["softwareRevision"].as_str())
     {
         fields.insert("softwareRevision".into(), json!(software_revision));
     }
-    if let Some(manufacturer) = records
-        .iter()
-        .find(|record| record.target.index == 0xAFF0)
-        .and_then(|record| record.parsed["manufacturerName"].as_str())
+    if let Some(manufacturer) =
+        primary.and_then(|record| record.parsed["manufacturerName"].as_str())
     {
         fields.insert("manufacturer".into(), json!(manufacturer));
     }
@@ -373,9 +385,120 @@ fn attach_pnio_records(device: &mut Device, records: Vec<pnio::RecordRead>) {
         ip_address: ip_address.clone(),
         mac_address: Some(device.mac_address.clone()),
         fields,
-        raw: json!({ "pnioRecords": raw_records }),
+        raw: json!({
+            "observationId": uuid::Uuid::new_v4().to_string(),
+            "subject": { "kind": "device", "macAddress": device.mac_address },
+            "physicalEntities": pnio_physical_entities(&records),
+            "pnioRecords": raw_records,
+        }),
         warnings: vec![],
     });
+}
+
+fn pnio_component(
+    entities: &mut BTreeMap<String, Value>,
+    api: u32,
+    slot: u16,
+    subslot: Option<u16>,
+) -> &mut Value {
+    let module_ref = format!("pnio:{api}:{slot}");
+    let key = subslot.map_or_else(
+        || module_ref.clone(),
+        |subslot| format!("{module_ref}:{subslot}"),
+    );
+    entities.entry(key.clone()).or_insert_with(|| {
+        json!({
+            "ref": key,
+            "parentRef": subslot.map(|_| module_ref),
+            "parentPosition": subslot.unwrap_or(slot),
+            "class": if subslot.is_some() { "submodule" } else { "module" },
+            "api": api,
+            "slot": slot,
+            "subslot": subslot,
+        })
+    })
+}
+
+fn pnio_physical_entities(records: &[pnio::RecordRead]) -> Value {
+    let mut entities = BTreeMap::new();
+    // Identification records describe modules even when they provide no I&M identity.
+    for record in records
+        .iter()
+        .filter(|record| record.target.index == 0xF000)
+    {
+        for api in record.parsed["apis"].as_array().into_iter().flatten() {
+            let Some(api_id) = api["api"].as_u64().and_then(|id| u32::try_from(id).ok()) else {
+                continue;
+            };
+            for module in api["modules"].as_array().into_iter().flatten() {
+                let Some(slot) = module["slot"]
+                    .as_u64()
+                    .and_then(|slot| u16::try_from(slot).ok())
+                else {
+                    continue;
+                };
+                pnio_component(&mut entities, api_id, slot, None)["identNumber"] =
+                    module["identNumber"].clone();
+                for submodule in module["submodules"].as_array().into_iter().flatten() {
+                    let Some(subslot) = submodule["subslot"]
+                        .as_u64()
+                        .and_then(|slot| u16::try_from(slot).ok())
+                    else {
+                        continue;
+                    };
+                    pnio_component(&mut entities, api_id, slot, Some(subslot))["identNumber"] =
+                        submodule["identNumber"].clone();
+                }
+            }
+        }
+    }
+    for record in records
+        .iter()
+        .filter(|record| matches!(record.target.index, 0xAFF0..=0xAFF5))
+    {
+        let target = &record.target;
+        pnio_component(&mut entities, target.api, target.slot, None);
+        let component =
+            pnio_component(&mut entities, target.api, target.slot, Some(target.subslot));
+        let parsed = &record.parsed;
+        let mappings: &[(&str, &str)] = match target.index {
+            0xAFF0 => &[
+                ("manufacturerId", "manufacturerId"),
+                ("manufacturerName", "manufacturer"),
+                ("orderId", "catalogNumber"),
+                ("hardwareRevision", "hardwareRevision"),
+                ("softwareRevision", "softwareRevision"),
+            ],
+            0xAFF1 => &[("function", "function"), ("location", "location")],
+            0xAFF2 => &[("installationDate", "installationDate")],
+            0xAFF3 => &[("descriptor", "description")],
+            _ => &[],
+        };
+        for &(source, field) in mappings {
+            if let Some(value) = parsed
+                .get(source)
+                .filter(|value| value.as_str().is_some_and(|text| !text.trim().is_empty()))
+            {
+                component[field] = value.clone();
+            }
+        }
+        if target.index == 0xAFF0
+            && let Some(serial) = parsed["serialNumber"]
+                .as_str()
+                .filter(|serial| !serial.trim().is_empty())
+        {
+            component["serialClaim"] = json!({
+                "scope": "submodule",
+                "componentRef": component["ref"],
+                "issuer": parsed.get("manufacturerName"),
+                "manufacturerId": parsed.get("manufacturerId"),
+                "original": serial,
+                "encoding": "profinet-im-text",
+                "normalizationVersion": 1,
+            });
+        }
+    }
+    entities.into_values().collect()
 }
 
 #[cfg(target_os = "linux")]
@@ -1391,6 +1514,148 @@ mod tests {
         assert_eq!(devices[&mac].ip_addresses, ["192.0.2.1"]);
     }
 
+    fn pnio_record(
+        api: u32,
+        slot: u16,
+        subslot: u16,
+        index: u16,
+        parsed: Value,
+    ) -> pnio::RecordRead {
+        pnio::RecordRead {
+            target: pnio::RecordTarget {
+                api,
+                slot,
+                subslot,
+                index,
+                data_length: 32_768,
+            },
+            data: vec![0x12, 0x34],
+            parsed,
+        }
+    }
+
+    #[test]
+    fn pnio_components_preserve_identity_containment_and_observation_scope() {
+        let module = json!({
+            "manufacturerId": "002A", "manufacturerName": "Module vendor",
+            "orderId": "MODULE-1", "serialNumber": "MODULE-SERIAL",
+            "hardwareRevision": "2", "softwareRevision": "V2.0.0",
+        });
+        let records = vec![
+            pnio_record(0, 1, 1, 0xAFF0, module.clone()),
+            pnio_record(7, 1, 1, 0xAFF0, module),
+            pnio_record(
+                0,
+                0,
+                1,
+                0xAFF0,
+                json!({
+                    "manufacturerName": "Primary vendor", "serialNumber": "DAP-SERIAL",
+                    "softwareRevision": "V1.0.0", "hardwareRevision": "1",
+                }),
+            ),
+            pnio_record(
+                0,
+                1,
+                1,
+                0xAFF1,
+                json!({ "function": "Input", "location": "Cell 1" }),
+            ),
+            pnio_record(0, 1, 1, 0xAFF2, json!({ "installationDate": "2026-01-01" })),
+            pnio_record(0, 1, 1, 0xAFF3, json!({ "descriptor": "Input module" })),
+            pnio_record(0, 1, 1, 0xAFF4, json!({ "imSignature": "AB" })),
+            pnio_record(0, 1, 1, 0xAFF5, json!({ "im5Data": [] })),
+            pnio_record(
+                0,
+                0,
+                1,
+                0xF000,
+                json!({ "apis": [{
+                "api": 0, "modules": [{
+                    "slot": 1, "identNumber": 10,
+                    "submodules": [{ "subslot": 1, "identNumber": 11 }],
+                }, {
+                    "slot": 2, "identNumber": 20,
+                    "submodules": [{ "subslot": 1, "identNumber": 21 }],
+                }],
+            }] }),
+            ),
+        ];
+        let mut device = Device {
+            mac_address: "00:11:22:33:44:55".into(),
+            ..Device::default()
+        };
+        attach_pnio_records(&mut device, records.clone());
+        attach_pnio_records(&mut device, records);
+        let observation = &device.observations[0];
+        assert_eq!(observation.fields["manufacturer"], "Primary vendor");
+        assert_eq!(observation.fields["softwareRevision"], "V1.0.0");
+        assert!(!observation.fields.contains_key("serialNumber"));
+        assert_eq!(observation.raw["pnioRecords"][0]["raw"], "1234");
+        assert_eq!(observation.raw["pnioRecords"].as_array().unwrap().len(), 9);
+        assert_ne!(
+            observation.raw["observationId"],
+            device.observations[1].raw["observationId"]
+        );
+        assert_eq!(observation.raw["subject"]["macAddress"], device.mac_address);
+        let components = observation.raw["physicalEntities"].as_array().unwrap();
+        let by_ref = |key| {
+            components
+                .iter()
+                .find(|entity| entity["ref"] == key)
+                .unwrap()
+        };
+        assert_eq!(components.len(), 8);
+        assert_eq!(by_ref("pnio:0:1")["identNumber"], 10);
+        let module = by_ref("pnio:0:1:1");
+        assert_eq!(module["identNumber"], 11);
+        assert_eq!(module["parentRef"], "pnio:0:1");
+        assert_eq!(module["parentPosition"], 1);
+        assert_eq!(module["catalogNumber"], "MODULE-1");
+        assert_eq!(module["hardwareRevision"], "2");
+        assert_eq!(module["softwareRevision"], "V2.0.0");
+        assert_eq!(module["location"], "Cell 1");
+        assert_eq!(module["installationDate"], "2026-01-01");
+        assert_eq!(module["description"], "Input module");
+        assert_eq!(module["serialClaim"]["scope"], "submodule");
+        assert_eq!(module["serialClaim"]["componentRef"], module["ref"]);
+        assert_eq!(
+            by_ref("pnio:7:1:1")["serialClaim"]["original"],
+            "MODULE-SERIAL"
+        );
+        assert!(by_ref("pnio:0:2:1").get("serialClaim").is_none());
+        let restored: Observation =
+            serde_json::from_value(serde_json::to_value(observation).unwrap()).unwrap();
+        assert_eq!(restored.raw, observation.raw);
+    }
+
+    #[test]
+    fn pnio_module_only_and_empty_records_do_not_supply_device_identity() {
+        let mut device = Device::default();
+        attach_pnio_records(&mut device, vec![]);
+        assert!(device.observations.is_empty());
+        attach_pnio_records(
+            &mut device,
+            vec![pnio_record(
+                0,
+                1,
+                1,
+                0xAFF0,
+                json!({
+                    "serialNumber": " ", "orderId": "", "manufacturerName": "Module vendor",
+                    "softwareRevision": "V2.0.0",
+                }),
+            )],
+        );
+        let observation = &device.observations[0];
+        assert!(!observation.fields.contains_key("manufacturer"));
+        assert!(!observation.fields.contains_key("softwareRevision"));
+        let module = &observation.raw["physicalEntities"][1];
+        assert!(module.get("serialClaim").is_none());
+        assert!(module.get("catalogNumber").is_none());
+        assert_eq!(module["manufacturer"], "Module vendor");
+    }
+
     #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn cancelled_dcp_scan_skips_capture() {
@@ -1642,7 +1907,28 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn lists_linux_interfaces_without_privileges() {
-        assert!(!interfaces().unwrap().is_empty());
+        let interfaces = interfaces().unwrap();
+        assert!(!interfaces.is_empty());
+        let loopback = interfaces
+            .iter()
+            .find(|interface| interface.name == "lo")
+            .unwrap();
+        assert!(
+            loopback
+                .addresses
+                .iter()
+                .any(|address| address == "127.0.0.1")
+        );
+        assert_eq!(
+            crate::discovery::source_ipv4("lo").unwrap(),
+            Ipv4Addr::LOCALHOST
+        );
+        assert!(
+            crate::discovery::interface_ipv4_addresses("missing-otserver-interface")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(crate::discovery::interface_ipv4_addresses("invalid\0interface").is_err());
     }
 
     #[cfg(windows)]

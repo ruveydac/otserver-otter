@@ -84,6 +84,7 @@ Write-Host "Windows lab adapter: $($labAdapter.Name) ($interfaceId), $labAddress
 Write-Host 'This is a host-routed protocol smoke test. Docker responders share the host adapter MAC.'
 Write-Host 'PROFINET DCP is excluded: Docker Desktop does not bridge raw Ethernet DCP frames to Windows.'
 Write-Host 'IEC 61850 is excluded: its MMS port 102 is already host-bound by the S7 lab device.'
+Write-Host 'SMB/RPC are excluded: Windows host services own TCP 445/135; Linux lab tests use Samba.'
 
 try {
     & $DockerPath @composeArguments up --build --wait @services
@@ -94,6 +95,8 @@ try {
         --interface $interfaceId `
         --source-mac $sourceMac `
         --no-profinet `
+        --no-smb `
+        --no-rpc `
         --output $outputPath `
         --ack-authorized
     if ($LASTEXITCODE -ne 0) { throw "Windows scanner failed with exit code $LASTEXITCODE." }
@@ -128,7 +131,7 @@ try {
         "Adapter MAC: $sourceMac"
         "Observed protocols: $($sources -join ', ')"
         'The temporary scan represented one Docker host endpoint and was deleted; do not import it as asset data.'
-        'PROFINET DCP, IEC 61850, and distinct device MAC correlation were not tested.'
+        'PROFINET DCP, IEC 61850, SMB, RPC, and distinct device MAC correlation were not tested.'
     ) | Out-File -LiteralPath $summaryPath -Encoding utf8
     Write-Host "OTserver Otter Windows Docker protocol smoke test passed. Summary: $summaryPath"
 } finally {

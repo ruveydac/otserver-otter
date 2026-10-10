@@ -107,6 +107,10 @@ async def build_address_space(server: Server) -> None:
         ua.Variant(7, ua.VariantType.Int32),
     )
     await identification.add_variable(
+        ua.NodeId(322, lab), f"{di}:PatchIdentifiers",
+        ua.Variant(["LAB-PATCH-1"], ua.VariantType.String),
+    )
+    await identification.add_variable(
         ua.NodeId(317, lab),
         f"{di}:DeviceHealth",
         ua.Variant(0, ua.VariantType.Int32),
@@ -138,18 +142,32 @@ async def build_address_space(server: Server) -> None:
     device_set = await objects.add_folder(ua.NodeId(200, lab), f"{di}:DeviceSet")
     await device_set.add_reference(asset, ua.NodeId(ua.ObjectIds.Organizes, 0))
 
+    # A distinct represented asset must keep its identity separate from the first one.
+    secondary = await device_set.add_object(ua.NodeId(400, lab), f"{lab}:Secondary Asset")
+    for identifier, name, value in (
+        (401, "AssetId", "LAB-ASSET-2"),
+        (411, "Manufacturer", "Secondary Manufacturer"),
+        (412, "Model", "Secondary Device"),
+        (413, "SerialNumber", "OPCLAB0002"),
+        (414, "HardwareRevision", "B2"),
+    ):
+        await secondary.add_variable(
+            ua.NodeId(identifier, lab), f"{di}:{name}",
+            ua.Variant(value, ua.VariantType.String),
+        )
+
     # FindAlias method: returns an AliasNameDataType referencing the asset node.
     def find_alias(parent: Any, pattern: Any) -> List[ua.Variant]:
-        alias = ua.AliasNameDataType()
-        alias.AliasName = ua.QualifiedName(ASSET_ID, lab)
-        alias.ReferencedNodes = [
-            ua.ExpandedNodeId(Identifier=ASSET_NODE_ID.Identifier, NamespaceIndex=lab)
-        ]
-        ext = ua.ExtensionObject(
-            TypeId=ua.extension_object_typeids["AliasNameDataType"],
-            Body=struct_to_binary(alias),
-        )
-        return [ua.Variant([ext], ua.VariantType.ExtensionObject)]
+        entries = []
+        for name, node_id in ((ASSET_ID, ASSET_NODE_ID.Identifier), ("LAB-ASSET-2", 400)):
+            alias = ua.AliasNameDataType()
+            alias.AliasName = ua.QualifiedName(name, lab)
+            alias.ReferencedNodes = [ua.ExpandedNodeId(Identifier=node_id, NamespaceIndex=lab)]
+            entries.append(ua.ExtensionObject(
+                TypeId=ua.extension_object_typeids["AliasNameDataType"],
+                Body=struct_to_binary(alias),
+            ))
+        return [ua.Variant(entries, ua.VariantType.ExtensionObject)]
 
     await category.add_method(
         ua.NodeId(121, lab),

@@ -186,21 +186,29 @@ fn reply(
     (mac != [0; 6] && mac != BROADCAST).then_some((ip, mac))
 }
 
-#[cfg(windows)]
 pub(crate) fn source_ipv4(interface: &str) -> Result<Ipv4Addr, String> {
-    crate::profinet::interfaces()?
+    interface_ipv4_addresses(interface)?
         .into_iter()
-        .find(|item| item.name == interface || item.friendly_name == interface)
-        .and_then(|item| {
-            item.addresses
-                .iter()
-                .find_map(|address| address.parse::<Ipv4Addr>().ok())
-        })
+        .next()
         .ok_or_else(|| format!("Interface {interface} has no IPv4 address."))
 }
 
+#[cfg(windows)]
+pub fn interface_ipv4_addresses(interface: &str) -> Result<Vec<Ipv4Addr>, String> {
+    crate::profinet::interfaces()?
+        .into_iter()
+        .find(|item| item.name == interface || item.friendly_name == interface)
+        .map(|item| {
+            item.addresses
+                .iter()
+                .filter_map(|address| address.parse::<Ipv4Addr>().ok())
+                .collect()
+        })
+        .ok_or_else(|| format!("Could not find interface {interface}."))
+}
+
 #[cfg(target_os = "linux")]
-pub(crate) fn source_ipv4(interface: &str) -> Result<Ipv4Addr, String> {
+pub fn interface_ipv4_addresses(interface: &str) -> Result<Vec<Ipv4Addr>, String> {
     use std::ffi::{CStr, CString};
     use std::net::Ipv4Addr;
     use std::ptr::{self, NonNull};
@@ -217,7 +225,7 @@ pub(crate) fn source_ipv4(interface: &str) -> Result<Ipv4Addr, String> {
     }
 
     let mut current = addresses;
-    let mut result = None;
+    let mut result = Vec::new();
 
     while let Some(item_ptr) = NonNull::new(current) {
         if !item_ptr.as_ptr().is_aligned() {
@@ -233,19 +241,18 @@ pub(crate) fn source_ipv4(interface: &str) -> Result<Ipv4Addr, String> {
             && unsafe { (*item.ifa_addr).sa_family as i32 } == libc::AF_INET
         {
             let address = unsafe { &*(item.ifa_addr.cast::<libc::sockaddr_in>()) };
-            result = Some(Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr)));
-            break;
+            result.push(Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr)));
         }
 
         current = item.ifa_next;
     }
 
     unsafe { libc::freeifaddrs(addresses) };
-    result.ok_or_else(|| format!("Interface {interface} has no IPv4 address."))
+    Ok(result)
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-pub(crate) fn source_ipv4(_interface: &str) -> Result<Ipv4Addr, String> {
+pub fn interface_ipv4_addresses(_interface: &str) -> Result<Vec<Ipv4Addr>, String> {
     Err("Native discovery is supported on Windows and Linux.".into())
 }
 

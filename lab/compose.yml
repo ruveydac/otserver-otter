@@ -98,6 +98,18 @@ services:
         ipv4_address: 172.30.0.18
         mac_address: "02:00:00:00:00:18"
 
+  smb1:
+    build:
+      context: .
+      dockerfile: devices/Dockerfile.netbios
+    # Deliberately legacy-only responder, isolated on the lab bridge with no published ports.
+    entrypoint: [smbd, --foreground, --no-process-group, --debug-stdout, "--option=netbios name=OTTER-SMB1", "--option=server min protocol=NT1", "--option=server max protocol=NT1"]
+    healthcheck: *process-health
+    networks:
+      ot_lab:
+        ipv4_address: 172.30.0.19
+        mac_address: "02:00:00:00:00:19"
+
   opcua:
     build:
       context: .
@@ -127,6 +139,7 @@ services:
       dnp3: { condition: service_healthy }
       iec61850: { condition: service_healthy }
       netbios: { condition: service_healthy }
+      smb1: { condition: service_healthy }
       opcua: { condition: service_healthy }
     volumes:
       - ./artifacts:/artifacts:Z

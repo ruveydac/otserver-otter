@@ -9,7 +9,8 @@ OTserver Otter is a read-only Rust discovery CLI and GUI for Windows and Linux. 
 assets with native ARP, PROFINET DCP Identify and PNIO I&M record reads (EPM endpoint mapping,
 bounded read requests, and DCE/RPC fragmentation/FACK handling), S7 identity, EtherNet/IP List
 Identity, BACnet ReadProperty, Omron FINS identity, Niagara Fox hello, DNP3 Group 0 device
-attributes, NetBIOS Node Status, OPC UA asset discovery, SNMP GET/WALK, and LLDP. It exports
+attributes, NetBIOS Node Status, SMB1/2/3 and RPC NTLM challenge identity, OPC UA asset discovery,
+SNMP GET/WALK, and LLDP. It exports
 `otserver-scan` schema-version-2 JSON for OTserver.
 
 The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
@@ -37,6 +38,22 @@ The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
 - NetBIOS uses one unicast wildcard NBSTAT query to UDP 137. Keep the reported UNIT_ID as raw
   evidence, never as an override for ARP/DCP identity or a way to resolve MAC-less targets.
   It is enabled by default; `--no-netbios`, `noNetbios`, and the GUI toggle disable it.
+- SMB uses TCP 445, SMB2/3 negotiation and only the first NTLM SESSION_SETUP; RPC uses TCP 135
+  and one EPM bind carrying NTLM Type 1. Never send NTLM Type 3/AUTH3, authenticate, enumerate
+  shares/endpoints, activate DCOM, or execute WMI/WinRM commands in these probes. Both are enabled
+  by default, with `--no-smb`/`noSmb`, `--no-rpc`/`noRpc`, GUI toggles and legacy `noProtocols`
+  disablement. Export them as existing `os-fingerprint` observations with `raw.protocol` `smb` or
+  `rpc`, retaining reported NT versions and candidate releases. A dialect is not an OS version;
+  NTLM versions may be synthesized by compatible implementations. Do not infer edition, client
+  versus server on shared builds, UBR, installed hotfixes, or patch compliance from a challenge.
+- SMB may reconnect once with SMB1 `NT LM 0.12` after a correlated SMB2 `STATUS_NOT_SUPPORTED`
+  or a connection close/reset before any negotiation response bytes. Never fall back on malformed,
+  partial, mismatched, or timed-out responses, or after an accepted SMB2 negotiation. SMB1 uses
+  negotiation and at most one extended-security Type 1 SESSION_SETUP_ANDX, without AndX chaining.
+  Classic-security servers retain negotiation/domain evidence only: never send a classic/anonymous
+  login or an LM/NT challenge response. Preserve native OS/LAN-manager strings separately from
+  NTLM versions, and unknown OEM bytes without lossy decoding. Existing SMB toggles disable all
+  dialects; SMB1 remains `os-fingerprint` with `raw.protocol` `smb` and `raw.smbVersion` 1.
 - Preserve process-wide `src/traffic.rs` pacing: 35 explicit ARP requests/s and approximately 350
   aggregate discovery operations/s, 70% of the supplied site ceilings (50 and 500). Serialize raw
   ARP sends and Windows `SendARP` calls through the blocking send gate, including syscall retries;
@@ -47,7 +64,22 @@ The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
 - Credentials belong in executable-adjacent `otter.json`. Load legacy `otscanner.json` only when
   `otter.json` is absent. Never write credentials to logs or scan exports.
 - Direct imports use OTserver's `asset-imports` REST API so authorization, validation, merging, and
-  auditing remain application-owned.
+  auditing remain application-owned. Bound uploads to a 10-second connection timeout, five-minute
+  total deadline, and 16 MiB response body; retain the local scan on failure.
+- SNMP and PNIO component references are observation-local under `raw.physicalEntities`, with
+  `raw.observationId`, explicit subjects, containment, and component-scoped serial claims. Preserve
+  original ENTITY-MIB/PNIO data. Only a unique root ENTITY-MIB chassis/stack may supply device
+  identity; module-only or ambiguous inventories must not. PNIO's legacy device-level manufacturer
+  and software fields come only from API 0, slot 0, subslot 1; component serials stay scoped.
+- Export the selected scan interface's current IP addresses separately from its source MAC.
+- Keep application/runtime versions separate from firmware. BACnet exports `applicationSoftwareVersion`;
+  Fox exports `applicationName`, `applicationSoftwareVersion`, `runtimeName`, and `runtimeVersion`,
+  retaining successful listener evidence when another listener fails.
+- OPC UA normalized identity comes from one asset entry; all entries retain scoped fields and serials
+  under `raw.assets`, with `raw.normalizedAssetRef` identifying the selected entry. IEC 61850 never
+  fills normalized fields from another logical device; preserve node-scoped evidence and serials in
+  `raw.nodeObservations`, with `raw.normalizedLogicalDevice` and `raw.fieldSources`. These references
+  are observation-local, not identities for merging assets or substitutes for MAC correlation.
 
 ## Platform Rules
 

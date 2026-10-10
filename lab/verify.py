@@ -21,8 +21,9 @@ DEVICES = {
     "dnp3": "02:00:00:00:00:16",
     "iec61850": "02:00:00:00:00:17",
     "netbios": "02:00:00:00:00:18",
+    "smb1": "02:00:00:00:00:19",
 }
-TARGETS = [f"172.30.0.{number}" for number in range(10, 19)]
+TARGETS = [f"172.30.0.{number}" for number in range(10, 20)]
 
 
 def run(*arguments: str) -> None:
@@ -54,7 +55,9 @@ def scan(output: Path, targets: list[str], *flags: str) -> dict:
     run(*arguments)
     run("validate", str(output))
     with output.open(encoding="utf-8") as source:
-        return json.load(source)
+        result = json.load(source)
+    assert result["scan"]["interface"]["addresses"] == ["172.30.0.2"]
+    return result
 
 
 def by_mac(result: dict, mac: str) -> dict:
@@ -70,6 +73,32 @@ def assert_full(result: dict) -> None:
     assert result["scan"].get("partial", False) is False
     assert result["errors"] == []
     assert {device["macAddress"] for device in result["devices"]} == set(DEVICES.values())
+
+    smb = next(item for item in by_mac(result, DEVICES["netbios"])["observations"]
+               if (item.get("raw") or {}).get("protocol") == "smb")
+    assert smb["source"] == "os-fingerprint"
+    assert smb["fields"]["protocols"] == ["smb"]
+    assert smb["raw"]["authenticationCompleted"] is False
+    assert smb["raw"]["ntlm"]["names"]["netbiosComputerName"] == "OTTER-NB"
+    assert any(port["key"] == "tcp:445" for port in by_mac(result, DEVICES["netbios"])["ports"])
+    rpc = next(item for item in by_mac(result, DEVICES["netbios"])["observations"]
+               if (item.get("raw") or {}).get("protocol") == "rpc")
+    assert rpc["source"] == "os-fingerprint"
+    assert rpc["fields"]["protocols"] == ["rpc"]
+    assert rpc["raw"]["authenticationCompleted"] is False
+    assert rpc["raw"]["ntlm"]["names"]["netbiosComputerName"] == "OTTER-NB"
+
+    legacy = next(item for item in by_mac(result, DEVICES["smb1"])["observations"]
+                  if (item.get("raw") or {}).get("protocol") == "smb")
+    assert legacy["source"] == "os-fingerprint"
+    assert legacy["fields"]["protocols"] == ["smb"]
+    assert legacy["raw"]["smbVersion"] == 1
+    assert legacy["raw"]["dialect"] == "NT LM 0.12"
+    assert legacy["raw"]["extendedSecurity"] is True
+    assert legacy["raw"]["ntlm"]["names"]["netbiosComputerName"] == "OTTER-SMB1"
+    assert legacy["raw"]["authenticationCompleted"] is False
+    assert legacy["warnings"] == []
+    assert legacy["raw"]["serverStrings"]["nativeLanMan"].startswith("Samba ")
 
     siemens = by_mac(result, DEVICES["siemens"])
     sources = {item["source"] for item in siemens["observations"]}
@@ -115,6 +144,16 @@ def assert_full(result: dict) -> None:
     assert interface["adminStatus"] == interface["operStatus"] == "up"
     assert snmp["raw"]["1.0.62439.1.1.1.1.2.1"] == "00112233445566778899AABBCCDDEEFF"
     assert snmp["raw"]["physicalEntities"][0]["serialClaim"]["original"] == "S7LAB0001"
+    assert snmp["raw"]["identityComponentRef"] == "entity:1"
+    assert snmp["raw"]["serialClaim"]["scope"] == "chassis"
+    assert snmp["raw"]["serialClaim"]["componentRef"] == "entity:1"
+    assert snmp["raw"]["subject"]["macAddress"] == DEVICES["siemens"]
+    uuid.UUID(snmp["raw"]["observationId"])
+    module = snmp["raw"]["physicalEntities"][1]
+    assert module["ref"] == "entity:2" and module["parentRef"] == "entity:1"
+    assert module["parentPosition"] == 2
+    assert module["serialClaim"]["scope"] == "module"
+    assert module["serialClaim"]["original"] == "MODULELAB0002"
     lldp_port = next(value for value in siemens["ports"] if value["key"] == "lldpPort:1")
     assert lldp_port["vlans"] == [1]
     assert lldp_port["raw"]["lldpDot3"]["maxFrameSize"] == 1500
@@ -152,6 +191,7 @@ def assert_full(result: dict) -> None:
         pnio["fields"]["manufacturer"]
         == "Chengdu Zongheng Intelligence Control Technology Co., Ltd."
     )
+    assert_pnio_components(pnio)
 
     ethernet_ip = observation(by_mac(result, DEVICES["ethernet_ip"]), "ethernet-ip")
     assert ethernet_ip["fields"] | {
@@ -178,6 +218,8 @@ def assert_full(result: dict) -> None:
         "vendor": "BACnet Stack at SourceForge",
     } == bacnet["fields"]
     assert bacnet["raw"]["instanceNumber"] == 12001
+    assert bacnet["fields"]["applicationSoftwareVersion"] == bacnet["raw"]["applicationSoftware"]
+    assert bacnet["fields"]["applicationSoftwareVersion"]
 
     fins = observation(by_mac(result, DEVICES["fins"]), "omron-fins")
     assert fins["fields"] | {
@@ -194,10 +236,16 @@ def assert_full(result: dict) -> None:
         "name": "niagara-station-1",
         "operatingSystem": "QNX",
         "vendor": "Tridium",
+        "applicationName": "Station",
+        "applicationSoftwareVersion": "4.13.1",
+        "runtimeName": "Java HotSpot",
+        "runtimeVersion": "17",
     } == fox["fields"]
     fox_ports = {value["key"]: value["raw"] for value in by_mac(result, DEVICES["fox"])["ports"]}
     assert fox_ports["tcp:1911"]["tls"] is False
     assert fox_ports["tcp:4911"]["tls"] is True
+    assert {(reply["port"], reply["tls"]) for reply in fox["raw"]["transportResponses"]} == {(1911, False), (4911, True)}
+    assert "firmwareVersion" not in fox["fields"]
 
     dnp3 = observation(by_mac(result, DEVICES["dnp3"]), "dnp3")
     assert dnp3["fields"] | {
@@ -205,6 +253,7 @@ def assert_full(result: dict) -> None:
         "model": "OT Lab RTU 3000",
         "vendor": "OT Lab Automation",
         "firmwareVersion": "4.2.1",
+        "hardwareVersion": "rev C",
         "serialNumber": "DNPLAB0001",
         "location": "OT Lab / Cell 2",
     } == dnp3["fields"]
@@ -244,6 +293,12 @@ def assert_full(result: dict) -> None:
     assert iec61850["raw"]["values"]["OTTERIEDLD0/LPHD1.PhyNam.vendor[DC]"] == "OT Lab Automation"
     assert iec61850["raw"]["values"]["OTTERIEDLD0/LLN0.Health.stVal[ST]"] == 1
     assert iec61850["raw"]["values"]["OTTERIEDLD0/XCBR1.OpCnt.stVal[ST]"] == 42
+    assert iec61850["raw"]["normalizedLogicalDevice"] == "OTTERIEDLD0"
+    assert iec61850["raw"]["serialClaim"]["scope"] == "physical-device"
+    assert iec61850["raw"]["fieldSources"]["serialNumber"] == "mms:OTTERIEDLD0/LPHD1"
+    nodes = {node["ref"]: node for node in iec61850["raw"]["nodeObservations"]}
+    assert nodes["mms:OTTERIEDLD0/XCBR1"]["fields"]["operationCount"] == 42
+    assert nodes["mms:OTTERIEDLD0/LPHD1"]["serialClaim"]["original"] == "IEDLAB0001"
     assert iec61850["warnings"] == []
     assert iec61850["raw"]["values"]["OTTERIEDLD0/XCBR1.Pos.stVal[ST]"] == {
         "padding": 6,
@@ -260,11 +315,21 @@ def assert_full(result: dict) -> None:
         "model": "OPC UA Lab Device",
         "serialNumber": "OPCLAB0001",
         "firmwareVersion": "2.1.0",
+        "hardwareVersion": "A1",
+        "patchIdentifiers": ["LAB-PATCH-1"],
         "location": "Plant1/Line3/Cell2",
         "description": "Test Device",
         "status": "online",
     } == opcua["fields"]
     assert "opc-ua" in opcua["fields"].get("protocols", [])
+    assets = opcua["raw"]["assets"]
+    assert len(assets) == 2
+    assert opcua["raw"]["normalizedAssetRef"] == assets[0]["ref"]
+    assert opcua["raw"]["serialClaim"]["scope"] == "asset"
+    assert assets[1]["fields"]["model"] == "Secondary Device"
+    assert assets[1]["fields"]["hardwareVersion"] == "B2"
+    assert assets[1]["serialClaim"]["original"] == "OPCLAB0002"
+    assert assets[1]["serialClaim"]["componentRef"] == assets[1]["ref"]
     opcua_ports = {value["key"] for value in by_mac(result, DEVICES["opcua"])["ports"]}
     assert "tcp:4840" in opcua_ports
 
@@ -343,6 +408,28 @@ def assert_pnio(result: dict) -> None:
         == "Chengdu Zongheng Intelligence Control Technology Co., Ltd."
     )
     assert len(by_index["0xAFF5"]["assetManagementBlocks"]) == 3
+    assert_pnio_components(pnio)
+
+
+def assert_pnio_components(pnio: dict) -> None:
+    uuid.UUID(pnio["raw"]["observationId"])
+    assert pnio["raw"]["subject"]["macAddress"] == DEVICES["siemens"]
+    entities = {entity["ref"]: entity for entity in pnio["raw"]["physicalEntities"]}
+    for record in pnio["raw"]["pnioRecords"]:
+        if record["index"] != "0xAFF0":
+            continue
+        api, slot, subslot = record["api"], record["slot"], record["subslot"]
+        ref = f"pnio:{api}:{slot}:{subslot}"
+        entity = entities[ref]
+        assert entity["parentRef"] == f"pnio:{api}:{slot}"
+        assert entity["parentRef"] in entities
+        assert entity["parentPosition"] == subslot
+        assert entity["catalogNumber"] == record["parsed"]["orderId"]
+        assert entity["hardwareRevision"] == record["parsed"]["hardwareRevision"]
+        assert entity["softwareRevision"] == record["parsed"]["softwareRevision"]
+        assert entity["serialClaim"]["scope"] == "submodule"
+        assert entity["serialClaim"]["componentRef"] == ref
+        assert entity["serialClaim"]["original"] == record["parsed"]["serialNumber"]
 
 
 def main() -> None:
@@ -389,10 +476,11 @@ def main() -> None:
             "--no-lldp",
         )
     )
-    netbios_flags = (
+    native_flags = (
         "--no-profinet", "--no-s7", "--no-enip", "--no-bacnet", "--no-fins",
         "--no-fox", "--no-dnp3", "--no-iec61850", "--no-opcua", "--no-snmp", "--no-lldp",
     )
+    netbios_flags = (*native_flags, "--no-smb", "--no-rpc")
     disabled = scan(netbios_disabled_path, ["172.30.0.18"], *netbios_flags, "--no-netbios")
     disabled_device = by_mac(disabled, DEVICES["netbios"])
     assert not any(item["source"] == "netbios" for item in disabled_device["observations"])
@@ -404,6 +492,28 @@ def main() -> None:
     assert "macAddress" not in netbios and "macAddress" not in netbios["fields"]
     assert netbios["raw"]["subject"]["kind"] == "endpoint"
     assert netbios["raw"]["listeners"][0]["port"] == 137
+    for disabled_protocol, expected_protocol in [("smb", "rpc"), ("rpc", "smb")]:
+        path = ARTIFACTS / f"windows-{expected_protocol}-unresolved-{run_id}.otserver.json"
+        result = scan(path, ["172.30.0.18"], *native_flags, "--no-netbios", "--no-arp", f"--no-{disabled_protocol}")
+        assert result["devices"] == [] and len(result["unresolved"]) == 1
+        evidence = result["unresolved"][0]
+        assert evidence["source"] == "os-fingerprint"
+        assert evidence["raw"]["protocol"] == expected_protocol
+        assert evidence["raw"]["subject"]["kind"] == "endpoint"
+        assert "macAddress" not in evidence and "macAddress" not in evidence["fields"]
+        assert evidence["raw"]["authenticationCompleted"] is False
+        os.chmod(path, 0o666)
+    for disabled in [False, True]:
+        path = ARTIFACTS / f"smb1-{'disabled' if disabled else 'unresolved'}-{run_id}.otserver.json"
+        result = scan(path, ["172.30.0.19"], *native_flags, "--no-netbios", "--no-rpc", "--no-arp", *(["--no-smb"] if disabled else []))
+        assert result["devices"] == []
+        assert len(result["unresolved"]) == (0 if disabled else 1)
+        if not disabled:
+            legacy = result["unresolved"][0]
+            assert legacy["raw"]["smbVersion"] == 1
+            assert legacy["raw"]["subject"]["kind"] == "endpoint"
+            assert "macAddress" not in legacy and "macAddress" not in legacy["fields"]
+        os.chmod(path, 0o666)
     for artifact in (full_path, v3_path, netbios_disabled_path, netbios_unresolved_path):
         os.chmod(artifact, 0o666)
     print("OTserver Otter virtual lab passed.", flush=True)
