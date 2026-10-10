@@ -277,22 +277,34 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
 
+    // Windows itself can answer SMB, RPC, and NetBIOS on loopback, so only a
+    // Linux loopback target is genuinely empty.
+    fn loopback_selection() -> Selection {
+        Selection {
+            netbios: !cfg!(windows),
+            smb: !cfg!(windows),
+            rpc: !cfg!(windows),
+            ..Selection::default()
+        }
+    }
+
     #[tokio::test]
     async fn empty_loopback_scan_is_safe() {
         let _network = crate::network_test_lock().await;
+        let selection = loopback_selection();
         let result = scan(
             Ipv4Addr::LOCALHOST,
             Some("00:11:22:33:44:55"),
-            Selection::default(),
+            selection,
             &opcua::ProbeSettings::default(),
         )
         .await;
         assert!(result.observations.is_empty());
         assert!(result.ports.is_empty());
-        assert_eq!(result.outcomes.len(), 11);
+        assert_eq!(result.outcomes.len(), selection.labels().len());
         assert_eq!(result.outcome_protocols.len(), result.outcomes.len());
-        assert!(result.outcome_protocols.contains(&"smb"));
-        assert!(result.outcome_protocols.contains(&"rpc"));
+        assert_eq!(result.outcome_protocols.contains(&"smb"), selection.smb);
+        assert_eq!(result.outcome_protocols.contains(&"rpc"), selection.rpc);
         assert!(result.outcomes.iter().all(|(_, success)| !success));
         assert!(text(b"  value\0ignored").as_deref() == Some("value"));
         assert_eq!(text(b" \0"), None);
@@ -354,7 +366,7 @@ mod tests {
         let result = scan(
             Ipv4Addr::LOCALHOST,
             None,
-            Selection::default(),
+            loopback_selection(),
             &opcua::ProbeSettings::default(),
         )
         .await;
