@@ -13,6 +13,8 @@ mod npcap;
 mod pnio;
 #[cfg(any(windows, target_os = "linux"))]
 use std::net::Ipv4Addr;
+#[cfg(windows)]
+use std::net::Ipv6Addr;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
 #[cfg(any(windows, target_os = "linux", test))]
@@ -116,16 +118,7 @@ pub fn interfaces() -> Result<Vec<CaptureInterface>, String> {
 
         let mut addresses = Vec::new();
         if adapter.PhysicalAddressLength == 6 {
-            let mac = format!(
-                "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                adapter.PhysicalAddress[0],
-                adapter.PhysicalAddress[1],
-                adapter.PhysicalAddress[2],
-                adapter.PhysicalAddress[3],
-                adapter.PhysicalAddress[4],
-                adapter.PhysicalAddress[5]
-            );
-            addresses.push(mac);
+            addresses.push(format_mac(&adapter.PhysicalAddress[..6]));
         }
 
         let mut unicast = adapter.FirstUnicastAddress;
@@ -142,6 +135,13 @@ pub fn interfaces() -> Result<Vec<CaptureInterface>, String> {
                     let s_addr = unsafe { sockaddr.sin_addr.S_un.S_addr };
                     let ip = std::net::Ipv4Addr::from(u32::from_be(s_addr));
                     addresses.push(ip.to_string());
+                } else if family == windows_sys::Win32::Networking::WinSock::AF_INET6 as u32 {
+                    let sockaddr = unsafe {
+                        &*(item.Address.lpSockaddr
+                            as *const windows_sys::Win32::Networking::WinSock::SOCKADDR_IN6)
+                    };
+                    let bytes = unsafe { sockaddr.sin6_addr.u.Byte };
+                    addresses.push(Ipv6Addr::from(bytes).to_string());
                 }
             }
             unicast = item.Next;
@@ -174,7 +174,7 @@ pub fn interfaces() -> Result<Vec<CaptureInterface>, String> {
                 .filter(|value| normalize_mac(value).is_some());
             let mut addresses = mac.into_iter().collect::<Vec<_>>();
             addresses.extend(
-                crate::discovery::interface_ipv4_addresses(&name)
+                crate::discovery::interface_ip_addresses(&name)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|address| address.to_string()),
@@ -508,44 +508,15 @@ fn enrich_linux_pnio(
     devices: &mut BTreeMap<String, Device>,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
-    use std::ffi::CString;
     use std::io;
-    use std::mem::{size_of, zeroed};
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::mem::size_of;
+    use std::os::fd::AsRawFd;
 
     if devices.is_empty() {
         return Ok(());
     }
-    let name = CString::new(interface)
-        .map_err(|_| "The Linux interface name contains an invalid null byte.".to_string())?;
-    // SAFETY: name is a valid C string for this call.
-    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
-    if index == 0 {
-        return Err(format!("Could not find Linux interface {interface}."));
-    }
-    let protocol = u16::from_be_bytes([0x08, 0x00]).to_be();
-    // SAFETY: socket returns a new descriptor which is owned immediately below.
-    let descriptor = unsafe {
-        libc::socket(
-            libc::AF_PACKET,
-            libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            i32::from(protocol),
-        )
-    };
-    if descriptor < 0 {
-        return Err(format!(
-            "Could not open the Linux PROFINET RPC raw socket: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: descriptor was returned by socket and has not been transferred elsewhere.
-    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
-    // SAFETY: zero is a valid initial state for sockaddr_ll.
-    let mut address: libc::sockaddr_ll = unsafe { zeroed() };
-    address.sll_family = libc::AF_PACKET as u16;
-    address.sll_protocol = protocol;
-    address.sll_ifindex = index as i32;
-    address.sll_halen = 6;
+    let (descriptor, mut address) = crate::discovery::open_raw_socket(interface, 0x0800)?;
+    // SAFETY: address is initialized and remains valid for the duration of bind.
     let bound = unsafe {
         libc::bind(
             descriptor.as_raw_fd(),
@@ -913,10 +884,9 @@ pub fn scan(
     wait: Duration,
     cancelled: &AtomicBool,
 ) -> Result<Vec<Device>, String> {
-    use std::ffi::CString;
     use std::io;
-    use std::mem::{size_of, zeroed};
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::mem::size_of;
+    use std::os::fd::AsRawFd;
 
     if cancelled.load(Ordering::Relaxed) {
         return Ok(Vec::new());
@@ -925,39 +895,8 @@ pub fn scan(
     let source = mac_bytes(source_mac)
         .ok_or_else(|| "A valid source MAC address is required.".to_string())?;
     let xid = new_xid();
-    let interface_name = CString::new(interface)
-        .map_err(|_| "The Linux interface name contains an invalid null byte.".to_string())?;
-    // SAFETY: interface_name is a valid, null-terminated C string for the duration of the call.
-    let interface_index = unsafe { libc::if_nametoindex(interface_name.as_ptr()) };
-    if interface_index == 0 {
-        return Err(format!(
-            "Could not find Linux interface {interface}: {}",
-            io::Error::last_os_error()
-        ));
-    }
-
-    let protocol = u16::from_be_bytes(PROFINET_ETHERTYPE).to_be();
-    // SAFETY: socket returns a new file descriptor which is immediately owned below.
-    let descriptor = unsafe {
-        libc::socket(
-            libc::AF_PACKET,
-            libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            i32::from(protocol),
-        )
-    };
-    if descriptor < 0 {
-        return Err(format!(
-            "Could not open the Linux raw socket; run as root or grant CAP_NET_RAW: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: descriptor was returned by socket and has not been transferred elsewhere.
-    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
-    // SAFETY: sockaddr_ll is a plain C struct and zero is a valid initial state.
-    let mut address: libc::sockaddr_ll = unsafe { zeroed() };
-    address.sll_family = libc::AF_PACKET as u16;
-    address.sll_protocol = protocol;
-    address.sll_ifindex = interface_index as i32;
+    let (descriptor, mut address) =
+        crate::discovery::open_raw_socket(interface, u16::from_be_bytes(PROFINET_ETHERTYPE))?;
     // SAFETY: address points to a fully initialized sockaddr_ll of the supplied size.
     let bound = unsafe {
         libc::bind(
@@ -973,7 +912,6 @@ pub fn scan(
         ));
     }
 
-    address.sll_halen = DCP_MULTICAST.len() as u8;
     address.sll_addr[..DCP_MULTICAST.len()].copy_from_slice(&DCP_MULTICAST);
     let request = identify_request(source, xid);
     let send_request = || {
@@ -1918,6 +1856,7 @@ mod tests {
                 .iter()
                 .any(|address| address == "127.0.0.1")
         );
+        assert!(loopback.addresses.iter().any(|address| address == "::1"));
         assert_eq!(
             crate::discovery::source_ipv4("lo").unwrap(),
             Ipv4Addr::LOCALHOST

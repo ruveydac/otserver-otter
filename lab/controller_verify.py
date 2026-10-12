@@ -5,6 +5,7 @@ import datetime
 from email.parser import BytesParser
 from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,14 @@ import time
 
 def future(days=0, seconds=0):
     return (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days, seconds=seconds)).isoformat()
+
+
+def is_ip(value):
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
 
 
 def main(binary):
@@ -57,7 +66,14 @@ def main(binary):
             def post(self):
                 body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
                 if self.path == "/api/otter/v1/enroll":
-                    assert json.loads(body) == {"token": "t" * 43}
+                    report = json.loads(body)
+                    assert report["token"] == "t" * 43
+                    assert report["version"]
+                    assert "controller-v1" in report["capabilities"]
+                    assert report["computerName"]
+                    adapter = next(item for item in report["networkAdapters"] if item["name"] == interface["name"])
+                    assert adapter["friendlyName"] == interface["friendlyName"]
+                    assert adapter["ipAddresses"] == [address for address in interface["addresses"] if is_ip(address)]
                     assert not self.headers.get("Authorization")
                     self.send_json({"credential": data["credential"], "credentialExpiresAt": future(days=10), "scanner": {"id": "scanner1", "name": "Lab", "site": "site1"}}, 201)
                     return
@@ -70,6 +86,8 @@ def main(binary):
                     report = json.loads(body)
                     assert "scan-v2" in report["capabilities"]
                     assert interface["name"] in report["interfaces"]
+                    assert report["computerName"]
+                    assert any(adapter["name"] == interface["name"] for adapter in report["networkAdapters"])
                     if len(data["finished"]) == 3:
                         self.send_json({"errors": [{"message": "revoked"}]}, 401) if data["importCompleted"] else self.send_json({"action": "idle", "retryAfterSeconds": 1})
                         return

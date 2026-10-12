@@ -709,14 +709,6 @@ fn text_of(value: &Value) -> Option<String> {
     }
 }
 
-fn insert_once(fields: &mut BTreeMap<String, Value>, key: &str, value: Option<String>) {
-    if let Some(value) = value
-        && !fields.contains_key(key)
-    {
-        fields.insert(key.to_string(), json!(value));
-    }
-}
-
 fn asset_fields(entries: &[AssetEntry]) -> BTreeMap<String, Value> {
     let mut fields = BTreeMap::new();
     // One normalized identity must never combine fields from different represented assets.
@@ -724,38 +716,24 @@ fn asset_fields(entries: &[AssetEntry]) -> BTreeMap<String, Value> {
         let identification = &entry.identification;
         let asset_id = identification.get("AssetId").and_then(text_of);
         let product_uri = identification.get("ProductInstanceUri").and_then(text_of);
-        insert_once(
-            &mut fields,
-            "name",
-            asset_id
-                .or_else(|| (!entry.display_name.is_empty()).then(|| entry.display_name.clone()))
-                .or(product_uri),
-        );
-        insert_once(
-            &mut fields,
-            "vendor",
-            identification.get("Manufacturer").and_then(text_of),
-        );
-        insert_once(
-            &mut fields,
-            "model",
-            identification.get("Model").and_then(text_of),
-        );
-        insert_once(
-            &mut fields,
-            "serialNumber",
-            identification.get("SerialNumber").and_then(text_of),
-        );
-        insert_once(
-            &mut fields,
-            "firmwareVersion",
-            identification.get("SoftwareRevision").and_then(text_of),
-        );
-        insert_once(
-            &mut fields,
-            "hardwareVersion",
-            identification.get("HardwareRevision").and_then(text_of),
-        );
+        if let Some(name) = asset_id
+            .or_else(|| (!entry.display_name.is_empty()).then(|| entry.display_name.clone()))
+            .or(product_uri)
+        {
+            fields.insert("name".into(), json!(name));
+        }
+        for (source, field) in [
+            ("Manufacturer", "vendor"),
+            ("Model", "model"),
+            ("SerialNumber", "serialNumber"),
+            ("SoftwareRevision", "firmwareVersion"),
+            ("HardwareRevision", "hardwareVersion"),
+            ("DeviceClass", "description"),
+        ] {
+            if let Some(value) = identification.get(source).and_then(text_of) {
+                fields.insert(field.into(), json!(value));
+            }
+        }
         if let Some(patches) = identification
             .get("PatchIdentifiers")
             .and_then(Value::as_array)
@@ -765,20 +743,14 @@ fn asset_fields(entries: &[AssetEntry]) -> BTreeMap<String, Value> {
                 fields.insert("patchIdentifiers".into(), json!(patches));
             }
         }
-        insert_once(
-            &mut fields,
-            "description",
-            identification.get("DeviceClass").and_then(text_of),
-        );
-        insert_once(
-            &mut fields,
-            "location",
-            entry
-                .locations
-                .get("HierarchicalLocation")
-                .and_then(text_of)
-                .or_else(|| entry.locations.get("OperationalLocation").and_then(text_of)),
-        );
+        if let Some(location) = entry
+            .locations
+            .get("HierarchicalLocation")
+            .and_then(text_of)
+            .or_else(|| entry.locations.get("OperationalLocation").and_then(text_of))
+        {
+            fields.insert("location".into(), json!(location));
+        }
         if let Some(code) = entry.health {
             let status = match code {
                 0 => "online",
@@ -786,7 +758,7 @@ fn asset_fields(entries: &[AssetEntry]) -> BTreeMap<String, Value> {
                 4 => "maintenance",
                 _ => "unknown",
             };
-            insert_once(&mut fields, "status", Some(status.to_string()));
+            fields.insert("status".into(), json!(status));
         }
     }
     fields

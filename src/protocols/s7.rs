@@ -1,6 +1,6 @@
 use super::{Finding, TIMEOUT, hex, port, text};
 use crate::contract::Source;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -218,28 +218,25 @@ fn parse(hardware: &[u8], identity: &[u8]) -> Result<Finding, String> {
     if let Some(serial) = &serial {
         fields.insert("serialNumber".into(), json!(serial));
     }
-    let raw = Value::Object(Map::from_iter([
-        ("basicHardware".into(), json!(basic_hardware)),
-        ("copyright".into(), json!(copyright)),
-        ("module".into(), json!(module)),
-        ("moduleType".into(), json!(module_type)),
-        ("plantIdentification".into(), json!(plant)),
-        ("response".into(), json!(hex(hardware_response))),
-        ("identityResponse".into(), json!(hex(identity_response))),
-        ("systemName".into(), json!(system_name)),
-        ("version".into(), json!(version)),
-        (
-            "serialClaim".into(),
-            json!({
-                "scope": "cpu",
-                "issuer": "Siemens",
-                "original": serial,
-                "encoding": "s7-szl-text",
-                "catalogNumber": module_type.as_ref().or(module.as_ref()),
-                "normalizationVersion": 1,
-            }),
-        ),
-    ]));
+    let raw = json!({
+        "basicHardware": basic_hardware,
+        "copyright": copyright,
+        "module": module,
+        "moduleType": module_type,
+        "plantIdentification": plant,
+        "response": hex(hardware_response),
+        "identityResponse": hex(identity_response),
+        "systemName": system_name,
+        "version": version,
+        "serialClaim": {
+            "scope": "cpu",
+            "issuer": "Siemens",
+            "original": serial,
+            "encoding": "s7-szl-text",
+            "catalogNumber": module_type.as_ref().or(module.as_ref()),
+            "normalizationVersion": 1,
+        },
+    });
     Ok(Finding {
         source: Source::S7,
         fields,

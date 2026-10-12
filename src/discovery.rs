@@ -1,7 +1,9 @@
 use crate::contract::{Device, Observation, Source, format_mac, mac_bytes};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::Ipv4Addr;
+#[cfg(target_os = "linux")]
+use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv4Addr};
 #[cfg(any(target_os = "linux", test))]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -194,23 +196,22 @@ pub(crate) fn source_ipv4(interface: &str) -> Result<Ipv4Addr, String> {
 }
 
 #[cfg(windows)]
-pub fn interface_ipv4_addresses(interface: &str) -> Result<Vec<Ipv4Addr>, String> {
+pub fn interface_ip_addresses(interface: &str) -> Result<Vec<IpAddr>, String> {
     crate::profinet::interfaces()?
         .into_iter()
         .find(|item| item.name == interface || item.friendly_name == interface)
         .map(|item| {
             item.addresses
                 .iter()
-                .filter_map(|address| address.parse::<Ipv4Addr>().ok())
+                .filter_map(|address| address.parse::<IpAddr>().ok())
                 .collect()
         })
         .ok_or_else(|| format!("Could not find interface {interface}."))
 }
 
 #[cfg(target_os = "linux")]
-pub fn interface_ipv4_addresses(interface: &str) -> Result<Vec<Ipv4Addr>, String> {
+pub fn interface_ip_addresses(interface: &str) -> Result<Vec<IpAddr>, String> {
     use std::ffi::{CStr, CString};
-    use std::net::Ipv4Addr;
     use std::ptr::{self, NonNull};
 
     let wanted = CString::new(interface)
@@ -238,10 +239,20 @@ pub fn interface_ipv4_addresses(interface: &str) -> Result<Vec<Ipv4Addr>, String
             && !item.ifa_addr.is_null()
             && item.ifa_addr.is_aligned()
             && unsafe { CStr::from_ptr(item.ifa_name) }.to_bytes() == wanted.as_bytes()
-            && unsafe { (*item.ifa_addr).sa_family as i32 } == libc::AF_INET
         {
-            let address = unsafe { &*(item.ifa_addr.cast::<libc::sockaddr_in>()) };
-            result.push(Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr)));
+            match unsafe { (*item.ifa_addr).sa_family as i32 } {
+                libc::AF_INET => {
+                    let address = unsafe { &*(item.ifa_addr.cast::<libc::sockaddr_in>()) };
+                    result.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                        address.sin_addr.s_addr,
+                    ))));
+                }
+                libc::AF_INET6 => {
+                    let address = unsafe { &*(item.ifa_addr.cast::<libc::sockaddr_in6>()) };
+                    result.push(IpAddr::V6(Ipv6Addr::from(address.sin6_addr.s6_addr)));
+                }
+                _ => {}
+            }
         }
 
         current = item.ifa_next;
@@ -251,8 +262,18 @@ pub fn interface_ipv4_addresses(interface: &str) -> Result<Vec<Ipv4Addr>, String
     Ok(result)
 }
 
+pub fn interface_ipv4_addresses(interface: &str) -> Result<Vec<Ipv4Addr>, String> {
+    Ok(interface_ip_addresses(interface)?
+        .into_iter()
+        .filter_map(|address| match address {
+            IpAddr::V4(address) => Some(address),
+            IpAddr::V6(_) => None,
+        })
+        .collect())
+}
+
 #[cfg(not(any(windows, target_os = "linux")))]
-pub fn interface_ipv4_addresses(_interface: &str) -> Result<Vec<Ipv4Addr>, String> {
+pub fn interface_ip_addresses(_interface: &str) -> Result<Vec<IpAddr>, String> {
     Err("Native discovery is supported on Windows and Linux.".into())
 }
 
@@ -309,17 +330,12 @@ fn resolve_arp(
 }
 
 #[cfg(target_os = "linux")]
-fn platform_scan(
+pub(crate) fn open_raw_socket(
     interface: &str,
-    source_mac: [u8; 6],
-    source_ip: Ipv4Addr,
-    targets: &[Ipv4Addr],
-    wait: Duration,
-    cancelled: &AtomicBool,
-) -> Result<DiscoveryResults, String> {
+    ethertype: u16,
+) -> Result<(std::os::fd::OwnedFd, libc::sockaddr_ll), String> {
     use std::ffi::CString;
-    use std::mem::{size_of, zeroed};
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{FromRawFd, OwnedFd};
 
     let name = CString::new(interface)
         .map_err(|_| "The interface name contains an invalid null byte.".to_string())?;
@@ -328,7 +344,7 @@ fn platform_scan(
     if index == 0 {
         return Err(format!("Could not find Linux interface {interface}."));
     }
-    let protocol = 3_u16.to_be();
+    let protocol = ethertype.to_be();
     // SAFETY: socket returns a new descriptor, owned immediately below.
     let fd = unsafe {
         libc::socket(
@@ -346,11 +362,27 @@ fn platform_scan(
     // SAFETY: fd is newly returned and not owned elsewhere.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     // SAFETY: zero is a valid starting state for sockaddr_ll.
-    let mut address: libc::sockaddr_ll = unsafe { zeroed() };
+    let mut address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
     address.sll_family = libc::AF_PACKET as u16;
     address.sll_protocol = protocol;
     address.sll_ifindex = index as i32;
     address.sll_halen = 6;
+    Ok((fd, address))
+}
+
+#[cfg(target_os = "linux")]
+fn platform_scan(
+    interface: &str,
+    source_mac: [u8; 6],
+    source_ip: Ipv4Addr,
+    targets: &[Ipv4Addr],
+    wait: Duration,
+    cancelled: &AtomicBool,
+) -> Result<DiscoveryResults, String> {
+    use std::mem::size_of;
+    use std::os::fd::AsRawFd;
+
+    let (fd, mut address) = open_raw_socket(interface, 3)?;
     address.sll_addr[..6].copy_from_slice(&BROADCAST);
     let mut send = |frame: &[u8],
                     destination: [u8; 6],
@@ -616,8 +648,7 @@ fn fingerprint(
     ))
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn checksum(bytes: &[u8]) -> u16 {
+pub(crate) fn checksum(bytes: &[u8]) -> u16 {
     let (pairs, remainder) = bytes.as_chunks::<2>();
     let mut sum = pairs.iter().fold(0_u32, |sum, pair| {
         sum + u32::from(u16::from_be_bytes([pair[0], pair[1]]))
@@ -634,6 +665,32 @@ fn checksum(bytes: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn internet_checksum_handles_empty_odd_and_carrying_inputs() {
+        assert_eq!(checksum(&[]), 0xffff);
+        assert_eq!(checksum(&[1]), 0xfeff);
+        assert_eq!(checksum(&[1, 2, 3]), 0xfbfd);
+        assert_eq!(checksum(&[0xff, 0xff, 0, 1]), 0xfffe);
+        assert_eq!(checksum(&[0, 1, 0xf2, 3, 0xf4, 0xf5, 0xf6, 0xf7]), 0x220d);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_socket_rejects_invalid_interfaces_before_opening() {
+        assert!(
+            open_raw_socket("bad\0interface", 0x0800)
+                .err()
+                .unwrap()
+                .contains("null byte")
+        );
+        assert!(
+            open_raw_socket("missing-otserver-interface", 0x8892)
+                .err()
+                .unwrap()
+                .contains("Could not find Linux interface")
+        );
+    }
 
     #[test]
     fn expands_ipv4_targets_and_rejects_oversized_ranges() {

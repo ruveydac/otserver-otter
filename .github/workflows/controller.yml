@@ -1,0 +1,58 @@
+name: Remote management integration
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      management_ref:
+        description: 'OTserver branch, tag, or SHA (defaults to OTTER_MANAGEMENT_REF, then main)'
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  controller:
+    name: Full remote management
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout OTserver management
+        uses: actions/checkout@v6
+        with:
+          repository: ruveydac/OTserver
+          ref: ${{ inputs.management_ref || vars.OTTER_MANAGEMENT_REF || 'main' }}
+          path: management
+          persist-credentials: false
+      - name: Checkout the Otter revision under test
+        uses: actions/checkout@v6
+        with:
+          path: management/otserver-otter
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: management/package.json
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: management/pnpm-lock.yaml
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev openssl
+      - name: Install management dependencies
+        working-directory: management
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Run full integration gate
+        run: ./management/otserver-otter/lab/test-controller.sh
+      - name: Upload integration reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: otter-controller-integration
+          path: management/otserver-otter/lab/artifacts/controller.*/
+          if-no-files-found: ignore
+          retention-days: 7

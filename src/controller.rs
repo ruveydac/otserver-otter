@@ -8,6 +8,7 @@ use clap::Args;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +18,7 @@ use tokio::time::Instant;
 
 #[derive(Args)]
 pub struct ControllerArgs {
+    /// HTTPS controller URL, or a loopback address such as 127.0.0.1:3000 for HTTP development.
     #[arg(long)]
     server_url: String,
     /// Read the single-use enrollment token from stdin (never from process arguments).
@@ -24,6 +26,9 @@ pub struct ControllerArgs {
     enroll: bool,
     #[arg(long)]
     state_dir: Option<PathBuf>,
+    /// Replace saved enrollment and run state after enrolling with a new controller; retained exports are kept.
+    #[arg(long, requires = "enroll")]
+    overwrite_state_dir: bool,
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
     poll_seconds: u64,
     #[arg(long, required = true, action = clap::ArgAction::SetTrue)]
@@ -57,6 +62,74 @@ struct Enrollment {
     #[serde(flatten)]
     credential: Credential,
     scanner: Scanner,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScannerReport {
+    version: &'static str,
+    capabilities: [&'static str; 2],
+    interfaces: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    computer_name: Option<String>,
+    network_adapters: Vec<NetworkAdapterReport>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkAdapterReport {
+    name: String,
+    friendly_name: String,
+    description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mac_address: Option<String>,
+    ip_addresses: Vec<String>,
+}
+
+fn network_adapter_report(
+    adapter: otserver_otter::profinet::CaptureInterface,
+) -> NetworkAdapterReport {
+    NetworkAdapterReport {
+        mac_address: otserver_otter::profinet::interface_mac(&adapter),
+        ip_addresses: adapter
+            .addresses
+            .iter()
+            .filter_map(|address| address.parse::<IpAddr>().ok())
+            .map(|address| address.to_string())
+            .take(16)
+            .collect(),
+        name: adapter.name,
+        friendly_name: adapter.friendly_name,
+        description: adapter.description,
+    }
+}
+
+fn scanner_report() -> Result<ScannerReport, Error> {
+    let adapters = otserver_otter::profinet::interfaces()
+        .map_err(|_| Error::Local("Could not enumerate capture interfaces."))?;
+    let computer_name = ["COMPUTERNAME", "HOSTNAME"]
+        .into_iter()
+        .find_map(|key| std::env::var(key).ok())
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty() && name.len() <= 256);
+    let interfaces = adapters
+        .iter()
+        .map(|adapter| adapter.name.clone())
+        .take(32)
+        .collect();
+    let network_adapters = adapters
+        .into_iter()
+        .take(32)
+        .map(network_adapter_report)
+        .collect();
+    Ok(ScannerReport {
+        version: otserver_otter::VERSION,
+        capabilities: ["scan-v2", "controller-v1"],
+        interfaces,
+        computer_name,
+        network_adapters,
+    })
 }
 
 #[derive(Deserialize)]
@@ -109,6 +182,8 @@ struct RunState {
     phase: Phase,
     status: String,
     import_id: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -145,7 +220,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Retry => "Controller unavailable; retrying with backoff.",
-            Self::Auth => "Scanner authentication rejected; re-enroll this scanner.",
+            Self::Auth => "Scanner credential is expired or not accepted. Verify --server-url, OS account, and --state-dir; re-enroll if the controller revoked it.",
             Self::Terminal => "Run is no longer active; local results retained.",
             Self::Invalid => "Controller response or configuration is invalid.",
             Self::Local(message) => message,
@@ -161,7 +236,16 @@ struct Api {
 }
 
 fn base_url(input: &str) -> Result<Url, Error> {
-    let mut url = Url::parse(input).map_err(|_| Error::Invalid)?;
+    let mut url = if input.contains("://") {
+        Url::parse(input)
+    } else {
+        Url::parse(&format!("http://{input}"))
+    }
+    .map_err(|_| {
+        Error::Local(
+            "Controller URL is invalid; use https://otserver.example or http://127.0.0.1:3000.",
+        )
+    })?;
     if !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
@@ -172,7 +256,7 @@ fn base_url(input: &str) -> Result<Url, Error> {
                 && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
     {
         return Err(Error::Local(
-            "Controller URL requires HTTPS (HTTP is limited to loopback).",
+            "Controller URL requires HTTPS (HTTP is limited to loopback) and must not contain credentials, a query, or a fragment.",
         ));
     }
     url.set_path(&format!("{}/", url.path().trim_end_matches('/')));
@@ -361,9 +445,13 @@ fn mapped_config(
     scanner: &Scanner,
 ) -> Result<ScannerConfig, Error> {
     if !valid_id(&assignment.id) || assignment.upload_path != "/api/asset-imports" {
-        return Err(Error::Invalid);
+        return Err(Error::Local(
+            "The controller supplied an invalid run ID or upload path.",
+        ));
     }
-    let configuration = assignment.configuration.as_object().ok_or(Error::Invalid)?;
+    let configuration = assignment.configuration.as_object().ok_or(Error::Local(
+        "Managed scan configuration must be an object.",
+    ))?;
     const FIELDS: &[&str] = &[
         "name",
         "targets",
@@ -383,6 +471,8 @@ fn mapped_config(
         "noDnp3",
         "noIec61850",
         "noNetbios",
+        "noSmb",
+        "noRpc",
         "noOpcua",
         "noSnmp",
         "noLldp",
@@ -391,31 +481,55 @@ fn mapped_config(
     if configuration
         .keys()
         .any(|key| !FIELDS.contains(&key.as_str()))
-        || configuration.values().any(Value::is_null)
-        || configuration.get("site").and_then(Value::as_str) != Some(&scanner.site)
-        || base_url(
-            configuration
-                .get("serverUrl")
-                .and_then(Value::as_str)
-                .ok_or(Error::Invalid)?,
-        )? != api.base
     {
-        return Err(Error::Invalid);
+        return Err(Error::Local(
+            "Managed scan configuration contains an unsupported option. Check that the scanner and controller versions are compatible.",
+        ));
+    }
+    if configuration.values().any(Value::is_null) {
+        return Err(Error::Local(
+            "Managed scan configuration contains a null option. Optional unset fields must be omitted.",
+        ));
+    }
+    if configuration.get("site").and_then(Value::as_str) != Some(&scanner.site) {
+        return Err(Error::Local(
+            "The managed scan site does not match this scanner's enrolled site.",
+        ));
+    }
+    let server_url = configuration
+        .get("serverUrl")
+        .and_then(Value::as_str)
+        .ok_or(Error::Local(
+            "Managed scan configuration is missing its controller URL.",
+        ))?;
+    if base_url(server_url)? != api.base {
+        return Err(Error::Local(
+            "The managed scan controller URL does not match --server-url. Use the same scheme, host, port, and base path as OTSERVER_PUBLIC_URL.",
+        ));
     }
     let mut config: ScannerConfig =
-        serde_json::from_value(assignment.configuration.clone()).map_err(|_| Error::Invalid)?;
+        serde_json::from_value(assignment.configuration.clone()).map_err(|_| Error::Local("Managed scan configuration has invalid option types. Targets must be text lists, protocol toggles booleans, and OPC UA ports integers."))?;
     if config.interface.as_ref().is_some_and(|value| {
         value.trim().is_empty() || value.len() > 256 || value.chars().any(char::is_control)
     }) || config.name.as_ref().is_some_and(|value| {
         value.trim().is_empty() || value.len() > 120 || value.chars().any(char::is_control)
     }) {
-        return Err(Error::Invalid);
+        return Err(Error::Local(
+            "The managed profile name or network interface is empty, too long, or contains control characters.",
+        ));
     }
-    let targets = config.targets.as_ref().ok_or(Error::Invalid)?;
+    let targets = config
+        .targets
+        .as_ref()
+        .ok_or(Error::Local("The managed scan is missing its targets."))?;
     if targets.is_empty() || targets.len() > 1024 || targets.iter().any(|t| t.len() > 64) {
-        return Err(Error::Invalid);
+        return Err(Error::Local(
+            "Managed scan targets must contain 1 to 1,024 IPv4 addresses or CIDR ranges.",
+        ));
     }
-    otserver_otter::discovery::expand_targets(targets).map_err(|_| Error::Invalid)?;
+    otserver_otter::discovery::expand_targets(targets).map_err(|_| {
+        Error::Local("Managed scan targets are invalid or exceed the 65,536-address limit.")
+    })?;
     if config
         .opcua_ports
         .as_ref()
@@ -425,16 +539,22 @@ fn mapped_config(
             .as_deref()
             .is_some_and(|mac| otserver_otter::contract::normalize_mac(mac).is_none())
     {
-        return Err(Error::Invalid);
+        return Err(Error::Local(
+            "Managed OPC UA ports or source MAC are invalid. Ports must be 1–65535 (at most 64); source MAC must contain six colon-separated hexadecimal bytes.",
+        ));
     }
-    let credentials = assignment.credentials.as_object().ok_or(Error::Invalid)?;
+    let credentials = assignment.credentials.as_object().ok_or(Error::Local(
+        "Managed protocol credentials must be an object.",
+    ))?;
     if credentials.keys().any(|key| {
         !["snmp", "opcuaCredentials", "opcuaUsername", "opcuaPassword"].contains(&key.as_str())
     }) {
-        return Err(Error::Invalid);
+        return Err(Error::Local(
+            "Managed protocol credentials contain an unsupported credential option.",
+        ));
     }
-    let secrets: ScannerConfig =
-        serde_json::from_value(assignment.credentials.clone()).map_err(|_| Error::Invalid)?;
+    let secrets: ScannerConfig = serde_json::from_value(assignment.credentials.clone())
+        .map_err(|_| Error::Local("Managed protocol credentials have invalid field types."))?;
     for (key, value) in credentials {
         if matches!(key.as_str(), "snmp" | "opcuaCredentials") {
             let entries: Vec<&Value> = match value {
@@ -450,10 +570,14 @@ fn mapped_config(
                     })
                 })
             {
-                return Err(Error::Invalid);
+                return Err(Error::Local(
+                    "Managed SNMP or OPC UA credentials contain invalid entries or exceed their size limits.",
+                ));
             }
         } else if !bounded_secret(key, value) {
-            return Err(Error::Invalid);
+            return Err(Error::Local(
+                "Managed OPC UA fallback credentials must be text within the supported size limits.",
+            ));
         }
     }
     config.snmp = secrets.snmp;
@@ -469,7 +593,9 @@ fn mapped_config(
                         && otserver_otter::snmp::auth(s).is_err()
             })
         {
-            return Err(Error::Invalid);
+            return Err(Error::Local(
+                "Managed SNMP credentials are invalid. Check the version, SNMPv3 username, authentication/privacy algorithms, and required passwords.",
+            ));
         }
     }
     if config
@@ -477,7 +603,9 @@ fn mapped_config(
         .as_ref()
         .is_some_and(|c| c.to_vec().len() > 32)
     {
-        return Err(Error::Invalid);
+        return Err(Error::Local(
+            "Managed OPC UA credentials exceed the 32-entry limit.",
+        ));
     }
     config.server_url = None;
     config.site = None;
@@ -515,9 +643,16 @@ fn scan_options(mut config: ScannerConfig, output: PathBuf) -> Result<ScanOption
         config.interface.as_deref().ok_or(Error::Invalid)?,
         &interfaces,
     )
-    .ok_or(Error::Invalid)?;
+    .ok_or(Error::Local(
+        "The selected network interface is not available on this scanner.",
+    ))?;
     if config.source_mac.is_none() {
         config.source_mac = otserver_otter::profinet::interface_mac(selected);
+    }
+    if config.source_mac.is_none() {
+        return Err(Error::Local(
+            "Could not determine the selected interface's source MAC address.",
+        ));
     }
     config.output = Some(output);
     resolve_scan(
@@ -528,7 +663,22 @@ fn scan_options(mut config: ScannerConfig, output: PathBuf) -> Result<ScanOption
         config,
         None,
     )
-    .map_err(|_| Error::Invalid)
+    .map_err(|_| Error::Local("Could not resolve the managed scan options."))
+}
+
+// Never forward arbitrary discovery/protocol text: it may contain managed credentials.
+fn scan_failure_reason(error: &str) -> &'static str {
+    if error.contains("Permission denied") || error.contains("Operation not permitted") {
+        "Discovery or export access was denied. Check capture privileges and scanner state-directory permissions. Linux raw capture requires root or CAP_NET_RAW."
+    } else if error.starts_with("Could not determine the current MAC of interface") {
+        "Could not determine the selected interface's current MAC address. Check that the adapter is available."
+    } else if error.starts_with("Could not write export:") {
+        "Could not write the scan export to the scanner's private state directory. Check disk space and directory permissions."
+    } else if error.starts_with("Could not finalize export:") {
+        "Could not finalize the scan export in the scanner's private state directory. Check disk space and directory permissions."
+    } else {
+        "Discovery or scan-export validation failed before a usable result could be saved."
+    }
 }
 
 fn save(store: &store::Store, state: &State) -> Result<(), Error> {
@@ -540,16 +690,25 @@ async fn finish(
     store: &store::Store,
     state: &mut State,
     status: &str,
+    message: Option<&str>,
 ) -> Result<(), Error> {
     let run = state.assignment.as_mut().ok_or(Error::Invalid)?;
     run.phase = Phase::Finishing;
     run.status = status.into();
+    if let Some(message) = message {
+        run.message.get_or_insert_with(|| message.into());
+    }
     save(store, state)?;
     let run = state.assignment.as_ref().ok_or(Error::Invalid)?;
+    if run.status == "failed"
+        && let Some(message) = &run.message
+    {
+        eprintln!("Managed scan failed: {message}");
+    }
     let response: Value = api
         .post(
             &format!("api/otter/v1/runs/{}/finish", run.id),
-            json!({"status": run.status, "importID": run.import_id}),
+            json!({"status": run.status, "importID": run.import_id, "message": run.message}),
         )
         .await?;
     let status = response["status"].as_str().ok_or(Error::Invalid)?;
@@ -621,6 +780,7 @@ async fn execute(
             phase: Phase::Assigned,
             status: "failed".into(),
             import_id: None,
+            message: None,
         });
         save(store, state)?;
     }
@@ -637,21 +797,31 @@ async fn execute(
             .ok_or(Error::Invalid)?
             .status
             .clone();
-        return finish(api, store, state, &status).await;
+        return finish(api, store, state, &status, None).await;
     }
     if phase == Phase::Scanning {
         // A crash during discovery is uncertain work. Never replay active probes for this ID.
-        return finish(api, store, state, "failed").await;
+        return finish(api, store, state, "failed", Some("Scanner restarted during discovery. The interrupted scan was not replayed to avoid duplicate probes.")).await;
     }
     let path = store.result_path(id);
     if phase == Phase::Assigned {
-        let config = mapped_config(
+        let config = match mapped_config(
             &assignment,
             api,
             state.scanner.as_ref().ok_or(Error::Invalid)?,
-        )?;
+        ) {
+            Ok(config) => config,
+            Err(error) => {
+                return finish(api, store, state, "failed", Some(&error.to_string())).await;
+            }
+        };
         let name = config.name.clone().unwrap_or_else(|| "Managed scan".into());
-        let options = scan_options(config, path.clone())?;
+        let options = match scan_options(config, path.clone()) {
+            Ok(options) => options,
+            Err(error) => {
+                return finish(api, store, state, "failed", Some(&error.to_string())).await;
+            }
+        };
         state.assignment.as_mut().ok_or(Error::Invalid)?.phase = Phase::Scanning;
         save(store, state)?;
         let start: Value = api
@@ -672,7 +842,16 @@ async fn execute(
         .await;
         let partial = match outcome {
             Ok(Ok(partial)) => partial,
-            Ok(Err(_)) => return finish(api, store, state, "failed").await,
+            Ok(Err(error)) => {
+                return finish(
+                    api,
+                    store,
+                    state,
+                    "failed",
+                    Some(scan_failure_reason(&error)),
+                )
+                .await;
+            }
             Err(error) => {
                 cancelled.store(true, Ordering::Relaxed);
                 // Raw discovery uses blocking tasks; wait for their cooperative safe stop.
@@ -737,7 +916,7 @@ async fn execute(
         .ok_or(Error::Invalid)?
         .status
         .clone();
-    finish(api, store, state, &status).await
+    finish(api, store, state, &status, None).await
 }
 
 async fn imports(api: &Api, store: &store::Store, state: &mut State) -> Result<(), Error> {
@@ -794,15 +973,19 @@ async fn run_inner(args: ControllerArgs) -> Result<(), Error> {
     let base = base_url(&args.server_url)?;
     let store = store::Store::open(args.state_dir)?;
     let mut state = store.load()?;
-    if !state.server_url.is_empty() && state.server_url != base.as_str() {
+    if !state.server_url.is_empty()
+        && state.server_url != base.as_str()
+        && !(args.enroll && args.overwrite_state_dir)
+    {
         return Err(Error::Local(
-            "State directory belongs to a different controller URL.",
+            "State directory belongs to a different controller URL. To replace its saved enrollment and run state, re-enroll with --enroll --overwrite-state-dir. Retained scan exports will be kept.",
         ));
     }
     let mut api = Api::new(base)?;
     api.queued_imports = args.queued_imports;
     if args.enroll {
         use std::io::{BufRead, Read};
+        eprintln!("Paste the single-use enrollment token, then press Enter:");
         let mut token = String::new();
         std::io::stdin()
             .lock()
@@ -815,11 +998,14 @@ async fn run_inner(args: ControllerArgs) -> Result<(), Error> {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         {
-            return Err(Error::Invalid);
+            return Err(Error::Local(
+                "Enrollment token is invalid; copy the token from Manage Otters and supply it on stdin.",
+            ));
         }
-        let enrollment: Enrollment = api
-            .post("api/otter/v1/enroll", json!({"token": token}))
-            .await?;
+        let report = scanner_report()?;
+        let mut enrollment_request = serde_json::to_value(report).map_err(|_| Error::Invalid)?;
+        enrollment_request["token"] = json!(token);
+        let enrollment: Enrollment = api.post("api/otter/v1/enroll", enrollment_request).await?;
         validate_credential(&enrollment.credential)?;
         if !valid_id(&enrollment.scanner.id) || !valid_id(&enrollment.scanner.site) {
             return Err(Error::Invalid);
@@ -830,6 +1016,7 @@ async fn run_inner(args: ControllerArgs) -> Result<(), Error> {
         state.pending_imports.clear();
         store.persist_credential(&mut state, &enrollment.credential, args.file_credentials)?;
         api.credential = enrollment.credential.credential;
+        eprintln!("Scanner enrolled; polling controller.");
     } else {
         api.credential = store.credential(&state)?;
     }
@@ -852,19 +1039,8 @@ async fn run_inner(args: ControllerArgs) -> Result<(), Error> {
                 store.persist_credential(&mut state, &rotated, args.file_credentials)?;
                 api.credential = rotated.credential;
             }
-            let interfaces = otserver_otter::profinet::interfaces()
-                .map_err(|_| Error::Local("Could not enumerate capture interfaces."))?
-                .into_iter()
-                .map(|i| i.name)
-                .take(128)
-                .collect::<Vec<_>>();
-            let poll: Poll = api
-                .post(
-                    "api/otter/v1/poll",
-                    json!({"version": otserver_otter::VERSION,
-                "capabilities": ["scan-v2", "controller-v1"], "interfaces": interfaces}),
-                )
-                .await?;
+            let report = scanner_report()?;
+            let poll: Poll = api.post("api/otter/v1/poll", json!(report)).await?;
             match poll {
                 Poll::Idle {
                     retry_after_seconds,
@@ -885,21 +1061,31 @@ async fn run_inner(args: ControllerArgs) -> Result<(), Error> {
                             phase: Phase::Finishing,
                             status: "cancelled".into(),
                             import_id: None,
+                            message: None,
                         });
                     }
-                    finish(&api, &store, &mut state, "cancelled").await?;
+                    finish(&api, &store, &mut state, "cancelled", None).await?;
                     Ok(args.poll_seconds)
                 }
                 Poll::Run { run } => {
                     let id = run.id.clone();
                     match execute(&api, &store, &mut state, run).await {
                         Err(Error::Local("cancelled")) => {
-                            finish(&api, &store, &mut state, "cancelled").await?
+                            finish(&api, &store, &mut state, "cancelled", None).await?
                         }
                         Err(Error::Invalid)
                             if state.assignment.as_ref().is_some_and(|run| run.id == id) =>
                         {
-                            finish(&api, &store, &mut state, "failed").await?
+                            finish(
+                                &api,
+                                &store,
+                                &mut state,
+                                "failed",
+                                Some(
+                                    "Controller response or managed scan configuration is invalid.",
+                                ),
+                            )
+                            .await?
                         }
                         other => other?,
                     }

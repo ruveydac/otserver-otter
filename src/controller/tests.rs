@@ -101,6 +101,13 @@ async fn server(responses: Vec<(u16, Value)>) -> (Api, tokio::task::JoinHandle<V
 fn urls_require_https_and_reject_embedded_secrets() {
     for invalid in [
         "http://example.com",
+        "example.com:3000",
+        "192.168.1.10:3000",
+        "127.0.0.1.example.com:3000",
+        "localhost:3000@example.com",
+        "user:password@127.0.0.1:3000",
+        "127.0.0.1:3000?q=secret",
+        "127.0.0.1:3000/#token",
         "https://user:password@example.com",
         "https://example.com?q=secret",
         "https://example.com/#token",
@@ -113,6 +120,28 @@ fn urls_require_https_and_reject_embedded_secrets() {
         "/otserver/"
     );
     assert!(base_url("http://[::1]:3000").is_ok());
+}
+
+#[test]
+fn bare_loopback_addresses_use_http_and_match_explicit_urls() {
+    for address in ["127.0.0.1:3000", "localhost:3000", "[::1]:3000/otserver"] {
+        assert_eq!(
+            base_url(address).unwrap(),
+            base_url(&format!("http://{address}/")).unwrap()
+        );
+    }
+    assert_eq!(
+        base_url("https://localhost:3000").unwrap().scheme(),
+        "https"
+    );
+}
+
+#[test]
+fn malformed_controller_url_has_an_actionable_redacted_error() {
+    let error = base_url("http://user:secret@localhost:invalid").unwrap_err();
+    assert!(error.to_string().contains("Controller URL"));
+    assert!(error.to_string().contains("https://"));
+    assert!(!error.to_string().contains("secret"));
 }
 
 #[test]
@@ -137,6 +166,26 @@ fn poll_requires_a_supported_action_and_assignment_shape() {
     assert!(
         serde_json::from_value::<Poll>(json!({"action":"execute","credential":"secret"})).is_err()
     );
+}
+
+#[test]
+fn enrollment_adapter_report_separates_mac_and_ip_addresses() {
+    let adapter = otserver_otter::profinet::CaptureInterface {
+        name: "eth0".into(),
+        friendly_name: "Ethernet".into(),
+        description: "Physical adapter".into(),
+        addresses: vec![
+            "00:11:22:33:44:55".into(),
+            "192.0.2.10".into(),
+            "2001:db8::10".into(),
+            "not-an-address".into(),
+        ],
+    };
+    let report = serde_json::to_value(network_adapter_report(adapter)).unwrap();
+    assert_eq!(report["name"], "eth0");
+    assert_eq!(report["friendlyName"], "Ethernet");
+    assert_eq!(report["macAddress"], "00:11:22:33:44:55");
+    assert_eq!(report["ipAddresses"], json!(["192.0.2.10", "2001:db8::10"]));
 }
 
 #[tokio::test]
@@ -168,6 +217,7 @@ async fn errors_redact_server_bodies_and_classify_auth_and_retry() {
         .unwrap_err();
     assert_eq!(auth, Error::Auth);
     assert!(!auth.to_string().contains("do-not-log"));
+    assert!(auth.to_string().contains("OS account, and --state-dir"));
     assert_eq!(
         api.post::<Value>("api/otter/v1/poll", json!({}))
             .await
@@ -200,6 +250,8 @@ fn configuration_maps_profile_options_and_separate_credentials() {
         "noDnp3",
         "noIec61850",
         "noNetbios",
+        "noSmb",
+        "noRpc",
         "noOpcua",
         "noSnmp",
         "noLldp",
@@ -214,6 +266,8 @@ fn configuration_maps_profile_options_and_separate_credentials() {
         !options.protocols.arp
             && !options.protocols.profinet
             && !options.protocols.netbios
+            && !options.protocols.smb
+            && !options.protocols.rpc
             && !options.protocols.snmp
     );
     assert!(options.allow_dcp_source);
@@ -263,6 +317,48 @@ fn credentials_reject_unknown_or_invalid_protocol_settings() {
     }
 }
 
+#[tokio::test]
+async fn rejected_configuration_reports_a_specific_reason_without_discovery() {
+    let (api, task) = server(vec![(200, json!({"status":"failed"}))]).await;
+    let store = PrivateStore::new();
+    let mut state = State {
+        scanner: Some(scanner()),
+        ..State::default()
+    };
+    let mut job = assignment(&api);
+    job.configuration["serverUrl"] = json!("https://another-controller.example");
+    execute(&api, store.get(), &mut state, job).await.unwrap();
+    let run = store.get().load().unwrap().assignment.unwrap();
+    assert!(
+        run.message
+            .unwrap()
+            .contains("controller URL does not match --server-url")
+    );
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("controller URL does not match --server-url"));
+    assert!(!store.get().result_path("run1").exists());
+}
+
+#[test]
+fn rejected_configuration_distinguishes_null_type_target_and_credential_errors() {
+    let api = Api::new(base_url("http://localhost:3000").unwrap()).unwrap();
+    for (key, value, reason) in [
+        ("sourceMac", Value::Null, "null option"),
+        ("noArp", json!("do-not-log-secret"), "invalid option types"),
+        ("targets", json!(["invalid-target"]), "targets are invalid"),
+        ("site", json!("different-site"), "enrolled site"),
+    ] {
+        let mut job = assignment(&api);
+        job.configuration[key] = value;
+        let message = mapped_config(&job, &api, &scanner())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains(reason), "{message}");
+        assert!(!message.contains("do-not-log-secret"));
+    }
+}
+
 #[test]
 fn file_credentials_and_assignment_survive_atomic_state_replacement() {
     let store = PrivateStore::new();
@@ -280,6 +376,7 @@ fn file_credentials_and_assignment_survive_atomic_state_replacement() {
         phase: Phase::Ready,
         status: "partial".into(),
         import_id: Some("import1".into()),
+        message: None,
     });
     store.get().save(&state).unwrap();
     let recovered = store.get().load().unwrap();
@@ -327,6 +424,7 @@ async fn recovered_scanning_assignment_is_failed_without_rescanning_or_uploading
             phase: Phase::Scanning,
             status: "failed".into(),
             import_id: None,
+            message: None,
         }),
         ..State::default()
     };
@@ -334,7 +432,9 @@ async fn recovered_scanning_assignment_is_failed_without_rescanning_or_uploading
         .await
         .unwrap();
     assert!(state.assignment.unwrap().phase == Phase::Terminal);
-    assert!(task.await.unwrap()[0].starts_with("POST /api/otter/v1/runs/run1/finish "));
+    let requests = task.await.unwrap();
+    assert!(requests[0].starts_with("POST /api/otter/v1/runs/run1/finish "));
+    assert!(requests[0].contains("Scanner restarted during discovery"));
     assert!(!store.get().result_path("run1").exists());
 }
 
@@ -348,15 +448,84 @@ async fn finish_rejects_a_nonterminal_status_response() {
             phase: Phase::Ready,
             status: "completed".into(),
             import_id: Some("import1".into()),
+            message: None,
         }),
         ..State::default()
     };
     assert_eq!(
-        finish(&api, store.get(), &mut state, "completed").await,
+        finish(&api, store.get(), &mut state, "completed", None).await,
         Err(Error::Invalid)
     );
     assert!(store.get().load().unwrap().assignment.unwrap().phase == Phase::Finishing);
     task.await.unwrap();
+}
+
+#[tokio::test]
+async fn failure_reason_survives_a_failed_finish_request_and_restart() {
+    let (api, task) = server(vec![
+        (503, json!({})),
+        (503, json!({})),
+        (200, json!({"status":"failed"})),
+    ])
+    .await;
+    let store = PrivateStore::new();
+    let mut state = State {
+        scanner: Some(scanner()),
+        assignment: Some(RunState {
+            id: "run1".into(),
+            phase: Phase::Assigned,
+            status: "failed".into(),
+            import_id: None,
+            message: None,
+        }),
+        ..State::default()
+    };
+    let reason = "The selected network interface is not available on this scanner.";
+    assert_eq!(
+        finish(&api, store.get(), &mut state, "failed", Some(reason)).await,
+        Err(Error::Retry)
+    );
+    assert_eq!(
+        finish(
+            &api,
+            store.get(),
+            &mut state,
+            "failed",
+            Some("Controller response or managed scan configuration is invalid.")
+        )
+        .await,
+        Err(Error::Retry)
+    );
+    let mut recovered = store.get().load().unwrap();
+    assert_eq!(
+        recovered.assignment.as_ref().unwrap().message.as_deref(),
+        Some(reason)
+    );
+    execute(&api, store.get(), &mut recovered, assignment(&api))
+        .await
+        .unwrap();
+    let requests = task.await.unwrap();
+    assert!(requests.iter().all(|request| request.contains(reason)));
+    assert!(recovered.assignment.unwrap().phase == Phase::Terminal);
+    assert!(!store.get().result_path("run1").exists());
+}
+
+#[test]
+fn failure_diagnostics_do_not_forward_arbitrary_secret_text() {
+    for error in [
+        "Protocol failed with password managed-secret",
+        "Could not write export: managed-secret",
+        "Could not determine the current MAC of interface managed-secret.",
+        "Permission denied: managed-secret",
+    ] {
+        assert!(!scan_failure_reason(error).contains("managed-secret"));
+    }
+    assert!(scan_failure_reason("Could not write export: disk full").contains("disk space"));
+    let legacy: RunState = serde_json::from_value(json!({
+        "id":"run1", "phase":"scanning", "status":"failed", "importId":null
+    }))
+    .unwrap();
+    assert!(legacy.message.is_none());
 }
 
 #[tokio::test]
@@ -381,6 +550,7 @@ async fn recovered_ready_assignment_uploads_once_and_finishes_separately_from_qu
             phase: Phase::Ready,
             status: "partial".into(),
             import_id: None,
+            message: None,
         }),
         ..State::default()
     };
@@ -476,4 +646,56 @@ async fn failed_queued_import_retries_by_id_once_without_reuploading() {
     imports(&api, store.get(), &mut state).await.unwrap();
     assert!(state.pending_imports.is_empty());
     assert!(task.await.unwrap()[1].starts_with("POST /api/asset-imports/import1/retry "));
+}
+
+#[tokio::test]
+async fn controller_url_mismatch_preserves_state_and_explains_the_overwrite_flag() {
+    let mut store = PrivateStore::new();
+    store
+        .get()
+        .save(&State {
+            server_url: "https://previous.example/".into(),
+            ..State::default()
+        })
+        .unwrap();
+    store.store.take();
+    let args = crate::Cli::try_parse_from([
+        "otserver-otter",
+        "controller",
+        "--server-url",
+        "localhost:3000",
+        "--state-dir",
+        store.path.to_str().unwrap(),
+        "--enroll",
+        "--ack-authorized",
+    ])
+    .unwrap();
+    let Some(crate::Commands::Controller(args)) = args.command else {
+        panic!("expected controller command")
+    };
+    let error = run_inner(args).await.unwrap_err();
+    assert!(error.to_string().contains("--enroll --overwrite-state-dir"));
+    let saved = store::Store::open(Some(store.path.clone()))
+        .unwrap()
+        .load()
+        .unwrap();
+    assert_eq!(saved.server_url, "https://previous.example/");
+}
+
+#[test]
+fn overwrite_state_dir_requires_explicit_enrollment() {
+    let args = [
+        "otserver-otter",
+        "controller",
+        "--server-url",
+        "localhost:3000",
+        "--ack-authorized",
+        "--overwrite-state-dir",
+    ];
+    assert!(crate::Cli::try_parse_from(args).is_err());
+    let args = crate::Cli::try_parse_from(args.into_iter().chain(["--enroll"])).unwrap();
+    let Some(crate::Commands::Controller(args)) = args.command else {
+        panic!("expected controller command")
+    };
+    assert!(args.overwrite_state_dir && args.enroll);
 }

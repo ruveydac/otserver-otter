@@ -1575,30 +1575,8 @@ mod tests {
 
     fn args() -> ScanArgs {
         ScanArgs {
-            targets: vec![],
-            interface: None,
-            source_mac: None,
-            output: None,
             ack_authorized: true,
-            no_protocols: false,
-            no_arp: false,
-            no_profinet: false,
-            allow_dcp_source: false,
-            no_s7: false,
-            no_enip: false,
-            no_bacnet: false,
-            no_fins: false,
-            no_fox: false,
-            no_dnp3: false,
-            no_iec61850: false,
-            no_netbios: false,
-            no_smb: false,
-            no_rpc: false,
-            no_opcua: false,
-            no_snmp: false,
-            no_lldp: false,
-            server_url: None,
-            site: None,
+            ..ScanArgs::default()
         }
     }
 

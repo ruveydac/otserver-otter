@@ -1,6 +1,6 @@
 use super::{Finding, TIMEOUT, hex, port, text};
 use crate::contract::Source;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -194,18 +194,18 @@ fn parse(response: &[u8]) -> Result<(BTreeMap<String, Value>, Value), String> {
     if let Some(vendor) = vendor(vendor_id) {
         fields.insert("vendor".into(), json!(vendor));
     }
-    let raw = Value::Object(Map::from_iter([
-        ("deviceIp".into(), json!(device_ip)),
-        ("deviceType".into(), json!(device_type)),
-        ("productCode".into(), json!(product_code)),
-        ("productName".into(), json!(product_name)),
-        ("response".into(), json!(hex(response))),
-        ("revision".into(), json!(revision)),
-        ("serialNumber".into(), json!(format!("{serial:08X}"))),
-        ("state".into(), json!(state)),
-        ("status".into(), json!(status)),
-        ("vendorId".into(), json!(vendor_id)),
-    ]));
+    let raw = json!({
+        "deviceIp": device_ip,
+        "deviceType": device_type,
+        "productCode": product_code,
+        "productName": product_name,
+        "response": hex(response),
+        "revision": revision,
+        "serialNumber": format!("{serial:08X}"),
+        "state": state,
+        "status": status,
+        "vendorId": vendor_id,
+    });
     Ok((fields, raw))
 }
 

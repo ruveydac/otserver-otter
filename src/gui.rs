@@ -983,47 +983,26 @@ impl eframe::App for GuiApp {
                     let mut protocol_changed = false;
                     ui.add_enabled_ui(!self.is_scanning, |ui| {
                         ui.horizontal_wrapped(|ui| {
-                            protocol_changed |=
-                                ui.toggle_value(&mut self.arp_enabled, "ARP").changed();
-                            protocol_changed |= ui
-                                .toggle_value(&mut self.profinet_enabled, "PROFINET DCP")
-                                .changed();
-                            protocol_changed |= ui
-                                .toggle_value(&mut self.allow_dcp_source, "Allow DCP source")
-                                .changed();
-                            protocol_changed |=
-                                ui.toggle_value(&mut self.s7_enabled, "S7").changed();
-                            protocol_changed |= ui
-                                .toggle_value(&mut self.enip_enabled, "EtherNet/IP")
-                                .changed();
-                            protocol_changed |= ui
-                                .toggle_value(&mut self.bacnet_enabled, "BACnet")
-                                .changed();
-                            protocol_changed |=
-                                ui.toggle_value(&mut self.fins_enabled, "FINS").changed();
-                            protocol_changed |=
-                                ui.toggle_value(&mut self.fox_enabled, "Fox").changed();
-                            protocol_changed |=
-                                ui.toggle_value(&mut self.dnp3_enabled, "DNP3").changed();
-                            protocol_changed |= ui
-                                .toggle_value(&mut self.iec61850_enabled, "IEC 61850")
-                                .changed();
-                            protocol_changed |= ui
-                                .toggle_value(&mut self.netbios_enabled, "NetBIOS")
-                                .changed();
-                            protocol_changed |= ui
-                                .toggle_value(&mut self.smb_enabled, "SMB")
-                                .changed();
-                            protocol_changed |= ui
-                                .toggle_value(&mut self.rpc_enabled, "RPC")
-                                .changed();
-                            protocol_changed |= ui
-                                .toggle_value(&mut self.opcua_enabled, "OPC UA")
-                                .changed();
-                            protocol_changed |=
-                                ui.toggle_value(&mut self.snmp_enabled, "SNMP").changed();
-                            protocol_changed |=
-                                ui.toggle_value(&mut self.lldp_enabled, "LLDP").changed();
+                            for (label, enabled) in [
+                                ("ARP", &mut self.arp_enabled),
+                                ("PROFINET DCP", &mut self.profinet_enabled),
+                                ("Allow DCP source", &mut self.allow_dcp_source),
+                                ("S7", &mut self.s7_enabled),
+                                ("EtherNet/IP", &mut self.enip_enabled),
+                                ("BACnet", &mut self.bacnet_enabled),
+                                ("FINS", &mut self.fins_enabled),
+                                ("Fox", &mut self.fox_enabled),
+                                ("DNP3", &mut self.dnp3_enabled),
+                                ("IEC 61850", &mut self.iec61850_enabled),
+                                ("NetBIOS", &mut self.netbios_enabled),
+                                ("SMB", &mut self.smb_enabled),
+                                ("RPC", &mut self.rpc_enabled),
+                                ("OPC UA", &mut self.opcua_enabled),
+                                ("SNMP", &mut self.snmp_enabled),
+                                ("LLDP", &mut self.lldp_enabled),
+                            ] {
+                                protocol_changed |= ui.toggle_value(enabled, label).changed();
+                            }
                         });
                     });
                     ui.small("Highlighted protocols are enabled. All protocols are enabled by default.");

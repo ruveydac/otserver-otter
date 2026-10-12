@@ -68,13 +68,23 @@ The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
   `otter.json` is absent. These local CLI/GUI flows must continue to work independently of managed
   `controller` mode. Never write credentials to logs or scan exports.
 - Controller v1 uses outbound HTTPS only (HTTP loopback for development), sensitive machine headers,
-  and no redirects. Require local `--ack-authorized`; apply snapshots through the shared scan path.
+  and no redirects. Bare loopback addresses normalize to HTTP; other hosts require explicit HTTPS.
+  Require local `--ack-authorized`; apply snapshots through the shared scan path.
   Keep machine credentials in Secret Service/Windows Credential Manager where available, with an
-  atomic permission-restricted file fallback. Never persist protocol credential snapshots.
+  atomic permission-restricted file fallback. Report the computer name and at most 32 available
+  adapters (technical/friendly names, description, MAC, and up to 16 IPv4/IPv6 addresses) at
+  enrollment and during polling; never include credentials in this report or persist protocol
+  credential snapshots.
 - Persist managed assignment state before starting probes; uncertain interrupted discovery must not
   be replayed. Resume saved uploads/finish by run/import ID. Keep lease heartbeats during scans and
   uploads; cancellation, lease loss, terminal responses, or rejected authentication must prevent stale
   uploads. Credential rotation must be durable before switching the in-memory credential.
+- A controller URL mismatch may be overridden only with explicit `--enroll --overwrite-state-dir`.
+  Replace saved enrollment and run state only after successful enrollment; retain scan exports and
+  do not send previous-controller credentials, assignments, or import IDs to the new controller.
+- Persist credential-safe run failure reasons before sending the finish request, and retain them
+  across retries/restarts. Use fixed setup messages and allowlisted discovery failure categories;
+  never forward arbitrary protocol error text or managed credential snapshots into run messages.
 - Direct imports use OTserver's `asset-imports` REST API so authorization, validation, merging, and
   auditing remain application-owned. Bound uploads to a 10-second connection timeout, five-minute
   total deadline, and 16 MiB response body; retain the local scan on failure.
@@ -116,6 +126,7 @@ The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
 
 ```bash
 cargo fmt -- --check
+python3 -B databases/test_generate_database.py
 cargo check --locked
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
@@ -123,13 +134,21 @@ cargo llvm-cov --lib --fail-under-lines 90 --summary-only -- --test-threads=1
 ./lab/test.sh
 ./lab/test-pnio.sh
 python3 lab/controller_verify.py target/debug/otserver-otter
+./lab/test-controller.sh
 git diff --check
 ```
 
 Scanner branch, loop, and parser logic needs a focused Rust unit test. Protocol interoperability
 belongs in the Docker lab. The controller HTTPS lab is also runnable standalone after a headless
-build. Management's opt-in `tests/int/otter-client.int.spec.ts` uses `OTTER_CLIENT_BIN` to exercise
-the actual Rust executable against Payload REST and the integration-test replica set.
+build. Management's `pnpm test:otter-client` builds the headless executable and exercises enrollment,
+import, and saved-credential restart against Payload REST and the integration-test replica set.
+Its `tests/int/otter-client.int.spec.ts` also accepts an existing build via `OTTER_CLIENT_BIN`.
+`./lab/test-controller.sh` is the full remote-management CI gate. Run from an Otter checkout at
+`MANAGEMENT/otserver-otter` with management dependencies installed; it builds/tests the controller,
+runs the HTTPS lab, and runs the entire management integration suite with the real client enabled.
+It owns a disposable Docker/Podman MongoDB replica set and must never reuse operator database URLs.
+Reports live under `lab/artifacts/controller.*/`. The remote-management workflow selects a compatible
+OTserver revision through `management_ref` or `OTTER_MANAGEMENT_REF` (default `main`).
 
 On Windows, the Fox TLS retry test requires a process context that can acquire Schannel outbound
 credentials. A restricted sandbox may return `SEC_E_NO_CREDENTIALS` before sending ClientHello;

@@ -153,6 +153,8 @@ otserver-otter controller --server-url https://otserver.example \
 
 The token is read from stdin rather than a command-line argument. HTTPS certificate validation is
 mandatory; only loopback URLs permit HTTP for development. No scanner-side listener is opened.
+Bare loopback addresses such as `127.0.0.1:3000`, `localhost:3000`, and `[::1]:3000` use HTTP;
+other hosts require an explicit `https://` URL. Match the manager's `OTSERVER_PUBLIC_URL`.
 Restart without `--enroll` to use the saved machine credential:
 
 ```bash
@@ -162,13 +164,19 @@ otserver-otter controller --server-url https://otserver.example --ack-authorized
 - State defaults to `$XDG_STATE_HOME/otserver-otter` (or `~/.local/state/otserver-otter`) on Linux
   and `%LOCALAPPDATA%\otserver-otter` on Windows. `--state-dir PATH` selects a dedicated location;
   one process owns it at a time. Always run under the same OS account and state directory.
+- If a state directory belongs to a different controller URL, use `--enroll --overwrite-state-dir`
+  with a fresh enrollment token to replace its saved enrollment and run state. Existing scan exports
+  remain in the directory. The previous state is preserved if enrollment fails; restart afterward
+  without `--enroll` or `--overwrite-state-dir` to reuse the new credential.
 - Credentials use Linux Secret Service or Windows Credential Manager when available. Headless hosts
   fall back to an atomic private state file; `--file-credentials` selects this explicitly. Unix
   directories/files must be owned by the current user with modes 0700/0600. Windows ACLs restrict
   state to the current user. Managed protocol credential snapshots stay in memory, not state files.
 - `--poll-seconds 30` sets the minimum polling interval (1–300 seconds); the server can request a
   longer idle interval. Network/429/5xx failures use bounded exponential backoff with jitter up to
-  five minutes. Polls report build version, capabilities, and available capture interfaces.
+  five minutes. Enrollment and polls report build version, capabilities, computer name, and capture
+  adapter technical/friendly names, descriptions, MAC addresses, and IPv4/IPv6 addresses. OTserver
+  stores this inventory with the scanner for adapter selection in its Payload profile editor.
 - Set an explicit capture `interface` in each profile on multi-adapter hosts. An omitted `sourceMac`
   is obtained from the selected adapter. All managed scans retain the shared interface validation,
   read-only protocol behavior, response validation, and process-wide traffic pacing.
@@ -201,9 +209,54 @@ The same check runs in `./lab/test.sh`. To run the real Rust client against OTse
 test replica set, from the management repository use:
 
 ```bash
-OTTER_CLIENT_BIN=otserver-otter/target/debug/otserver-otter \
-  OTSERVER_VULNERABILITY_FEEDS=off pnpm test:int tests/int/otter-client.int.spec.ts
+TEST_DATABASE_URL='mongodb://127.0.0.1:27018/otserver-test?replicaSet=rs0&directConnection=true' \
+  pnpm test:otter-client
 ```
+
+This builds the headless client and tests bare-loopback/explicit-HTTP enrollment, a complete managed
+run/import, and saved-credential restart. To use an existing build, set `OTTER_CLIENT_BIN` and run
+`pnpm test:int tests/int/otter-client.int.spec.ts` directly.
+
+### Full remote-management CI/CD gate
+
+From a management checkout containing this repository at `otserver-otter/`, run:
+
+```bash
+pnpm install --frozen-lockfile
+./otserver-otter/lab/test-controller.sh
+```
+
+The runner requires Linux, Rust, Node.js 22, pnpm 10, Python 3, OpenSSL (including development
+headers for the Rust build), and Docker or Podman. It builds the headless client, runs all Rust
+controller tests and the HTTPS fault/recovery lab, then runs **the entire management integration
+suite** with `OTTER_CLIENT_BIN` set so real-client tests execute. It creates a disposable MongoDB 8
+replica set on a random loopback port, overrides database settings from the environment and `.env`,
+and removes the container and its volumes on success, failure, or interruption. Set
+`CONTAINER_RUNTIME=podman` to select a runtime explicitly.
+
+Coverage includes:
+
+| Area | Checks |
+| --- | --- |
+| Enrollment and inventory | Single-use tokens, controller URL validation, computer/adapters, saved-credential restart, explicit controller takeover |
+| Configurations and credentials | All managed options, encrypted SNMP/OPC UA credentials, replace/clear, immutable snapshots, import overrides |
+| Run lifecycle | Manual runs, start, progress/heartbeats, completion/partial/failure, cancellation, lease expiry, interrupted-run recovery |
+| Scheduling | Once, interval, cron/time zones, latest-only offline catch-up, occurrence deduplication |
+| Imports | Real-client multipart REST upload, schema-v2 validation, sync/queued processing, idempotency, upload recovery, retry by import ID |
+| Access and administration | Role/site isolation, machine-principal restrictions, origin checks, audit redaction, rotation, revocation/re-enrollment, UI controls |
+
+The real-client REST tests use Payload's HTTP endpoints and the replica set; HTTPS failures and
+recovery use the local controller lab. UI controls are component-tested. These managed scans disable
+discovery probes; protocol interoperability remains covered by `./lab/test.sh` and `./lab/test-pnio.sh`.
+Stage logs, MongoDB logs, and the management JUnit report are saved under
+`lab/artifacts/controller.*/`. Any failed stage fails the gate.
+
+`.github/workflows/controller.yml` runs this gate on pull requests and pushes to `main`, and supports
+manual runs. It checks out `ruveydac/OTserver` alongside the exact Otter
+revision being tested and uploads reports even on failure. Set the repository variable
+`OTTER_MANAGEMENT_REF` to a compatible management branch/tag/SHA, or pass `management_ref` to a
+manual run; the default is `main`. The selected management revision must contain the
+controller-v1 integration tests. Use **Full remote management** as a required pre-release check.
 
 ## Protocols and safety
 
