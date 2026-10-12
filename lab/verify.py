@@ -520,4 +520,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    subprocess.run(["python3", str(Path(__file__).with_name("controller_verify.py")), SCANNER], check=True)
     main()

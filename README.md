@@ -137,6 +137,74 @@ Validate an export before uploading it:
 .\otserver-otter.exe validate .\scan.otserver.json
 ```
 
+## Managed controller mode
+
+Local `scan`, GUI, executable-adjacent `otter.json` (including multiple profiles and legacy
+`otscanner.json` fallback), and user API-key uploads continue to work independently. Managed mode
+is a separate, outbound-only command; it does not load or modify that local configuration.
+
+Create a scanner in OTserver's **Manage Otters**, then redeem its single-use enrollment token:
+
+```bash
+otserver-otter controller --server-url https://otserver.example \
+  --enroll --ack-authorized
+# Supply the enrollment token on stdin, followed by Enter (or use protected input redirection).
+```
+
+The token is read from stdin rather than a command-line argument. HTTPS certificate validation is
+mandatory; only loopback URLs permit HTTP for development. No scanner-side listener is opened.
+Restart without `--enroll` to use the saved machine credential:
+
+```bash
+otserver-otter controller --server-url https://otserver.example --ack-authorized
+```
+
+- State defaults to `$XDG_STATE_HOME/otserver-otter` (or `~/.local/state/otserver-otter`) on Linux
+  and `%LOCALAPPDATA%\otserver-otter` on Windows. `--state-dir PATH` selects a dedicated location;
+  one process owns it at a time. Always run under the same OS account and state directory.
+- Credentials use Linux Secret Service or Windows Credential Manager when available. Headless hosts
+  fall back to an atomic private state file; `--file-credentials` selects this explicitly. Unix
+  directories/files must be owned by the current user with modes 0700/0600. Windows ACLs restrict
+  state to the current user. Managed protocol credential snapshots stay in memory, not state files.
+- `--poll-seconds 30` sets the minimum polling interval (1–300 seconds); the server can request a
+  longer idle interval. Network/429/5xx failures use bounded exponential backoff with jitter up to
+  five minutes. Polls report build version, capabilities, and available capture interfaces.
+- Set an explicit capture `interface` in each profile on multi-adapter hosts. An omitted `sourceMac`
+  is obtained from the selected adapter. All managed scans retain the shared interface validation,
+  read-only protocol behavior, response validation, and process-wide traffic pacing.
+- Heartbeats report bounded stage progress every 15 seconds and renew the two-minute lease. Human
+  cancellation, lost lease, or a terminal/authentication response stops work safely and prevents
+  further upload. Managed output omits probe details and all controller bodies/credentials.
+- Assignment state is durable before starting discovery. Interrupted discovery is reconciled as
+  failed, never silently scanned again. Completed local exports resume byte-identical upload retries;
+  known import IDs resume finishing without another upload. Results remain as `RUN_ID.otserver.json`
+  in the private state directory, including on failure. Manage their retention as operator data.
+- Imports default to synchronous execution. `--queued-imports` requests queued execution and requires
+  `OTSERVER_QUEUED_IMPORTS=on` and healthy manager workers. Scanner completion is independent of import
+  completion: pending/running imports are checked by ID during idle polling; failed queued imports
+  receive at most one explicit retry by ID, without re-uploading terminal scan work.
+- Credentials rotate when less than 30 days remain. The new secret and state reference are durable
+  before replacing the old local credential. Authentication failure stops the agent; use management
+  re-enrollment and `--enroll` to recover. A lost enrollment/rotation response also requires
+  re-enrollment because the server consumes/revokes the prior token immediately.
+
+Controller v1 is independent of the unchanged schema-version-2 scan result contract. The HTTPS lab
+checks enrollment, rotation, restart/upload recovery, cancellation, rejected settings, queued import
+retry, redaction, and revocation:
+
+```bash
+cargo build --locked --no-default-features
+python3 lab/controller_verify.py target/debug/otserver-otter
+```
+
+The same check runs in `./lab/test.sh`. To run the real Rust client against OTserver's REST API and
+test replica set, from the management repository use:
+
+```bash
+OTTER_CLIENT_BIN=otserver-otter/target/debug/otserver-otter \
+  OTSERVER_VULNERABILITY_FEEDS=off pnpm test:int tests/int/otter-client.int.spec.ts
+```
+
 ## Protocols and safety
 
 The scanner sends PROFINET DCP Identify, read-only SNMP requests, and fixed read-only identity

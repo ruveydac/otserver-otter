@@ -65,7 +65,16 @@ The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
   paced sweeps and honor cancellation. These are application limits, not an on-wire guarantee for
   OS-generated ARP/TCP or protocol-library traffic; do not label them universally safe.
 - Credentials belong in executable-adjacent `otter.json`. Load legacy `otscanner.json` only when
-  `otter.json` is absent. Never write credentials to logs or scan exports.
+  `otter.json` is absent. These local CLI/GUI flows must continue to work independently of managed
+  `controller` mode. Never write credentials to logs or scan exports.
+- Controller v1 uses outbound HTTPS only (HTTP loopback for development), sensitive machine headers,
+  and no redirects. Require local `--ack-authorized`; apply snapshots through the shared scan path.
+  Keep machine credentials in Secret Service/Windows Credential Manager where available, with an
+  atomic permission-restricted file fallback. Never persist protocol credential snapshots.
+- Persist managed assignment state before starting probes; uncertain interrupted discovery must not
+  be replayed. Resume saved uploads/finish by run/import ID. Keep lease heartbeats during scans and
+  uploads; cancellation, lease loss, terminal responses, or rejected authentication must prevent stale
+  uploads. Credential rotation must be durable before switching the in-memory credential.
 - Direct imports use OTserver's `asset-imports` REST API so authorization, validation, merging, and
   auditing remain application-owned. Bound uploads to a 10-second connection timeout, five-minute
   total deadline, and 16 MiB response body; retain the local scan on failure.
@@ -113,11 +122,14 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo llvm-cov --lib --fail-under-lines 90 --summary-only -- --test-threads=1
 ./lab/test.sh
 ./lab/test-pnio.sh
+python3 lab/controller_verify.py target/debug/otserver-otter
 git diff --check
 ```
 
 Scanner branch, loop, and parser logic needs a focused Rust unit test. Protocol interoperability
-belongs in the Docker lab.
+belongs in the Docker lab. The controller HTTPS lab is also runnable standalone after a headless
+build. Management's opt-in `tests/int/otter-client.int.spec.ts` uses `OTTER_CLIENT_BIN` to exercise
+the actual Rust executable against Payload REST and the integration-test replica set.
 
 On Windows, the Fox TLS retry test requires a process context that can acquire Schannel outbound
 credentials. A restricted sandbox may return `SEC_E_NO_CREDENTIALS` before sending ClientHello;

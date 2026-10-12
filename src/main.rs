@@ -1,3 +1,4 @@
+mod controller;
 #[cfg(feature = "gui")]
 pub mod gui;
 use clap::{ArgAction, Args, Parser, Subcommand};
@@ -51,6 +52,8 @@ pub enum Commands {
         json: bool,
     },
     Scan(ScanArgs),
+    /// Run an outbound-only, centrally managed scanner.
+    Controller(controller::ControllerArgs),
     Validate {
         file: PathBuf,
     },
@@ -349,6 +352,7 @@ async fn main() {
 
 async fn run() -> Result<(), String> {
     match Cli::parse().command {
+        Some(Commands::Controller(args)) => controller::run(args).await,
         Some(Commands::Doctor) => doctor(),
         Some(Commands::Interfaces { json }) => {
             let devices = profinet::interfaces()?;
