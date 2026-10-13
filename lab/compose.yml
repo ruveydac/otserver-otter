@@ -7,16 +7,16 @@ services:
       dockerfile: devices/Dockerfile.siemens
     cap_add: [NET_RAW]
     environment:
-      OTTER_DCP_RESPONSE_DELAY_SECONDS: "${OTTER_DCP_RESPONSE_DELAY_SECONDS:-55}"
+      OTTER_DCP_RESPONSE_DELAY_SECONDS: '${OTTER_DCP_RESPONSE_DELAY_SECONDS:-55}'
     healthcheck: &process-health
-      test: [CMD-SHELL, "kill -0 1"]
+      test: [CMD-SHELL, 'kill -0 1']
       interval: 1s
       timeout: 1s
       retries: 20
     networks:
       ot_lab:
         ipv4_address: 172.30.0.10
-        mac_address: "02:00:00:00:00:10"
+        mac_address: '02:00:00:00:00:10'
 
   ethernet_ip:
     build:
@@ -27,7 +27,7 @@ services:
     networks:
       ot_lab:
         ipv4_address: 172.30.0.11
-        mac_address: "02:00:00:00:00:11"
+        mac_address: '02:00:00:00:00:11'
 
   bacnet:
     build:
@@ -39,7 +39,7 @@ services:
     networks:
       ot_lab:
         ipv4_address: 172.30.0.12
-        mac_address: "02:00:00:00:00:12"
+        mac_address: '02:00:00:00:00:12'
 
   fins:
     build:
@@ -50,7 +50,7 @@ services:
     networks:
       ot_lab:
         ipv4_address: 172.30.0.13
-        mac_address: "02:00:00:00:00:13"
+        mac_address: '02:00:00:00:00:13'
 
   fox:
     build:
@@ -61,7 +61,7 @@ services:
     networks:
       ot_lab:
         ipv4_address: 172.30.0.14
-        mac_address: "02:00:00:00:00:14"
+        mac_address: '02:00:00:00:00:14'
 
   dnp3:
     build:
@@ -72,7 +72,7 @@ services:
     networks:
       ot_lab:
         ipv4_address: 172.30.0.16
-        mac_address: "02:00:00:00:00:16"
+        mac_address: '02:00:00:00:00:16'
 
   iec61850:
     build:
@@ -82,7 +82,7 @@ services:
     networks:
       ot_lab:
         ipv4_address: 172.30.0.17
-        mac_address: "02:00:00:00:00:17"
+        mac_address: '02:00:00:00:00:17'
 
   netbios:
     build:
@@ -96,19 +96,28 @@ services:
     networks:
       ot_lab:
         ipv4_address: 172.30.0.18
-        mac_address: "02:00:00:00:00:18"
+        mac_address: '02:00:00:00:00:18'
 
   smb1:
     build:
       context: .
       dockerfile: devices/Dockerfile.netbios
     # Deliberately legacy-only responder, isolated on the lab bridge with no published ports.
-    entrypoint: [smbd, --foreground, --no-process-group, --debug-stdout, "--option=netbios name=OTTER-SMB1", "--option=server min protocol=NT1", "--option=server max protocol=NT1"]
+    entrypoint:
+      [
+        smbd,
+        --foreground,
+        --no-process-group,
+        --debug-stdout,
+        '--option=netbios name=OTTER-SMB1',
+        '--option=server min protocol=NT1',
+        '--option=server max protocol=NT1',
+      ]
     healthcheck: *process-health
     networks:
       ot_lab:
         ipv4_address: 172.30.0.19
-        mac_address: "02:00:00:00:00:19"
+        mac_address: '02:00:00:00:00:19'
 
   opcua:
     build:
@@ -116,14 +125,20 @@ services:
       dockerfile: devices/Dockerfile.opcua
     # asyncua needs several seconds to bind 4840; wait for the socket, not just the process.
     healthcheck:
-      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 4840), 2).close()"]
+      test:
+        [
+          'CMD',
+          'python3',
+          '-c',
+          "import socket; socket.create_connection(('127.0.0.1', 4840), 2).close()",
+        ]
       interval: 1s
       timeout: 3s
       retries: 30
     networks:
       ot_lab:
         ipv4_address: 172.30.0.15
-        mac_address: "02:00:00:00:00:15"
+        mac_address: '02:00:00:00:00:15'
 
   test:
     build:
@@ -146,7 +161,7 @@ services:
     networks:
       ot_lab:
         ipv4_address: 172.30.0.2
-        mac_address: "02:00:00:00:00:02"
+        mac_address: '02:00:00:00:00:02'
 
 networks:
   ot_lab:

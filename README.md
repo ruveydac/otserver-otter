@@ -243,14 +243,14 @@ the resources it owns on success, failure, or interruption. Set
 
 Coverage includes:
 
-| Area | Checks |
-| --- | --- |
-| Enrollment and inventory | Single-use tokens, controller URL validation, computer/adapters, saved-credential restart, explicit controller takeover |
-| Configurations and credentials | All managed options, encrypted SNMP/OPC UA credentials, replace/clear, immutable snapshots, import overrides |
-| Run lifecycle | Manual runs, start, progress/heartbeats, completion/partial/failure, cancellation, lease expiry, interrupted-run recovery |
-| Scheduling | Once, interval, cron/time zones, latest-only offline catch-up, occurrence deduplication |
-| Imports | Real-client multipart REST upload, schema-v2 validation, sync/queued processing, idempotency, upload recovery, retry by import ID |
-| Access and administration | Role/site isolation, machine-principal restrictions, origin checks, audit redaction, rotation, revocation/re-enrollment, UI controls |
+| Area                           | Checks                                                                                                                               |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Enrollment and inventory       | Single-use tokens, controller URL validation, computer/adapters, saved-credential restart, explicit controller takeover              |
+| Configurations and credentials | All managed options, encrypted SNMP/OPC UA credentials, replace/clear, immutable snapshots, import overrides                         |
+| Run lifecycle                  | Manual runs, start, progress/heartbeats, completion/partial/failure, cancellation, lease expiry, interrupted-run recovery            |
+| Scheduling                     | Once, interval, cron/time zones, latest-only offline catch-up, occurrence deduplication                                              |
+| Imports                        | Real-client multipart REST upload, schema-v2 validation, sync/queued processing, idempotency, upload recovery, retry by import ID    |
+| Access and administration      | Role/site isolation, machine-principal restrictions, origin checks, audit redaction, rotation, revocation/re-enrollment, UI controls |
 
 The real-client REST tests use Payload's HTTP endpoints and the replica set; HTTPS failures and
 recovery use the local controller lab. UI controls are component-tested. These managed scans disable
@@ -384,11 +384,11 @@ OTserver importers must recognize the `netbios` source added to the schema-versi
 SMB and RPC probes work from both Linux and Windows and need no credentials or capture driver.
 They use the same authorized, paced, MAC-correlated target path as the other native probes.
 
-| Probe | Requests | Evidence |
-| --- | --- | --- |
-| SMB, TCP 445 | SMB2 NEGOTIATE (dialects 2.02, 2.10, 3.0, 3.02), one SPNEGO/NTLM Type 1 SESSION_SETUP | Negotiated dialect, signing mode, server GUID, computer/domain names, optional reported NT major/minor/build |
+| Probe                  | Requests                                                                                            | Evidence                                                                                                                   |
+| ---------------------- | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| SMB, TCP 445           | SMB2 NEGOTIATE (dialects 2.02, 2.10, 3.0, 3.02), one SPNEGO/NTLM Type 1 SESSION_SETUP               | Negotiated dialect, signing mode, server GUID, computer/domain names, optional reported NT major/minor/build               |
 | SMB1 fallback, TCP 445 | One fresh connection, NT LM 0.12 NEGOTIATE, at most one extended-security Type 1 SESSION_SETUP_ANDX | Same NTLM names/build evidence where reported; native OS/LAN-manager strings; classic-security negotiation/domain evidence |
-| RPC, TCP 135 | One endpoint-mapper v3 bind, NDR transfer syntax, NTLM Type 1 | Accepted EPM service, computer/domain names, optional reported NT major/minor/build |
+| RPC, TCP 135           | One endpoint-mapper v3 bind, NDR transfer syntax, NTLM Type 1                                       | Accepted EPM service, computer/domain names, optional reported NT major/minor/build                                        |
 
 Both stop at the server challenge: no NTLM Type 3, RPC AUTH3, completed login, share enumeration,
 endpoint enumeration, DCOM activation, or WMI/WinRM commands.
