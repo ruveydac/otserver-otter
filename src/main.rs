@@ -2274,7 +2274,10 @@ mod tests {
         assert_eq!(metadata.addresses, ["192.0.2.10", "2001:db8::1"]);
         assert_eq!(metadata.mac_address.as_deref(), Some("00:11:22:33:44:55"));
         assert_eq!(metadata.id, "Cell A");
-        assert_eq!(metadata.ip_route_policy.as_deref(), Some("operating-system"));
+        assert_eq!(
+            metadata.ip_route_policy.as_deref(),
+            Some("operating-system")
+        );
         assert!(
             scan_interface_ref("missing", "00:11:22:33:44:55", &interfaces)
                 .addresses
