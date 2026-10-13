@@ -65,7 +65,7 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
                 "manufacturerId": raw.get("vendorId"),
                 "original": fields.get("serialNumber"),
                 "encoding": "cip-uint32-hex",
-                "catalogNumber": raw.get("productCode"),
+                "catalogNumber": raw.get("productCode").and_then(Value::as_u64).map(|code| code.to_string()),
                 "normalizationVersion": 1,
             }),
         );
@@ -305,6 +305,15 @@ mod tests {
             2
         );
         assert_eq!(finding.raw["serialClaim"]["scope"], "adapter");
+        assert_eq!(finding.raw["serialClaim"]["catalogNumber"], "158");
+        let mut scan: crate::contract::ScanExport =
+            serde_json::from_str(include_str!("../../contracts/otserver-scan-v2-valid.json"))
+                .unwrap();
+        let observation = &mut scan.devices[0].observations[0];
+        observation.source = finding.source;
+        observation.fields = finding.fields;
+        observation.raw = finding.raw;
+        crate::contract::validate(&scan).unwrap();
         tcp_task.await.unwrap();
         udp_task.await.unwrap();
     }

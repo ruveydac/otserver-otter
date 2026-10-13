@@ -227,8 +227,9 @@ fn check_private(path: &Path, directory: bool) -> Result<(), Error> {
 
 #[cfg(windows)]
 fn restrict_windows(path: &Path) -> Result<(), Error> {
-    // Use a fixed script and a positional path; no credentials or untrusted code in the command.
-    let script = "$ErrorActionPreference='Stop'; $p=$env:OTTER_STATE_ACL_PATH; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; $acl=Get-Acl -LiteralPath $p; $acl.SetAccessRuleProtection($true,$false); foreach($r in @($acl.Access)){$acl.RemoveAccessRuleAll($r)}; if((Get-Item -LiteralPath $p).PSIsContainer){$rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')}else{$rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','Allow')}; $acl.SetOwner($sid); $acl.AddAccessRule($rule); Set-Acl -LiteralPath $p -AclObject $acl";
+    // Replace only the DACL: copying Get-Acl also attempts to write owner/group metadata.
+    // Use a fixed script and an environment path; no credentials or untrusted code in the command.
+    let script = "$ErrorActionPreference='Stop'; $p=$env:OTTER_STATE_ACL_PATH; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; if((Get-Item -LiteralPath $p).PSIsContainer){$acl=[System.Security.AccessControl.DirectorySecurity]::new(); $rule=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')}else{$acl=[System.Security.AccessControl.FileSecurity]::new(); $rule=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','Allow')}; $acl.SetAccessRuleProtection($true,$false); $acl.AddAccessRule($rule); Set-Acl -LiteralPath $p -AclObject $acl";
     let output = std::process::Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .env("OTTER_STATE_ACL_PATH", path)

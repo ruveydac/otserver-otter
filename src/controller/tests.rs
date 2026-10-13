@@ -394,6 +394,21 @@ fn file_credentials_and_assignment_survive_atomic_state_replacement() {
             0o600
         );
     }
+    #[cfg(windows)]
+    {
+        // Inspect both the protected directory and the file inherited during atomic replacement.
+        let script = "$ErrorActionPreference='Stop'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; foreach($p in @($env:OTTER_STATE_ACL_PATH,(Join-Path $env:OTTER_STATE_ACL_PATH 'agent-state.json'))){$acl=Get-Acl -LiteralPath $p; $rules=@($acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])); if($rules.Count -ne 1 -or $rules[0].IdentityReference -ne $sid -or $rules[0].AccessControlType -ne 'Allow' -or $rules[0].FileSystemRights -ne 'FullControl'){throw 'State ACL must grant only the current user full control'}}";
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env("OTTER_STATE_ACL_PATH", &store.path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]

@@ -4,5 +4,8 @@
 !build.rs
 !src/
 !src/**
+!contracts/
+!contracts/**
 !lab/
 !lab/verify.py
+!lab/controller_verify.py
