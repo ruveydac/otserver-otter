@@ -228,14 +228,14 @@ fn parse(hardware: &[u8], identity: &[u8]) -> Result<Finding, String> {
         "identityResponse": hex(identity_response),
         "systemName": system_name,
         "version": version,
-        "serialClaim": {
+        "serialClaim": serial.as_ref().map(|serial| json!({
             "scope": "cpu",
             "issuer": "Siemens",
             "original": serial,
             "encoding": "s7-szl-text",
             "catalogNumber": module_type.as_ref().or(module.as_ref()),
             "normalizationVersion": 1,
-        },
+        })),
     });
     Ok(Finding {
         source: Source::S7,

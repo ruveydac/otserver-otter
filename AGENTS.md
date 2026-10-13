@@ -147,8 +147,10 @@ Its `tests/int/otter-client.int.spec.ts` also accepts an existing build via `OTT
 `MANAGEMENT/otserver-otter` with management dependencies installed; it builds/tests the controller,
 runs the HTTPS lab, and runs the entire management integration suite with the real client enabled.
 It owns a disposable Docker/Podman MongoDB replica set and must never reuse operator database URLs.
-Reports live under `lab/artifacts/controller.*/`. The remote-management workflow selects a compatible
-OTserver revision through `management_ref` or `OTTER_MANAGEMENT_REF` (default `main`).
+Reports live under `lab/artifacts/controller.*/` and record both source revisions plus the client
+binary digest. The remote-management workflow requires an explicit compatible OTserver revision
+through `management_ref` or the `OTTER_MANAGEMENT_REF` repository variable; it does not default to
+`main`. Otter releases also require this exact-pair gate.
 
 On Windows, the Fox TLS retry test requires a process context that can acquire Schannel outbound
 credentials. A restricted sandbox may return `SEC_E_NO_CREDENTIALS` before sending ClientHello;

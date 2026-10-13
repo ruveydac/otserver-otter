@@ -210,9 +210,9 @@ pub fn scan(
     let selected = windows_scan_interface(interface)?;
     let source = mac_bytes(source_mac)
         .ok_or_else(|| "A valid source MAC address is required.".to_string())?;
+    validate_source_mac(&selected, source_mac)?;
     let xid = new_xid();
     if npcap::available() {
-        validate_source_mac(&selected, source_mac)?;
         let request = identify_request(source, xid);
         let mut devices = BTreeMap::new();
         npcap::capture(&selected.name, &request, wait, cancelled, |frame| {
@@ -231,7 +231,7 @@ pub fn scan(
         if cancelled.load(Ordering::Relaxed) {
             break;
         }
-        if frame.len() < 14 || frame[12..14] != PROFINET_ETHERTYPE || frame[6..12] == source {
+        if !passive_frame_matches_interface(&frame, source) {
             continue;
         }
         if frame.len() >= 22
@@ -261,10 +261,14 @@ pub fn scan(
             ip_address: None,
             mac_address: Some(mac.clone()),
             fields,
-            raw: json!({ "capture": "pktmon", "etherType": "0x8892", "passive": true }),
+            raw: json!({
+                "capture": "pktmon",
+                "captureTarget": { "interface": selected.name, "macAddress": source_mac },
+                "etherType": "0x8892",
+                "passive": true,
+            }),
             warnings: vec![
-                "Observed passive PROFINET traffic; pktmon cannot transmit DCP Identify requests."
-                    .into(),
+                "Observed passive PROFINET traffic addressed to the selected adapter; pktmon cannot transmit DCP Identify requests.".into(),
             ],
         };
         insert_passive_dcp_device(
@@ -318,6 +322,14 @@ fn insert_passive_dcp_device(
         insert_dcp_device(devices, device)?;
     }
     Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn passive_frame_matches_interface(frame: &[u8], selected_mac: [u8; 6]) -> bool {
+    frame.len() >= 14
+        && frame[..6] == selected_mac
+        && frame[6..12] != selected_mac
+        && frame[12..14] == PROFINET_ETHERTYPE
 }
 
 fn add_pnio_warning(devices: &mut BTreeMap<String, Device>, error: String) {
@@ -1449,6 +1461,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(devices[&mac].ip_addresses, ["192.0.2.1"]);
+    }
+
+    #[test]
+    fn pktmon_passive_frames_require_the_selected_adapter_as_destination() {
+        let selected = [0, 1, 2, 3, 4, 5];
+        let remote = [6, 7, 8, 9, 10, 11];
+        let frame = |destination: [u8; 6], source: [u8; 6], ether_type: [u8; 2]| {
+            let mut packet = vec![0; 14];
+            packet[..6].copy_from_slice(&destination);
+            packet[6..12].copy_from_slice(&source);
+            packet[12..14].copy_from_slice(&ether_type);
+            packet
+        };
+
+        assert!(passive_frame_matches_interface(
+            &frame(selected, remote, PROFINET_ETHERTYPE),
+            selected,
+        ));
+        assert!(!passive_frame_matches_interface(
+            &frame([12, 13, 14, 15, 16, 17], remote, PROFINET_ETHERTYPE),
+            selected,
+        ));
+        assert!(!passive_frame_matches_interface(
+            &frame(selected, selected, PROFINET_ETHERTYPE),
+            selected,
+        ));
+        assert!(!passive_frame_matches_interface(
+            &frame(selected, remote, [0x08, 0x00]),
+            selected,
+        ));
+        assert!(!passive_frame_matches_interface(&[0; 13], selected));
     }
 
     fn pnio_record(

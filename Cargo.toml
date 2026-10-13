@@ -28,6 +28,7 @@ async-opcua = { version = "0.19", features = ["client"] }
 iec61850-client = { version = "0.2", default-features = false, features = ["std"] }
 iec61850-mms = { version = "0.2", default-features = false, features = ["std"] }
 iec61850-model = { version = "0.2", default-features = false, features = ["std"] }
+jsonschema = { version = "0.58.6", default-features = false }
 
 
 [target.'cfg(windows)'.dependencies]

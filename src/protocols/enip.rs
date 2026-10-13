@@ -44,6 +44,7 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
         return Ok(None);
     };
     if let Value::Object(raw) = &mut raw {
+        let scope = serial_scope(raw.get("deviceType").and_then(Value::as_u64).unwrap_or(0));
         raw.insert(
             "transportResponses".into(),
             responses
@@ -59,7 +60,7 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
         raw.insert(
             "serialClaim".into(),
             json!({
-                "scope": "adapter",
+                "scope": scope,
                 "issuer": fields.get("vendor"),
                 "manufacturerId": raw.get("vendorId"),
                 "original": fields.get("serialNumber"),
@@ -76,6 +77,14 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
         ports,
         warnings,
     }))
+}
+
+fn serial_scope(device_type: u64) -> &'static str {
+    match device_type {
+        12 => "adapter",
+        14 => "cpu",
+        _ => "device",
+    }
 }
 
 async fn tcp(target: Ipv4Addr) -> Result<Option<Vec<u8>>, String> {
@@ -234,6 +243,7 @@ mod tests {
         response[32..34].copy_from_slice(&2_u16.to_be_bytes());
         response[36..40].copy_from_slice(&[192, 0, 2, 1]);
         response[48..50].copy_from_slice(&1_u16.to_le_bytes());
+        response[50..52].copy_from_slice(&12_u16.to_le_bytes());
         response[52..54].copy_from_slice(&158_u16.to_le_bytes());
         response[54..56].copy_from_slice(&[3, 7]);
         response[58..62].copy_from_slice(&42_u32.to_le_bytes());
@@ -255,6 +265,13 @@ mod tests {
         assert!(parse(&response).is_ok());
         response[8] = 1;
         assert!(parse(&response).is_err());
+    }
+
+    #[test]
+    fn scopes_serial_claim_to_the_reported_device_type() {
+        for (device_type, expected_scope) in [(12, "adapter"), (14, "cpu"), (2, "device")] {
+            assert_eq!(serial_scope(device_type), expected_scope);
+        }
     }
 
     #[tokio::test]

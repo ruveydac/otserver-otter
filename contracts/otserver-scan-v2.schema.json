@@ -62,7 +62,8 @@
         "id": { "type": "string", "minLength": 1 },
         "name": { "type": "string", "minLength": 1 },
         "macAddress": { "$ref": "#/$defs/mac" },
-        "addresses": { "type": "array", "items": { "type": "string" } }
+        "addresses": { "type": "array", "items": { "type": "string" } },
+        "ipRoutePolicy": { "const": "operating-system" }
       }
     },
     "device": {
@@ -118,7 +119,7 @@
         "ipAddress": { "type": "string" },
         "macAddress": { "$ref": "#/$defs/mac" },
         "fields": { "type": "object", "additionalProperties": true },
-        "raw": { "type": ["object", "array", "string", "number", "boolean", "null"] },
+        "raw": { "$ref": "#/$defs/rawEvidence" },
         "warnings": { "type": "array", "items": { "type": "string" } }
       }
     },
@@ -165,6 +166,143 @@
         "interfaceKey": { "type": "string" },
         "portId": { "type": "string" },
         "portMac": { "$ref": "#/$defs/mac" }
+      }
+    },
+    "rawEvidence": {
+      "description": "Known identity evidence is validated; protocol-specific evidence remains opaque.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "observationId": { "type": "string", "format": "uuid" },
+            "subject": { "$ref": "#/$defs/subject" },
+            "serialClaim": {
+              "oneOf": [{ "$ref": "#/$defs/serialClaim" }, { "type": "null" }]
+            },
+            "identityComponentRef": { "type": "string", "minLength": 1 },
+            "physicalEntities": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/physicalEntity" }
+            },
+            "pnioRecords": { "type": "array", "items": { "$ref": "#/$defs/pnioRecord" } }
+          }
+        },
+        { "type": ["array", "string", "number", "boolean", "null"] }
+      ]
+    },
+    "subject": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["device", "endpoint", "opc-ua-asset", "logical-node"]
+        },
+        "macAddress": { "$ref": "#/$defs/mac" },
+        "ipAddress": { "type": "string", "minLength": 1 },
+        "nodeId": { "type": "string", "minLength": 1 },
+        "logicalDevice": { "type": "string", "minLength": 1 },
+        "logicalNode": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "device" } }, "required": ["kind"] },
+          "then": { "required": ["macAddress"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "endpoint" } }, "required": ["kind"] },
+          "then": { "required": ["ipAddress"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "opc-ua-asset" } }, "required": ["kind"] },
+          "then": { "required": ["nodeId"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "logical-node" } }, "required": ["kind"] },
+          "then": { "required": ["logicalDevice", "logicalNode"] }
+        }
+      ]
+    },
+    "serialClaim": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["scope", "original", "encoding", "normalizationVersion"],
+      "properties": {
+        "scope": {
+          "type": "string",
+          "enum": [
+            "device",
+            "adapter",
+            "cpu",
+            "module",
+            "chassis",
+            "stack",
+            "submodule",
+            "asset",
+            "physical-device",
+            "backplane",
+            "container",
+            "power-supply",
+            "fan",
+            "sensor",
+            "port",
+            "unknown"
+          ]
+        },
+        "componentRef": { "type": "string", "minLength": 1 },
+        "issuer": { "type": ["string", "null"] },
+        "manufacturerId": { "type": ["string", "integer", "null"] },
+        "original": { "type": "string", "minLength": 1 },
+        "encoding": { "type": "string", "minLength": 1 },
+        "normalizationVersion": { "type": "integer", "minimum": 1 },
+        "catalogNumber": { "type": ["string", "null"] }
+      }
+    },
+    "physicalEntity": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["ref"],
+      "properties": {
+        "ref": { "type": "string", "minLength": 1 },
+        "entPhysicalIndex": { "type": "string", "minLength": 1 },
+        "parentRef": { "type": ["string", "null"] },
+        "parentPosition": { "type": ["integer", "null"] },
+        "class": {
+          "type": ["string", "null"],
+          "enum": [
+            "chassis",
+            "backplane",
+            "container",
+            "power-supply",
+            "fan",
+            "sensor",
+            "module",
+            "submodule",
+            "port",
+            "stack",
+            "cpu",
+            "unknown",
+            null
+          ]
+        },
+        "serialClaim": {
+          "oneOf": [{ "$ref": "#/$defs/serialClaim" }, { "type": "null" }]
+        }
+      }
+    },
+    "pnioRecord": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["api", "slot", "subslot", "index", "parsed", "raw"],
+      "properties": {
+        "api": { "type": "integer", "minimum": 0 },
+        "slot": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "subslot": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "index": { "type": "string", "pattern": "^0x[0-9A-F]{4}$" },
+        "parsed": { "type": "object", "additionalProperties": true },
+        "raw": { "type": "string", "pattern": "^(?:[0-9A-F]{2})*$" }
       }
     },
     "link": {

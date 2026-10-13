@@ -122,6 +122,15 @@ At scan start, both the CLI and GUI read the selected interface's current MAC fo
 If `sourceMac` is stale (for example, after Wi-Fi MAC randomization), the scanner logs the replacement
 and uses the current MAC in requests and scan metadata.
 
+The selected interface is the Layer-2 capture/ARP/DCP selection. TCP/UDP, SNMP, and other native IP
+probes use the operating system's route table; selecting a capture adapter does not bind those probes
+to that interface. On a multi-homed host, configure routes for the target networks in the operating
+system. The scan's `interface` describes the selected capture interface, not every IP egress route.
+New exports state this explicitly as `scan.interface.ipRoutePolicy: "operating-system"`.
+When Windows uses pktmon, it captures all NICs; passive PROFINET frames are retained only when their
+Ethernet destination MAC matches the selected adapter, so an unattributed frame cannot become site
+inventory.
+
 The Windows executable exposes its build Git tag in Explorer file properties and in the GUI.
 Starting the GUI detaches its console window; CLI commands keep normal terminal input and output.
 
@@ -205,12 +214,11 @@ cargo build --locked --no-default-features
 python3 lab/controller_verify.py target/debug/otserver-otter
 ```
 
-The same check runs in `./lab/test.sh`. To run the real Rust client against OTserver's REST API and
-test replica set, from the management repository use:
+The same check runs in `./lab/test.sh`. To run the real Rust client against OTserver's REST API, from
+the management repository use:
 
 ```bash
-TEST_DATABASE_URL='mongodb://127.0.0.1:27018/otserver-test?replicaSet=rs0&directConnection=true' \
-  pnpm test:otter-client
+pnpm test:otter-client
 ```
 
 This builds the headless client and tests bare-loopback/explicit-HTTP enrollment, a complete managed
@@ -229,9 +237,8 @@ pnpm install --frozen-lockfile
 The runner requires Linux, Rust, Node.js 22, pnpm 10, Python 3, OpenSSL (including development
 headers for the Rust build), and Docker or Podman. It builds the headless client, runs all Rust
 controller tests and the HTTPS fault/recovery lab, then runs **the entire management integration
-suite** with `OTTER_CLIENT_BIN` set so real-client tests execute. It creates a disposable MongoDB 8
-replica set on a random loopback port, overrides database settings from the environment and `.env`,
-and removes the container and its volumes on success, failure, or interruption. Set
+replica set and unique upload directory, ignores caller and `.env` database settings, and removes only
+the resources it owns on success, failure, or interruption. Set
 `CONTAINER_RUNTIME=podman` to select a runtime explicitly.
 
 Coverage includes:

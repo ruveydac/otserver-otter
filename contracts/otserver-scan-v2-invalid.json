@@ -1,0 +1,17 @@
+{
+  "format": "otserver-scan",
+  "schemaVersion": 2,
+  "scanner": { "name": "OTserver Otter", "version": "0.4.0" },
+  "scan": {
+    "id": "scan-1",
+    "startedAt": "2026-10-13T09:00:00Z",
+    "finishedAt": "2026-10-13T09:01:00Z",
+    "targets": ["192.0.2.0/24"],
+    "interface": { "id": "test-interface", "name": "Test adapter" }
+  },
+  "devices": [],
+  "links": [],
+  "unresolved": [],
+  "warnings": [],
+  "errors": []
+}
