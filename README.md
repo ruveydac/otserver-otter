@@ -122,6 +122,15 @@ At scan start, both the CLI and GUI read the selected interface's current MAC fo
 If `sourceMac` is stale (for example, after Wi-Fi MAC randomization), the scanner logs the replacement
 and uses the current MAC in requests and scan metadata.
 
+The selected interface is the Layer-2 capture/ARP/DCP selection. TCP/UDP, SNMP, and other native IP
+probes use the operating system's route table; selecting a capture adapter does not bind those probes
+to that interface. On a multi-homed host, configure routes for the target networks in the operating
+system. The scan's `interface` describes the selected capture interface, not every IP egress route.
+New exports state this explicitly as `scan.interface.ipRoutePolicy: "operating-system"`.
+When Windows uses pktmon, it captures all NICs; passive PROFINET frames are retained only when their
+Ethernet destination MAC matches the selected adapter, so an unattributed frame cannot become site
+inventory.
+
 The Windows executable exposes its build Git tag in Explorer file properties and in the GUI.
 Starting the GUI detaches its console window; CLI commands keep normal terminal input and output.
 
@@ -136,6 +145,126 @@ Validate an export before uploading it:
 ```powershell
 .\otserver-otter.exe validate .\scan.otserver.json
 ```
+
+## Managed controller mode
+
+Local `scan`, GUI, executable-adjacent `otter.json` (including multiple profiles and legacy
+`otscanner.json` fallback), and user API-key uploads continue to work independently. Managed mode
+is a separate, outbound-only command; it does not load or modify that local configuration.
+
+Create a scanner in OTserver's **Manage Otters**, then redeem its single-use enrollment token:
+
+```bash
+otserver-otter controller --server-url https://otserver.example \
+  --enroll --ack-authorized
+# Supply the enrollment token on stdin, followed by Enter (or use protected input redirection).
+```
+
+The token is read from stdin rather than a command-line argument. HTTPS certificate validation is
+mandatory; only loopback URLs permit HTTP for development. No scanner-side listener is opened.
+Bare loopback addresses such as `127.0.0.1:3000`, `localhost:3000`, and `[::1]:3000` use HTTP;
+other hosts require an explicit `https://` URL. Match the manager's `OTSERVER_PUBLIC_URL`.
+Restart without `--enroll` to use the saved machine credential:
+
+```bash
+otserver-otter controller --server-url https://otserver.example --ack-authorized
+```
+
+- State defaults to `$XDG_STATE_HOME/otserver-otter` (or `~/.local/state/otserver-otter`) on Linux
+  and `%LOCALAPPDATA%\otserver-otter` on Windows. `--state-dir PATH` selects a dedicated location;
+  one process owns it at a time. Always run under the same OS account and state directory.
+- If a state directory belongs to a different controller URL, use `--enroll --overwrite-state-dir`
+  with a fresh enrollment token to replace its saved enrollment and run state. Existing scan exports
+  remain in the directory. The previous state is preserved if enrollment fails; restart afterward
+  without `--enroll` or `--overwrite-state-dir` to reuse the new credential.
+- Credentials use Linux Secret Service or Windows Credential Manager when available. Headless hosts
+  fall back to an atomic private state file; `--file-credentials` selects this explicitly. Unix
+  directories/files must be owned by the current user with modes 0700/0600. Windows ACLs restrict
+  state to the current user. Managed protocol credential snapshots stay in memory, not state files.
+- `--poll-seconds 30` sets the minimum polling interval (1–300 seconds); the server can request a
+  longer idle interval. Network/429/5xx failures use bounded exponential backoff with jitter up to
+  five minutes. Enrollment and polls report build version, capabilities, computer name, and capture
+  adapter technical/friendly names, descriptions, MAC addresses, and IPv4/IPv6 addresses. OTserver
+  stores this inventory with the scanner for adapter selection in its Payload profile editor.
+- Set an explicit capture `interface` in each profile on multi-adapter hosts. An omitted `sourceMac`
+  is obtained from the selected adapter. All managed scans retain the shared interface validation,
+  read-only protocol behavior, response validation, and process-wide traffic pacing.
+- Heartbeats report bounded stage progress every 15 seconds and renew the two-minute lease. Human
+  cancellation, lost lease, or a terminal/authentication response stops work safely and prevents
+  further upload. Managed output omits probe details and all controller bodies/credentials.
+- Assignment state is durable before starting discovery. Interrupted discovery is reconciled as
+  failed, never silently scanned again. Completed local exports resume byte-identical upload retries;
+  known import IDs resume finishing without another upload. Results remain as `RUN_ID.otserver.json`
+  in the private state directory, including on failure. Manage their retention as operator data.
+- Imports default to synchronous execution. `--queued-imports` requests queued execution and requires
+  `OTSERVER_QUEUED_IMPORTS=on` and healthy manager workers. Scanner completion is independent of import
+  completion: pending/running imports are checked by ID during idle polling; failed queued imports
+  receive at most one explicit retry by ID, without re-uploading terminal scan work.
+- Credentials rotate when less than 30 days remain. The new secret and state reference are durable
+  before replacing the old local credential. Authentication failure stops the agent; use management
+  re-enrollment and `--enroll` to recover. A lost enrollment/rotation response also requires
+  re-enrollment because the server consumes/revokes the prior token immediately.
+
+Controller v1 is independent of the unchanged schema-version-2 scan result contract. The HTTPS lab
+checks enrollment, rotation, restart/upload recovery, cancellation, rejected settings, queued import
+retry, redaction, and revocation:
+
+```bash
+cargo build --locked --no-default-features
+python3 lab/controller_verify.py target/debug/otserver-otter
+```
+
+The same check runs in `./lab/test.sh`. To run the real Rust client against OTserver's REST API, from
+the management repository use:
+
+```bash
+pnpm test:otter-client
+```
+
+This builds the headless client and tests bare-loopback/explicit-HTTP enrollment, a complete managed
+run/import, and saved-credential restart. To use an existing build, set `OTTER_CLIENT_BIN` and run
+`pnpm test:int tests/int/otter-client.int.spec.ts` directly.
+
+### Full remote-management CI/CD gate
+
+From a management checkout containing this repository at `otserver-otter/`, run:
+
+```bash
+pnpm install --frozen-lockfile
+./otserver-otter/lab/test-controller.sh
+```
+
+The runner requires Linux, Rust, Node.js 22, pnpm 10, Python 3, OpenSSL (including development
+headers for the Rust build), and Docker or Podman. It builds the headless client, runs all Rust
+controller tests and the HTTPS fault/recovery lab, then runs **the entire management integration
+replica set and unique upload directory, ignores caller and `.env` database settings, and removes only
+the resources it owns on success, failure, or interruption. Set
+`CONTAINER_RUNTIME=podman` to select a runtime explicitly.
+
+Coverage includes:
+
+| Area                           | Checks                                                                                                                               |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Enrollment and inventory       | Single-use tokens, controller URL validation, computer/adapters, saved-credential restart, explicit controller takeover              |
+| Configurations and credentials | All managed options, encrypted SNMP/OPC UA credentials, replace/clear, immutable snapshots, import overrides                         |
+| Run lifecycle                  | Manual runs, start, progress/heartbeats, completion/partial/failure, cancellation, lease expiry, interrupted-run recovery            |
+| Scheduling                     | Once, interval, cron/time zones, latest-only offline catch-up, occurrence deduplication                                              |
+| Imports                        | Real-client multipart REST upload, schema-v2 validation, sync/queued processing, idempotency, upload recovery, retry by import ID    |
+| Access and administration      | Role/site isolation, machine-principal restrictions, origin checks, audit redaction, rotation, revocation/re-enrollment, UI controls |
+
+The real-client REST tests use Payload's HTTP endpoints and the replica set; HTTPS failures and
+recovery use the local controller lab. UI controls are component-tested. These managed scans disable
+discovery probes; protocol interoperability remains covered by `./lab/test.sh` and `./lab/test-pnio.sh`.
+Stage logs, MongoDB logs, and the management JUnit report are saved under
+`lab/artifacts/controller.*/`. Any failed stage fails the gate.
+
+`.github/workflows/controller.yml` runs this gate on pull requests and pushes to `main`, and supports
+manual runs. It checks out `ruveydac/OTserver` alongside the exact Otter
+revision being tested and uploads reports even on failure. Set the repository variable
+`OTTER_MANAGEMENT_REF` to a compatible management branch/tag/SHA, or pass `management_ref` to a
+manual run; the default is `main`. The selected management revision must contain the
+controller-v1 integration tests. Release/tag runs require an explicit management revision through
+`OTTER_MANAGEMENT_REF`. Use **Full remote management** as a required pre-release check.
 
 ## Protocols and safety
 
@@ -256,11 +385,11 @@ OTserver importers must recognize the `netbios` source added to the schema-versi
 SMB and RPC probes work from both Linux and Windows and need no credentials or capture driver.
 They use the same authorized, paced, MAC-correlated target path as the other native probes.
 
-| Probe | Requests | Evidence |
-| --- | --- | --- |
-| SMB, TCP 445 | SMB2 NEGOTIATE (dialects 2.02, 2.10, 3.0, 3.02), one SPNEGO/NTLM Type 1 SESSION_SETUP | Negotiated dialect, signing mode, server GUID, computer/domain names, optional reported NT major/minor/build |
+| Probe                  | Requests                                                                                            | Evidence                                                                                                                   |
+| ---------------------- | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| SMB, TCP 445           | SMB2 NEGOTIATE (dialects 2.02, 2.10, 3.0, 3.02), one SPNEGO/NTLM Type 1 SESSION_SETUP               | Negotiated dialect, signing mode, server GUID, computer/domain names, optional reported NT major/minor/build               |
 | SMB1 fallback, TCP 445 | One fresh connection, NT LM 0.12 NEGOTIATE, at most one extended-security Type 1 SESSION_SETUP_ANDX | Same NTLM names/build evidence where reported; native OS/LAN-manager strings; classic-security negotiation/domain evidence |
-| RPC, TCP 135 | One endpoint-mapper v3 bind, NDR transfer syntax, NTLM Type 1 | Accepted EPM service, computer/domain names, optional reported NT major/minor/build |
+| RPC, TCP 135           | One endpoint-mapper v3 bind, NDR transfer syntax, NTLM Type 1                                       | Accepted EPM service, computer/domain names, optional reported NT major/minor/build                                        |
 
 Both stop at the server challenge: no NTLM Type 3, RPC AUTH3, completed login, share enumeration,
 endpoint enumeration, DCOM activation, or WMI/WinRM commands.

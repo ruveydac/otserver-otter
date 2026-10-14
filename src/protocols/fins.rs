@@ -1,6 +1,6 @@
 use super::{Finding, TIMEOUT, hex, port, text};
 use crate::contract::Source;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -160,16 +160,12 @@ fn parse(response: &[u8], offset: usize) -> Result<Parsed, String> {
         return Err("invalid controller response".into());
     }
     let code = u16::from_be_bytes([response[12 + offset], response[13 + offset]]);
-    let mut raw = Map::from_iter([
-        ("response".into(), json!(hex(response))),
-        ("responseCode".into(), json!(format!("{code:04X}"))),
-    ]);
     let mut fields = BTreeMap::from([
         ("protocols".into(), json!(["omron-fins"])),
         ("vendor".into(), json!("Omron")),
     ]);
     let mut warnings = Vec::new();
-    if code == 0 {
+    let mut raw = if code == 0 {
         let model = text(&response[14 + offset..34 + offset]);
         let version = text(&response[34 + offset..54 + offset]);
         if let Some(model) = &model {
@@ -179,42 +175,25 @@ fn parse(response: &[u8], offset: usize) -> Result<Parsed, String> {
         if let Some(version) = &version {
             fields.insert("firmwareVersion".into(), json!(version));
         }
-        raw.insert("controllerModel".into(), json!(model));
-        raw.insert("controllerVersion".into(), json!(version));
-        raw.extend(Map::from_iter([
-            (
-                "programAreaSize".into(),
-                json!(u16::from_be_bytes(
-                    response[94 + offset..96 + offset].try_into().unwrap()
-                )),
-            ),
-            ("iomSize".into(), json!(response[96 + offset])),
-            (
-                "dmWords".into(),
-                json!(u16::from_be_bytes(
-                    response[97 + offset..99 + offset].try_into().unwrap()
-                )),
-            ),
-            ("timerCounterSize".into(), json!(response[99 + offset])),
-            ("expansionDmSize".into(), json!(response[100 + offset])),
-            (
-                "steps".into(),
-                json!(u16::from_be_bytes(
-                    response[101 + offset..103 + offset].try_into().unwrap()
-                )),
-            ),
-            ("memoryCardKind".into(), json!(response[103 + offset])),
-            (
-                "memoryCardSize".into(),
-                json!(u16::from_be_bytes(
-                    response[104 + offset..106 + offset].try_into().unwrap()
-                )),
-            ),
-        ]));
+        json!({
+            "controllerModel": model,
+            "controllerVersion": version,
+            "programAreaSize": u16::from_be_bytes(response[94 + offset..96 + offset].try_into().unwrap()),
+            "iomSize": response[96 + offset],
+            "dmWords": u16::from_be_bytes(response[97 + offset..99 + offset].try_into().unwrap()),
+            "timerCounterSize": response[99 + offset],
+            "expansionDmSize": response[100 + offset],
+            "steps": u16::from_be_bytes(response[101 + offset..103 + offset].try_into().unwrap()),
+            "memoryCardKind": response[103 + offset],
+            "memoryCardSize": u16::from_be_bytes(response[104 + offset..106 + offset].try_into().unwrap()),
+        })
     } else {
         warnings.push(format!("Controller returned FINS status {code:04X}."));
-    }
-    Ok((fields, Value::Object(raw), warnings))
+        json!({})
+    };
+    raw["response"] = json!(hex(response));
+    raw["responseCode"] = json!(format!("{code:04X}"));
+    Ok((fields, raw, warnings))
 }
 
 #[cfg(test)]
@@ -235,10 +214,22 @@ mod tests {
 
     #[test]
     fn parses_controller_identity() {
-        let response = controller_response();
-        let (fields, _, _) = parse(&response, 0).unwrap();
+        let mut response = controller_response();
+        response[94..106]
+            .copy_from_slice(&[0x12, 0x34, 2, 0x56, 0x78, 3, 4, 0x9a, 0xbc, 5, 0xde, 0xf0]);
+        let (fields, raw, _) = parse(&response, 0).unwrap();
         assert_eq!(fields["model"], "CJ2M-CPU32");
         assert_eq!(fields["firmwareVersion"], "02.01");
+        assert_eq!(
+            raw,
+            json!({
+                "response": hex(&response), "responseCode": "0000",
+                "controllerModel": "CJ2M-CPU32", "controllerVersion": "02.01",
+                "programAreaSize": 0x1234, "iomSize": 2, "dmWords": 0x5678,
+                "timerCounterSize": 3, "expansionDmSize": 4, "steps": 0x9abc,
+                "memoryCardKind": 5, "memoryCardSize": 0xdef0,
+            })
+        );
     }
 
     #[test]
@@ -249,9 +240,11 @@ mod tests {
         response[9] = 0xef;
         response[10..12].copy_from_slice(&[5, 1]);
         response[12..14].copy_from_slice(&1_u16.to_be_bytes());
+        let (_, raw, warnings) = parse(&response, 0).unwrap();
+        assert_eq!(warnings[0], "Controller returned FINS status 0001.");
         assert_eq!(
-            parse(&response, 0).unwrap().2[0],
-            "Controller returned FINS status 0001."
+            raw,
+            json!({"response": hex(&response), "responseCode": "0001"})
         );
         response[10] = 4;
         assert!(parse(&response, 0).is_err());

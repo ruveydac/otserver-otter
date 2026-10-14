@@ -8,3 +8,5 @@ otserver-scan.json
 __pycache__/
 coverage/
 pki/
+agent-state.json
+agent.lock

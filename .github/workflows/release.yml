@@ -3,7 +3,7 @@ name: Release Otter
 on:
   push:
     tags:
-      - "v*"
+      - 'v*'
 
 permissions:
   contents: write
@@ -23,8 +23,14 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: ./lab/test.sh
 
-  build-linux:
+  controller:
     needs: verify
+    uses: ./.github/workflows/controller.yml
+    with:
+      management_ref: ${{ vars.OTTER_MANAGEMENT_REF }}
+
+  build-linux:
+    needs: [verify, controller]
     runs-on: ubuntu-latest
     env:
       OTTER_BUILD_VERSION: ${{ github.ref_name }}
@@ -41,7 +47,7 @@ jobs:
           path: otserver-otter-linux-x86_64.tar.gz
 
   build-linux-arm64:
-    needs: verify
+    needs: [verify, controller]
     runs-on: ubuntu-24.04-arm
     container: rust:1.89-bookworm
     env:
@@ -59,7 +65,7 @@ jobs:
           path: otserver-otter-linux-aarch64.tar.gz
 
   build-windows:
-    needs: verify
+    needs: [verify, controller]
     runs-on: windows-latest
     env:
       OTTER_BUILD_VERSION: ${{ github.ref_name }}

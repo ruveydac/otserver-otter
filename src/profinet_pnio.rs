@@ -1,3 +1,5 @@
+use crate::contract::hex;
+use crate::discovery::checksum;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
@@ -15,7 +17,6 @@ const MAX_RPC_BODY_LENGTH: usize = MAX_RECORD_DATA_LENGTH as usize + 128;
 
 const EPM_INTERFACE: &str = "e1af8308-5d1f-11c9-91a4-08002b14a0fa";
 const PNIO_INTERFACE: &str = "dea00001-6c97-11d1-8271-00a02442df7d";
-const NIL_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RecordTarget {
@@ -36,19 +37,10 @@ impl RecordTarget {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EpmHandle {
     entry: u32,
     uuid: Uuid,
-}
-
-impl Default for EpmHandle {
-    fn default() -> Self {
-        Self {
-            entry: 0,
-            uuid: uuid(NIL_UUID),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -434,8 +426,8 @@ pub(crate) fn ethernet_ipv4_udp_frame(
     udp.extend(udp_length_u16.to_be_bytes());
     udp.extend([0, 0]);
     udp.extend(payload);
-    let checksum = transport_checksum(source_ip, destination_ip, 17, &udp);
-    udp[6..8].copy_from_slice(&checksum.to_be_bytes());
+    let udp_checksum = transport_checksum(source_ip, destination_ip, 17, &udp);
+    udp[6..8].copy_from_slice(&udp_checksum.to_be_bytes());
 
     let mut ip = vec![0; 20];
     ip[0] = 0x45;
@@ -446,8 +438,8 @@ pub(crate) fn ethernet_ipv4_udp_frame(
     ip[9] = 17;
     ip[12..16].copy_from_slice(&source_ip.octets());
     ip[16..20].copy_from_slice(&destination_ip.octets());
-    let checksum = internet_checksum(&ip);
-    ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+    let ip_checksum = checksum(&ip);
+    ip[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
 
     let mut frame = Vec::with_capacity(14 + ip.len() + udp.len());
     frame.extend(destination_mac);
@@ -476,7 +468,7 @@ pub(crate) fn parse_ipv4_udp_frame(frame: &[u8]) -> Option<UdpFrame<'_>> {
     if header_length < 20 || total_length < header_length + 8 || total_length > ip.len() {
         return None;
     }
-    if internet_checksum(&ip[..header_length]) != 0 {
+    if checksum(&ip[..header_length]) != 0 {
         return None;
     }
     let udp = &ip[header_length..total_length];
@@ -514,21 +506,7 @@ fn transport_checksum(
     data.extend([0, protocol]);
     data.extend((payload.len() as u16).to_be_bytes());
     data.extend(payload);
-    internet_checksum(&data)
-}
-
-fn internet_checksum(data: &[u8]) -> u16 {
-    let (pairs, remainder) = data.as_chunks::<2>();
-    let mut sum = pairs.iter().fold(0_u32, |sum, pair| {
-        sum + u32::from(u16::from_be_bytes(*pair))
-    });
-    if let Some(byte) = remainder.first() {
-        sum += u32::from(*byte) << 8;
-    }
-    while sum > 0xFFFF {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !(sum as u16)
+    checksum(&data)
 }
 
 pub(crate) fn build_epm_request(
@@ -539,7 +517,7 @@ pub(crate) fn build_epm_request(
     let mut body = Vec::with_capacity(76);
     put_u32(&mut body, 0, false); // Read all registered interfaces.
     put_u32(&mut body, 1, false); // Non-null object pointer.
-    put_uuid(&mut body, uuid(NIL_UUID), false);
+    put_uuid(&mut body, Uuid::nil(), false);
     put_u32(&mut body, 2, false); // Non-null interface pointer.
     put_uuid(&mut body, uuid(PNIO_INTERFACE), false);
     put_u16(&mut body, 1, false);
@@ -554,7 +532,7 @@ pub(crate) fn build_epm_request(
         0,
         0x20,
         false,
-        uuid(NIL_UUID),
+        Uuid::nil(),
         uuid(EPM_INTERFACE),
         activity_uuid,
         3,
@@ -592,14 +570,14 @@ pub(crate) fn build_read_request(
     put_u16(&mut body, 60, true);
     body.extend([1, 0]);
     put_u16(&mut body, 0, true);
-    put_uuid(&mut body, uuid(NIL_UUID), true);
+    put_uuid(&mut body, Uuid::nil(), true);
     put_u32(&mut body, target.api, true);
     put_u16(&mut body, target.slot, true);
     put_u16(&mut body, target.subslot, true);
     put_u16(&mut body, 0, true);
     put_u16(&mut body, target.index, true);
     put_u32(&mut body, data_length, true);
-    put_uuid(&mut body, uuid(NIL_UUID), true);
+    put_uuid(&mut body, Uuid::nil(), true);
     body.extend([0; 8]);
 
     let header = RpcHeader::new(
@@ -1366,14 +1344,11 @@ impl<'a> Cursor<'a> {
 }
 
 fn put_uuid(target: &mut Vec<u8>, value: Uuid, big_endian: bool) {
-    let bytes = value.into_bytes();
-    if big_endian {
-        target.extend(bytes);
+    target.extend(if big_endian {
+        value.into_bytes()
     } else {
-        target.extend([bytes[3], bytes[2], bytes[1], bytes[0]]);
-        target.extend([bytes[5], bytes[4], bytes[7], bytes[6]]);
-        target.extend(&bytes[8..]);
-    }
+        value.to_bytes_le()
+    });
 }
 
 fn parse_uuid(bytes: &[u8], big_endian: bool) -> Result<Uuid, String> {
@@ -1381,14 +1356,11 @@ fn parse_uuid(bytes: &[u8], big_endian: bool) -> Result<Uuid, String> {
         return Err("UUID was truncated.".into());
     }
     if big_endian {
-        return Uuid::from_slice(bytes).map_err(|_| "UUID was invalid.".to_string());
+        Uuid::from_slice(bytes)
+    } else {
+        Uuid::from_slice_le(bytes)
     }
-    let mut value = [0; 16];
-    value[..4].copy_from_slice(&[bytes[3], bytes[2], bytes[1], bytes[0]]);
-    value[4..6].copy_from_slice(&[bytes[5], bytes[4]]);
-    value[6..8].copy_from_slice(&[bytes[7], bytes[6]]);
-    value[8..].copy_from_slice(&bytes[8..]);
-    Ok(Uuid::from_bytes(value))
+    .map_err(|_| "UUID was invalid.".to_string())
 }
 
 fn uuid(value: &str) -> Uuid {
@@ -1464,13 +1436,37 @@ fn software_revision(data: &[u8]) -> String {
     }
 }
 
-fn hex(data: &[u8]) -> String {
-    data.iter().map(|byte| format!("{byte:02X}")).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uuid_wire_order_matches_dce_rpc() {
+        let value = uuid("00112233-4455-6677-8899-aabbccddeeff");
+        for (big_endian, expected) in [
+            (
+                true,
+                [
+                    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+                    0xdd, 0xee, 0xff,
+                ],
+            ),
+            (
+                false,
+                [
+                    0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+                    0xdd, 0xee, 0xff,
+                ],
+            ),
+        ] {
+            let mut encoded = Vec::new();
+            put_uuid(&mut encoded, value, big_endian);
+            assert_eq!(encoded, expected);
+            assert_eq!(parse_uuid(&expected, big_endian).unwrap(), value);
+            assert!(parse_uuid(&expected[..15], big_endian).is_err());
+        }
+        assert_eq!(EpmHandle::default().uuid, Uuid::nil());
+    }
 
     fn endpoint(big_endian: bool) -> RpcEndpoint {
         RpcEndpoint {
@@ -1500,7 +1496,7 @@ mod tests {
         put_u16(&mut body, 60, true);
         body.extend([1, 0]);
         put_u16(&mut body, 0, true);
-        put_uuid(&mut body, uuid(NIL_UUID), true);
+        put_uuid(&mut body, Uuid::nil(), true);
         put_u32(&mut body, request.api, true);
         put_u16(&mut body, request.slot, true);
         put_u16(&mut body, request.subslot, true);
@@ -1703,7 +1699,7 @@ mod tests {
             2,
             0x02,
             false,
-            uuid(NIL_UUID),
+            Uuid::nil(),
             uuid(EPM_INTERFACE),
             request.activity_uuid,
             3,

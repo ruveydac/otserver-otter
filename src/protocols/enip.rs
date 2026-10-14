@@ -1,6 +1,6 @@
 use super::{Finding, TIMEOUT, hex, port, text};
 use crate::contract::Source;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -44,6 +44,7 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
         return Ok(None);
     };
     if let Value::Object(raw) = &mut raw {
+        let scope = serial_scope(raw.get("deviceType").and_then(Value::as_u64).unwrap_or(0));
         raw.insert(
             "transportResponses".into(),
             responses
@@ -59,12 +60,12 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
         raw.insert(
             "serialClaim".into(),
             json!({
-                "scope": "adapter",
+                "scope": scope,
                 "issuer": fields.get("vendor"),
                 "manufacturerId": raw.get("vendorId"),
                 "original": fields.get("serialNumber"),
                 "encoding": "cip-uint32-hex",
-                "catalogNumber": raw.get("productCode"),
+                "catalogNumber": raw.get("productCode").and_then(Value::as_u64).map(|code| code.to_string()),
                 "normalizationVersion": 1,
             }),
         );
@@ -76,6 +77,14 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
         ports,
         warnings,
     }))
+}
+
+fn serial_scope(device_type: u64) -> &'static str {
+    match device_type {
+        12 => "adapter",
+        14 => "cpu",
+        _ => "device",
+    }
 }
 
 async fn tcp(target: Ipv4Addr) -> Result<Option<Vec<u8>>, String> {
@@ -194,18 +203,18 @@ fn parse(response: &[u8]) -> Result<(BTreeMap<String, Value>, Value), String> {
     if let Some(vendor) = vendor(vendor_id) {
         fields.insert("vendor".into(), json!(vendor));
     }
-    let raw = Value::Object(Map::from_iter([
-        ("deviceIp".into(), json!(device_ip)),
-        ("deviceType".into(), json!(device_type)),
-        ("productCode".into(), json!(product_code)),
-        ("productName".into(), json!(product_name)),
-        ("response".into(), json!(hex(response))),
-        ("revision".into(), json!(revision)),
-        ("serialNumber".into(), json!(format!("{serial:08X}"))),
-        ("state".into(), json!(state)),
-        ("status".into(), json!(status)),
-        ("vendorId".into(), json!(vendor_id)),
-    ]));
+    let raw = json!({
+        "deviceIp": device_ip,
+        "deviceType": device_type,
+        "productCode": product_code,
+        "productName": product_name,
+        "response": hex(response),
+        "revision": revision,
+        "serialNumber": format!("{serial:08X}"),
+        "state": state,
+        "status": status,
+        "vendorId": vendor_id,
+    });
     Ok((fields, raw))
 }
 
@@ -234,6 +243,7 @@ mod tests {
         response[32..34].copy_from_slice(&2_u16.to_be_bytes());
         response[36..40].copy_from_slice(&[192, 0, 2, 1]);
         response[48..50].copy_from_slice(&1_u16.to_le_bytes());
+        response[50..52].copy_from_slice(&12_u16.to_le_bytes());
         response[52..54].copy_from_slice(&158_u16.to_le_bytes());
         response[54..56].copy_from_slice(&[3, 7]);
         response[58..62].copy_from_slice(&42_u32.to_le_bytes());
@@ -255,6 +265,13 @@ mod tests {
         assert!(parse(&response).is_ok());
         response[8] = 1;
         assert!(parse(&response).is_err());
+    }
+
+    #[test]
+    fn scopes_serial_claim_to_the_reported_device_type() {
+        for (device_type, expected_scope) in [(12, "adapter"), (14, "cpu"), (2, "device")] {
+            assert_eq!(serial_scope(device_type), expected_scope);
+        }
     }
 
     #[tokio::test]
@@ -288,6 +305,15 @@ mod tests {
             2
         );
         assert_eq!(finding.raw["serialClaim"]["scope"], "adapter");
+        assert_eq!(finding.raw["serialClaim"]["catalogNumber"], "158");
+        let mut scan: crate::contract::ScanExport =
+            serde_json::from_str(include_str!("../../contracts/otserver-scan-v2-valid.json"))
+                .unwrap();
+        let observation = &mut scan.devices[0].observations[0];
+        observation.source = finding.source;
+        observation.fields = finding.fields;
+        observation.raw = finding.raw;
+        crate::contract::validate(&scan).unwrap();
         tcp_task.await.unwrap();
         udp_task.await.unwrap();
     }

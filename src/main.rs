@@ -1,3 +1,4 @@
+mod controller;
 #[cfg(feature = "gui")]
 pub mod gui;
 use clap::{ArgAction, Args, Parser, Subcommand};
@@ -51,6 +52,8 @@ pub enum Commands {
         json: bool,
     },
     Scan(ScanArgs),
+    /// Run an outbound-only, centrally managed scanner.
+    Controller(controller::ControllerArgs),
     Validate {
         file: PathBuf,
     },
@@ -349,6 +352,7 @@ async fn main() {
 
 async fn run() -> Result<(), String> {
     match Cli::parse().command {
+        Some(Commands::Controller(args)) => controller::run(args).await,
         Some(Commands::Doctor) => doctor(),
         Some(Commands::Interfaces { json }) => {
             let devices = profinet::interfaces()?;
@@ -1236,6 +1240,7 @@ fn scan_interface_ref(
         name: selected.into(),
         mac_address: otserver_otter::contract::normalize_mac(source_mac),
         addresses,
+        ip_route_policy: Some("operating-system".into()),
     }
 }
 
@@ -1571,30 +1576,8 @@ mod tests {
 
     fn args() -> ScanArgs {
         ScanArgs {
-            targets: vec![],
-            interface: None,
-            source_mac: None,
-            output: None,
             ack_authorized: true,
-            no_protocols: false,
-            no_arp: false,
-            no_profinet: false,
-            allow_dcp_source: false,
-            no_s7: false,
-            no_enip: false,
-            no_bacnet: false,
-            no_fins: false,
-            no_fox: false,
-            no_dnp3: false,
-            no_iec61850: false,
-            no_netbios: false,
-            no_smb: false,
-            no_rpc: false,
-            no_opcua: false,
-            no_snmp: false,
-            no_lldp: false,
-            server_url: None,
-            site: None,
+            ..ScanArgs::default()
         }
     }
 
@@ -2291,6 +2274,10 @@ mod tests {
         assert_eq!(metadata.addresses, ["192.0.2.10", "2001:db8::1"]);
         assert_eq!(metadata.mac_address.as_deref(), Some("00:11:22:33:44:55"));
         assert_eq!(metadata.id, "Cell A");
+        assert_eq!(
+            metadata.ip_route_policy.as_deref(),
+            Some("operating-system")
+        );
         assert!(
             scan_interface_ref("missing", "00:11:22:33:44:55", &interfaces)
                 .addresses

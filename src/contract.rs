@@ -46,6 +46,8 @@ pub struct InterfaceRef {
     pub mac_address: Option<String>,
     #[serde(default)]
     pub addresses: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_route_policy: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -291,6 +293,16 @@ pub fn validate(scan: &ScanExport) -> Result<(), String> {
         }
     }
     let value = serde_json::to_value(scan).map_err(|error| error.to_string())?;
+    let schema: Value =
+        serde_json::from_str(include_str!("../contracts/otserver-scan-v2.schema.json"))
+            .map_err(|error| format!("Invalid canonical scan schema: {error}"))?;
+    let validator = jsonschema::draft202012::options()
+        .should_validate_formats(true)
+        .build(&schema)
+        .map_err(|error| format!("Invalid canonical scan schema: {error}"))?;
+    validator
+        .validate(&value)
+        .map_err(|error| format!("Scan export does not match the canonical schema: {error}"))?;
     reject_secrets(&value, "")
 }
 
@@ -347,7 +359,7 @@ mod tests {
                 npcap_version: None,
             },
             scan: ScanInfo {
-                id: "scan-1".into(),
+                id: uuid::Uuid::new_v4().to_string(),
                 started_at: "2026-08-11T00:00:00Z".into(),
                 finished_at: "2026-08-11T00:01:00Z".into(),
                 targets: vec!["192.0.2.0/24".into()],
@@ -356,6 +368,7 @@ mod tests {
                     name: "test".into(),
                     mac_address: None,
                     addresses: vec![],
+                    ip_route_policy: None,
                 },
                 partial: false,
             },
@@ -440,6 +453,23 @@ mod tests {
         assert!(reject_secrets(&json!({ "nested": [{ "password": "secret" }] }), "").is_err());
         assert!(reject_secrets(&json!([1, "safe"]), "").is_ok());
         assert_eq!(hex(&[0xaa, 0x01]), "AA01");
+    }
+
+    #[test]
+    fn validates_shared_nonempty_fixtures_against_the_canonical_schema() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../contracts/otserver-scan-v2-valid.json")).unwrap();
+        let valid: ScanExport = serde_json::from_value(fixture.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&valid).unwrap(), fixture);
+        assert!(validate(&valid).is_ok());
+        assert_eq!(valid.devices.len(), 2);
+        assert_eq!(valid.links.len(), 1);
+
+        let invalid: ScanExport =
+            serde_json::from_str(include_str!("../contracts/otserver-scan-v2-invalid.json"))
+                .unwrap();
+        let error = validate(&invalid).unwrap_err();
+        assert!(error.contains("canonical schema") && error.contains("uuid"));
     }
 
     #[test]
