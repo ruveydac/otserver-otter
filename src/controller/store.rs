@@ -29,7 +29,9 @@ impl Store {
         if !directory.exists() {
             std::fs::create_dir_all(directory.parent().ok_or(Error::Invalid)?)
                 .map_err(|_| Error::Local("Could not create managed state parent directory."))?;
-            let mut builder = std::fs::DirBuilder::new();
+            let builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            let mut builder = builder;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::DirBuilderExt;
@@ -227,18 +229,109 @@ fn check_private(path: &Path, directory: bool) -> Result<(), Error> {
 
 #[cfg(windows)]
 fn restrict_windows(path: &Path) -> Result<(), Error> {
-    // Replace only the DACL: copying Get-Acl also attempts to write owner/group metadata.
-    // Use a fixed script and an environment path; no credentials or untrusted code in the command.
-    let script = "$ErrorActionPreference='Stop'; $p=$env:OTTER_STATE_ACL_PATH; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; if((Get-Item -LiteralPath $p).PSIsContainer){$acl=[System.Security.AccessControl.DirectorySecurity]::new(); $rule=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')}else{$acl=[System.Security.AccessControl.FileSecurity]::new(); $rule=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','Allow')}; $acl.SetAccessRuleProtection($true,$false); $acl.AddAccessRule($rule); Set-Acl -LiteralPath $p -AclObject $acl";
-    let output = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .env("OTTER_STATE_ACL_PATH", path)
-        .output()
-        .map_err(|_| Error::Local("Could not restrict scanner state ACL."))?;
-    if !output.status.success() {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW,
+        SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
+        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+    let user = windows_token_user()?;
+    let directory = std::fs::metadata(path)
+        .map_err(|_| Error::Local("Could not inspect private scanner state."))?
+        .is_dir();
+    let mut name: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if name.contains(&0) {
+        return Err(Error::Invalid);
+    }
+    name.push(0);
+    // SAFETY: windows_token_user returns a successful TOKEN_USER in a pointer-aligned buffer.
+    // Its SID storage remains alive until SetEntriesInAclW has copied it into the new ACL.
+    let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let access = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: FILE_ALL_ACCESS,
+        grfAccessMode: SET_ACCESS,
+        grfInheritance: if directory {
+            CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
+        } else {
+            0
+        },
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_USER,
+            ptstrName: sid.cast(),
+        },
+    };
+    let mut acl = null_mut();
+    // SAFETY: access contains a valid SID; a null old ACL builds a user-only ACL.
+    if unsafe { SetEntriesInAclW(1, &access, null(), &mut acl) } != 0 {
+        return Err(Error::Local(
+            "Could not construct private scanner state ACL.",
+        ));
+    }
+    // SAFETY: name is NUL-terminated and acl is owned by this call. Only the DACL is changed;
+    // owner, group and SACL are untouched. Protection removes inherited access from parents.
+    let status = unsafe {
+        let status = SetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            acl,
+            null(),
+        );
+        LocalFree(acl.cast());
+        status
+    };
+    if status != 0 {
         return Err(Error::Local("Could not restrict scanner state ACL."));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+pub(super) fn windows_token_user() -> Result<Box<[usize; 32]>, Error> {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TokenUser};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = null_mut();
+    // SAFETY: the process pseudo-handle is valid and token points to writable handle storage.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(Error::Local("Could not query scanner state owner token."));
+    }
+    // TOKEN_USER plus SECURITY_MAX_SID_SIZE (68 bytes) fits even on 32-bit Windows.
+    // usize storage supplies the alignment required by TOKEN_USER's pointer fields.
+    // Keep the allocation stable: TOKEN_USER contains a pointer into this buffer.
+    let mut user = Box::new([0usize; 32]);
+    let mut length = 0;
+    // SAFETY: the token is valid and the aligned buffer's full size is supplied. CloseHandle
+    // releases the token on both paths; the returned SID is copied into user, not token-owned.
+    let success = unsafe {
+        let success = GetTokenInformation(
+            token,
+            TokenUser,
+            user.as_mut_ptr().cast(),
+            std::mem::size_of_val(user.as_ref()) as u32,
+            &mut length,
+        );
+        CloseHandle(token);
+        success
+    };
+    if success == 0 {
+        return Err(Error::Local("Could not read scanner state owner SID."));
+    }
+    Ok(user)
 }
 
 #[cfg(not(windows))]

@@ -263,7 +263,8 @@ manual runs. It checks out `ruveydac/OTserver` alongside the exact Otter
 revision being tested and uploads reports even on failure. Set the repository variable
 `OTTER_MANAGEMENT_REF` to a compatible management branch/tag/SHA, or pass `management_ref` to a
 manual run; the default is `main`. The selected management revision must contain the
-controller-v1 integration tests. Use **Full remote management** as a required pre-release check.
+controller-v1 integration tests. Release/tag runs require an explicit management revision through
+`OTTER_MANAGEMENT_REF`. Use **Full remote management** as a required pre-release check.
 
 ## Protocols and safety
 

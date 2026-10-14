@@ -25,8 +25,11 @@ jobs:
     name: Full remote management
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      MANAGEMENT_REF: ${{ inputs.management_ref || vars.OTTER_MANAGEMENT_REF || 'main' }}
     steps:
-      - name: Require an explicit management revision
+      - name: Require an explicit management revision for releases
+        if: startsWith(github.ref, 'refs/tags/')
         env:
           MANAGEMENT_REF: ${{ inputs.management_ref || vars.OTTER_MANAGEMENT_REF }}
         run: test -n "$MANAGEMENT_REF"
@@ -34,7 +37,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ruveydac/OTserver
-          ref: ${{ inputs.management_ref || vars.OTTER_MANAGEMENT_REF }}
+          ref: ${{ env.MANAGEMENT_REF }}
           path: management
           persist-credentials: false
       - name: Checkout the Otter revision under test

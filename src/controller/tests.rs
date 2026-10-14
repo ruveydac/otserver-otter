@@ -396,18 +396,64 @@ fn file_credentials_and_assignment_survive_atomic_state_replacement() {
     }
     #[cfg(windows)]
     {
-        // Inspect both the protected directory and the file inherited during atomic replacement.
-        let script = "$ErrorActionPreference='Stop'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; foreach($p in @($env:OTTER_STATE_ACL_PATH,(Join-Path $env:OTTER_STATE_ACL_PATH 'agent-state.json'))){$acl=Get-Acl -LiteralPath $p; $rules=@($acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])); if($rules.Count -ne 1 -or $rules[0].IdentityReference -ne $sid -or $rules[0].AccessControlType -ne 'Allow' -or $rules[0].FileSystemRights -ne 'FullControl'){throw 'State ACL must grant only the current user full control'}}";
-        let output = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", script])
-            .env("OTTER_STATE_ACL_PATH", &store.path)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr::{addr_of, null_mut};
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+            GetSecurityDescriptorControl, SE_DACL_PROTECTED, TOKEN_USER,
+        };
+        use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+        let user = store::windows_token_user().unwrap();
+        for path in [&store.path, &store.path.join("agent-state.json")] {
+            let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let mut acl = null_mut();
+            let mut descriptor = null_mut();
+            // SAFETY: the path is NUL-terminated; output pointers remain valid for the call.
+            assert_eq!(
+                unsafe {
+                    GetNamedSecurityInfoW(
+                        name.as_ptr(),
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION,
+                        null_mut(),
+                        null_mut(),
+                        &mut acl,
+                        null_mut(),
+                        &mut descriptor,
+                    )
+                },
+                0
+            );
+            let mut ace = null_mut();
+            let mut control = 0;
+            let mut revision = 0;
+            // SAFETY: GetNamedSecurityInfoW owns descriptor and its ACL/ACE until LocalFree.
+            // GetAce is checked before reading the access-allowed ACE and its inline SID.
+            let private = unsafe {
+                let private = !acl.is_null()
+                    && (*acl).AceCount == 1
+                    && GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) != 0
+                    && control & SE_DACL_PROTECTED != 0
+                    && GetAce(acl, 0, &mut ace) != 0
+                    && (*ace.cast::<ACCESS_ALLOWED_ACE>()).Header.AceType == 0
+                    && (*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask == FILE_ALL_ACCESS
+                    && EqualSid(
+                        addr_of!((*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart)
+                            .cast_mut()
+                            .cast(),
+                        (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid,
+                    ) != 0;
+                LocalFree(descriptor);
+                private
+            };
+            assert!(
+                private,
+                "State ACL must grant only the current user full control: {path:?}"
+            );
+        }
     }
 }
 
