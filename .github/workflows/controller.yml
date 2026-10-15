@@ -13,9 +13,9 @@ on:
   workflow_call:
     inputs:
       management_ref:
-        description: 'Exact OTserver branch, tag, or SHA to test with this Otter revision'
+        description: 'OTserver branch, tag, or SHA (defaults to OTTER_MANAGEMENT_REF, then main)'
         type: string
-        required: true
+        required: false
 
 permissions:
   contents: read
@@ -28,11 +28,6 @@ jobs:
     env:
       MANAGEMENT_REF: ${{ inputs.management_ref || vars.OTTER_MANAGEMENT_REF || 'main' }}
     steps:
-      - name: Require an explicit management revision for releases
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          MANAGEMENT_REF: ${{ inputs.management_ref || vars.OTTER_MANAGEMENT_REF }}
-        run: test -n "$MANAGEMENT_REF"
       - name: Checkout OTserver management
         uses: actions/checkout@v6
         with:
