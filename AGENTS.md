@@ -14,6 +14,8 @@ SNMP GET/WALK, and LLDP. It exports
 `otserver-scan` schema-version-2 JSON for OTserver.
 
 The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
+Contract changes require coordinated updates in OTserver's importer. Product overview and first-scan
+instructions are in `README.md`; detailed operator and development guidance follows here.
 
 ## Safety Rules
 
@@ -112,6 +114,217 @@ The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
 - If Npcap is unavailable, passive Windows discovery uses Microsoft pktmon.
 - Preserve the current OPC UA limits: SecurityPolicy None, no continuation points, batches of at
   most 64 reads, no certificate authentication, and default ports 4840, 4841, and 48400.
+
+### Platform operation and release builds
+
+- The selected interface controls Layer-2 capture, ARP, and DCP. IP probes use the operating system's
+  route table, not an interface binding. Multi-homed hosts need suitable OS routes. Export this as
+  `scan.interface.ipRoutePolicy: "operating-system"`. Windows pktmon captures all NICs; retain passive
+  PROFINET frames only when their destination MAC matches the selected adapter.
+- Npcap is installed separately, never during a scan. Its free license permits up to five
+  installations but not redistribution; larger or bundled deployments need appropriate OEM licensing.
+  Otter does not use or modify a TAP adapter or Windows Network Bridge.
+- Raspberry Pi releases use `otserver-otter-linux-aarch64.tar.gz` for Pi 3, 4, 5, and Zero 2 W with
+  64-bit Raspberry Pi OS Bookworm or newer and `libssl3`. They are headless. Build natively with
+  `cargo build --locked --release --no-default-features`.
+- Build Windows with `cargo build --release --target x86_64-pc-windows-msvc`. The GUI detaches its
+  console window; CLI commands retain normal terminal input/output.
+- Release versions come from the triggering Git tag; local builds use the nearest reachable tag,
+  falling back to the Cargo package version without Git metadata. `OTTER_BUILD_VERSION` overrides
+  this for external builds. Keep CLI, GUI, scan exports, and Windows Explorer versions consistent.
+- Tagged releases publish signed SLSA provenance for the SHA-256 digest of each Linux archive and
+  Windows executable. This is separate from Windows Authenticode signing, which requires a trusted
+  code-signing certificate or managed signing service.
+
+## Local configuration and direct uploads
+
+Place `otter.json` beside the executable. A single object remains supported:
+
+```json
+{
+  "targets": ["192.168.1.0/24"],
+  "interface": "eth0",
+  "sourceMac": "00:11:22:33:44:55",
+  "output": "scan.otserver.json",
+  "snmp": { "version": "2c", "community": "public" }
+}
+```
+
+The root may instead be an array. Each entry needs a unique, non-empty `name` and a distinct resolved
+output path. CLI values override every entry; `OTSERVER_API_KEY` overrides each entry's `apiKey`.
+A shared `--output` cannot be used when it makes multiple outputs collide. Relative paths resolve
+from the current working directory. Never read `--ack-authorized` from configuration.
+
+The GUI clones selected settings when adding a configuration, assigns a unique name/output, and
+converts single-object files to arrays as needed. It offers **Run Selected** and **Run All**. CLI
+array runs proceed sequentially and continue after configuration, scan, or upload failures.
+**Stop Scan** writes partial output when possible and skips pending configurations. Exit code `0`
+means all scans completed, `2` means valid output contains partial failures, and `1` means a
+configuration, scan, or upload failed; failures take precedence in multi-configuration runs.
+
+All discovery protocols are enabled by default. CLI `--no-<protocol>` switches and JSON `noArp`,
+`noProfinet`, `noS7`, `noEnip`, `noBacnet`, `noFins`, `noFox`, `noDnp3`, `noIec61850`, `noNetbios`,
+`noSmb`, `noRpc`, `noOpcua`, `noSnmp`, and `noLldp` disable them individually. SNMP inventory and LLDP
+topology share credentials but have independent switches. The GUI exposes matching toggles.
+
+### SNMP and OPC UA credentials
+
+`snmp` accepts one credential object or a list tried in order per target, skipping duplicates.
+Without settings, use SNMPv2c community `public`. Explicit versions `1`, `2c`, and `3` never fall
+back. Version `auto` tries v3 when a username exists, then v2c, then v1, stopping on success.
+SNMPv3 supports an optional `contextName` (empty by default):
+
+```json
+{
+  "snmp": [
+    {
+      "version": "3",
+      "username": "inventory",
+      "contextName": "optional-snmp-context",
+      "authProtocol": "sha256",
+      "authPassword": "...",
+      "privacyProtocol": "aes128",
+      "privacyPassword": "..."
+    },
+    { "version": "2c", "community": "public" }
+  ]
+}
+```
+
+`opcuaPorts` defaults to `[4840, 4841, 48400]`. `opcuaCredentials` accepts one
+`{ "username": "inventory", "password": "..." }` object or a list tried in order after anonymous
+access fails. Legacy `opcuaUsername`/`opcuaPassword` remains supported. SecurityPolicy None sends
+passwords unencrypted; never describe this path as encrypted authentication.
+
+Both credential lists are editable in GUI tables with add/remove actions and masked passwords.
+Local credentials remain plaintext in `otter.json`; restrict access (for example,
+`chmod 600 otter.json`). Logs may show sanitized SNMP version/security choices, never secrets.
+The GUI log is timestamped, selectable, auto-scrolling, and clearable; preserve scan/save status and
+the native output-file picker.
+
+### Direct OTserver import
+
+Set `serverUrl`, `site`, and `apiKey` in configuration, or use CLI flags with an environment key:
+
+```bash
+OTSERVER_API_KEY='...' otserver-otter scan \
+  --target 192.168.1.0/24 \
+  --interface eth0 \
+  --source-mac 00:11:22:33:44:55 \
+  --server-url https://otserver.example \
+  --site PAYLOAD_SITE_ID \
+  --ack-authorized
+```
+
+Prefer `OTSERVER_API_KEY` over a stored API key for automation. The site is a Payload document ID;
+the user needs read/write access there. Write and validate the local JSON before posting it, and
+retain it on upload failure. `otserver-otter validate scan.otserver.json` validates an export.
+
+For direct uploads and controller connections, `--http-proxy URL` / `--https-proxy URL` select
+explicit proxies per destination scheme; the other scheme connects directly. The flags must be
+supplied again on later starts. `--ignore-self-signed` disables all TLS certificate and hostname
+validation for that process, not just self-signed certificate rejection.
+
+## Managed controller operation
+
+Enroll with `otserver-otter controller --server-url https://otserver.example --enroll --ack-authorized`
+and supply the single-use token on stdin. Restart without `--enroll` to reuse credentials. Match
+OTserver's `OTSERVER_PUBLIC_URL`; bare `127.0.0.1:3000`, `localhost:3000`, and `[::1]:3000` normalize
+to HTTP. Other hosts require explicit HTTPS. No scanner-side listener is opened.
+
+- Default state lives at `$XDG_STATE_HOME/otserver-otter` or `~/.local/state/otserver-otter` on Linux,
+  and `%LOCALAPPDATA%\otserver-otter` on Windows. `--state-dir PATH` overrides it. One process owns
+  the directory; use the same OS account and directory across restarts.
+- `--file-credentials` explicitly selects the private file fallback instead of the OS credential
+  store. Unix directories/files must belong to the current user with modes 0700/0600; Windows ACLs
+  restrict state to the current user. Protocol credential snapshots remain memory-only.
+- `--enroll --overwrite-state-dir` permits controller takeover with a fresh token. Preserve old
+  state on failed enrollment and retain scan exports. Omit both flags on subsequent starts.
+- `--poll-seconds 30` sets the minimum interval (1–300 seconds); the server may request longer idle
+  intervals. Network/429/5xx failures use bounded exponential backoff with jitter up to five minutes.
+- Set a capture interface explicitly on multi-adapter hosts. An omitted source MAC comes from the
+  selected adapter. Managed scans use the shared validation, read-only probes, and traffic pacing.
+- Heartbeats report bounded progress every 15 seconds and renew a two-minute lease. Cancellation,
+  lease loss, terminal responses, or authentication rejection stop work and prevent stale uploads.
+  Managed output omits probe details and controller bodies/credentials.
+- Interrupted discovery becomes failed work, never an automatic rescan. Completed exports resume
+  byte-identical upload retries; known import IDs resume finishing. Retain `RUN_ID.otserver.json`
+  in the state directory, including on failure; operators manage export retention.
+- `--queued-imports` requires `OTSERVER_QUEUED_IMPORTS=on` and healthy manager workers. Scanner
+  completion is distinct from import completion. Idle polling checks pending/running imports by ID;
+  failed queued imports receive at most one explicit retry by ID without re-uploading terminal work.
+- Rotate credentials when less than 30 days remain, durably saving the secret/reference first.
+  Authentication failure or a lost enrollment/rotation response requires re-enrollment because the
+  server consumes or revokes the prior token immediately.
+
+## Protocol evidence reference
+
+- SNMP covers MIB-II identity, LLDP and DOT1/DOT3/PNO extensions, MRP monitoring, IF-MIB/IP-MIB,
+  ENTITY-MIB components, BRIDGE/Q-BRIDGE ports/VLANs, and Siemens AUTOMATION-SYSTEM-MIB identity.
+  With ARP disabled, only valid interface, bridge, or LLDP chassis MAC evidence may identify an asset;
+  forwarding-table MACs remain port evidence. Preserve component-to-interface mappings where present.
+- DCP exports numeric `vendorId`/`deviceId` alongside full parsed blocks. EtherNet/IP preserves every
+  valid List Identity transport response; S7 preserves accepted TSAP access and both identity SZLs.
+  PNIO component references use `pnio:<api>:<slot>[:<subslot>]` and retain original records,
+  containment, identification numbers, I&M revisions, and scoped serial claims.
+- DNP3 uses TCP 20000: link reset followed by Group 0 Variation 0 device-attribute Read with the
+  all-objects qualifier, pipelined for four common outstation/master pairs. Keep hardware revisions
+  separate from firmware. Do not probe DNP3/UDP, TLS-wrapped DNP3, or Secure Authentication.
+- IEC 61850 uses MMS/TCP 102 for advertised identity, health, breaker-position, blocking, and
+  operation-count attributes. Do not access control, report, setting-group, file, or write services.
+- OPC UA preserves hardware revisions and patch identifiers as inventory evidence, not compliance
+  verdicts. Fox retains listener responses in `raw.transportResponses` even on partial failure.
+- NetBIOS retains name tables, suffixes, flags, workgroup, unit ID, and raw replies. Prefer workstation
+  over server names. No broadcast, registration, credentials, or SMB session is needed. OTserver must
+  recognize the `netbios` source in schema version 2.
+- SMB negotiation/identity phases and RPC exchanges each have two-second deadlines. SMB1 uses direct
+  TCP 445, not NetBIOS TCP 139, and installs no OS SMB1 component. Preserve `raw.dialect`,
+  `raw.serverStrings`, original NTLM challenges, `reportedVersion`, and `windowsCandidates`.
+  Build 17763 may mean Windows 10 1809 or Server 2019; build 26100 may mean Windows 11 24H2 or
+  Server 2025. Unknown builds retain numeric versions without guessed releases. Compatible servers
+  can synthesize NTLM versions; exact installed OS/patch inventory needs a separately authorized
+  authenticated path.
+
+## Virtual OT lab
+
+`./lab/test.sh` exercises Linux discovery against deterministic virtual devices. It requires Linux
+containers, Docker Engine with Compose, and daemon access; Windows developers may use WSL2.
+Scanner/Siemens containers receive only `NET_RAW`; no host networking or published protocol ports.
+The Siemens DCP responder waits 55 seconds to verify the one-minute capture window. JSON and logs
+remain under `lab/artifacts/`.
+
+Run `./lab/test-windows.ps1` from Windows PowerShell for the native executable smoke test. It binds
+responders only to Docker/WSL's host-only Hyper-V adapter. All forwarded replies share that adapter's
+MAC, so this checks protocol clients, not distinct device identity. The importable scan is deleted
+after validation; retain only the text summary and Compose log. DCP is disabled because Docker
+Desktop does not bridge raw Ethernet to Windows capture drivers. Validate active Windows DCP and
+multi-device MAC discovery on physical Layer-2 devices or a dedicated external test interface after
+Npcap changes. SMB/RPC are excluded because host services own TCP 445/135.
+
+Responders use pinned Snap7, libIEC61850, SNMP Simulator, checksum-pinned OpENer/BACnet Stack,
+asyncua, and bounded FINS/Fox/DNP3 implementations. NetBIOS uses Samba `nmbd`; SMB/RPC use real
+`smbd`/`samba-dcerpcd` without completed authentication. An isolated SMB1-only Samba service checks
+fallback, names, native strings, disablement, and MAC-less unresolved output. Classic security and
+old short NTLM challenges use Rust fixtures, not live legacy-Windows interoperability tests.
+Validate actual Windows releases separately with their firewall and NTLM policies.
+
+### Remote-management gate setup
+
+From the management checkout containing `otserver-otter/`:
+
+```bash
+pnpm install --frozen-lockfile
+./otserver-otter/lab/test-controller.sh
+```
+
+Requires Linux, Rust, Node.js 22, pnpm 10, Python 3, OpenSSL with development headers, and Docker or
+Podman. Set `CONTAINER_RUNTIME=podman` to choose explicitly. The gate builds the headless client,
+tests controller behavior and HTTPS recovery, and runs the full management integration suite.
+It owns its replica set/upload directory and ignores caller and `.env` database settings.
+Coverage includes enrollment/inventory, configurations/secrets, run lifecycle, scheduling, sync/queued
+imports, authorization, auditing, rotation, revocation, and UI component controls. Managed tests
+disable discovery probes; protocol interoperability remains the separate lab's responsibility.
+Any failed stage fails the gate; preserve stage logs, MongoDB logs, and management JUnit reports.
 
 ## Generated Files
 

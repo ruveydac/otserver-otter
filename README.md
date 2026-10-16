@@ -1,62 +1,39 @@
-<div align="center">
-
 # OTserver Otter
 
-### Read-only OT discovery for the [OTserver inventory](https://github.com/ruveydac/OTserver)
+Read-only discovery of industrial devices for [OTserver](https://github.com/ruveydac/OTserver).
 
-Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Fox · DNP3 · IEC 61850 · NetBIOS · SMB · RPC · OPC UA · SNMP · LLDP
+Otter is a Windows and Linux discovery tool with a command-line interface and an optional GUI.
+It collects device identities, firmware, network interfaces, and topology, then exports JSON
+that you can import into OTserver. It can also upload results directly or run as a centrally
+managed scanner.
 
-[![Website](https://img.shields.io/badge/otserver.org-111111?logo=firefoxbrowser&logoColor=white)](https://otserver.org)
-[![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Platforms](https://img.shields.io/badge/Windows_%7C_Linux-0078D6?logo=windows&logoColor=white)](#quick-start)
-[![OTserver](https://img.shields.io/badge/OTserver-Next.js-000000?logo=javascript&logoColor=white)](https://github.com/ruveydac/OTserver)
-[![AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENCE.md)
+[Website](https://otserver.org) · [Download](https://github.com/ruveydac/otserver-otter/releases) · [Quick start](#quick-start) · [License](#license)
 
-[Quick start](#quick-start) · [Protocols](#protocols-and-safety) · [Configuration](#configuration-and-direct-import) · [Lab](#virtual-ot-lab) · [Development](#development)
+## What it discovers
 
-</div>
+Otter uses ARP, PROFINET, S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, DNP3, IEC 61850,
+NetBIOS, SMB, RPC, OPC UA, SNMP, and LLDP to collect identity and network evidence.
+Results retain per-protocol observations and warnings, including partial results when individual
+probes fail.
 
----
-
-OTserver Otter is a cross-platform Rust CLI (with an optional GUI) built specifically for identifying
-industrial devices through fixed, read-only protocol requests. It discovers IPv4/MAC pairs with ARP
-and directly queries PROFINET DCP, S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, DNP3,
-IEC 61850, NetBIOS, SMB, RPC, OPC UA, and optional SNMP/LLDP. It collects structured evidence and exports observations, interfaces, ports,
-and topology through the schema-version-2 `otserver-scan` contract understood directly by
-[OTserver](https://github.com/ruveydac/OTserver).
-
-Windows uses native IP Helper for active ARP, Npcap for active PROFINET DCP, and Microsoft pktmon
-as a passive fallback. Linux uses native `AF_PACKET` raw sockets. No TAP adapter or Windows Network
-Bridge is used or modified.
-
-## What you get
-
-- **Native protocol identity** — Fixed queries designed to retrieve device identity without
-  configuration changes, vulnerability scripts, or exploit behavior.
-- **Evidence-preserving output** — Per-protocol observations and raw source data alongside
-  normalized devices, instead of collapsing a scan into one guessed record. Native observations
-  include scan-local IDs, explicit subjects, serial scope, and listening endpoints.
-- **Topology-aware collection** — LLDP, SNMP, and PROFINET link evidence, network interfaces, and
-  ports in a validated JSON export.
-- **Quality-aware by design** — Each observation reaches the importer with its source quality, so
-  stronger evidence improves the inventory without overwriting human edits.
-- **Predictable failure handling** — Valid partial results with warnings when individual probes
-  fail; malformed and unsolicited responses are rejected.
-- **Direct import** — Send a completed scan straight to OTserver's REST importer with your site
-  permissions, keeping the local JSON file.
+Discovery uses fixed, read-only requests. Otter does not change device configuration, run exploits,
+or perform active vulnerability checks. Only scan networks you own or are authorized to assess.
+Read-only discovery still generates network traffic; assess its suitability for your network.
 
 ## Quick start
 
-Otter requires `--ack-authorized` before every scan. Only scan networks you own or are authorized
-to assess.
+Download the build for your platform from the
+[releases page](https://github.com/ruveydac/otserver-otter/releases) and extract it.
+Use `doctor` to check your setup and `interfaces` to find the adapter name and MAC address.
 
 ### Linux
 
+Ethernet discovery requires root or `CAP_NET_RAW`:
+
 ```bash
-cargo build --release
-sudo ./target/release/otserver-otter doctor
-sudo ./target/release/otserver-otter interfaces
-sudo ./target/release/otserver-otter scan \
+sudo ./otserver-otter doctor
+sudo ./otserver-otter interfaces
+sudo ./otserver-otter scan \
   --target 192.168.1.0/24 \
   --interface eth0 \
   --source-mac 00:11:22:33:44:55 \
@@ -64,636 +41,69 @@ sudo ./target/release/otserver-otter scan \
   --ack-authorized
 ```
 
-Linux Ethernet discovery uses a native `AF_PACKET` raw socket and therefore needs root or
-`CAP_NET_RAW`.
-
-#### Raspberry Pi
-
-Tagged releases include `otserver-otter-linux-aarch64.tar.gz` for Raspberry Pi 3, 4, 5, and
-Zero 2 W running 64-bit Raspberry Pi OS Bookworm or newer. This headless build omits the GUI; run a
-CLI subcommand such as `doctor`, `interfaces`, or `scan`. It requires the Raspberry Pi OS `libssl3`
-package and the same root or `CAP_NET_RAW` access as other Linux builds.
-
-Release builds expose the triggering Git tag as their CLI, GUI, scan-export, and Windows Explorer
-version. Local builds use the nearest reachable Git tag; source archives without Git metadata fall
-back to the Cargo package version. `OTTER_BUILD_VERSION` can explicitly override this value for a
-reproducible external build.
-
-To build the headless scanner natively instead:
-
-```bash
-cargo build --locked --release --no-default-features
-```
+Replace the example network, interface, and MAC with your own values.
+Raspberry Pi releases support 64-bit Raspberry Pi OS Bookworm or newer and require `libssl3`.
+These builds are command-line only.
 
 ### Windows
 
 ```powershell
-cargo build --release --target x86_64-pc-windows-msvc
-.\target\x86_64-pc-windows-msvc\release\otserver-otter.exe doctor
-.\target\x86_64-pc-windows-msvc\release\otserver-otter.exe interfaces
-.\target\x86_64-pc-windows-msvc\release\otserver-otter.exe scan `
+.\otserver-otter.exe doctor
+.\otserver-otter.exe interfaces
+.\otserver-otter.exe scan `
   --target 192.168.1.0/24 `
   --interface '<interface name or GUID>' `
   --source-mac 00:11:22:33:44:55 `
-  --no-bacnet `
   --output .\scan.otserver.json `
   --ack-authorized
 ```
 
-Windows ARP discovery needs no additional driver. Active PROFINET discovery requires a separately
-installed [Npcap](https://npcap.com/#download). If Npcap is unavailable, the scanner uses built-in
-pktmon as a passive fallback. Pktmon requires Administrator rights and cannot transmit DCP Identify
-frames.
+Windows ARP discovery needs no additional driver. Active PROFINET DCP requires a separate
+[Npcap installation](https://npcap.com/#download). Without it, Otter uses Windows pktmon for
+passive capture, which requires Administrator rights and cannot send DCP Identify requests.
 
-Npcap installation is always an explicit user action and never occurs during a scan. The scanner
-loads `%SystemRoot%\System32\Npcap\Packet.dll` directly, matches the selected physical interface by
-GUID, transmits DCP Identify, and captures only PROFINET Ethernet frames. Npcap's free license permits
-up to five installations but not redistribution; larger or bundled deployments require an appropriate
-Npcap OEM license.
+### Use the results
 
-Active DCP verifies that the sender MAC belongs to the selected physical interface before
-opening the selected Npcap adapter. Identify-All is sent once with an engineering-tool response
-delay factor so device replies are spread over the capture window instead of creating a synchronized
-response burst. After a successful request, Otter keeps collecting replies for at least 60 seconds,
-including through quiet intervals, so slow devices are not missed. Stopping a scan or a capture
-failure ends this window early.
+Import `scan.otserver.json` into OTserver, selecting the site where the devices belong.
+Every scan requires `--ack-authorized`. Run `scan --help` for protocol switches and other options.
 
-At scan start, both the CLI and GUI read the selected interface's current MAC for ARP and DCP.
-If `sourceMac` is stale (for example, after Wi-Fi MAC randomization), the scanner logs the replacement
-and uses the current MAC in requests and scan metadata.
+## Configuration and managed scans
 
-The selected interface is the Layer-2 capture/ARP/DCP selection. TCP/UDP, SNMP, and other native IP
-probes use the operating system's route table; selecting a capture adapter does not bind those probes
-to that interface. On a multi-homed host, configure routes for the target networks in the operating
-system. The scan's `interface` describes the selected capture interface, not every IP egress route.
-New exports state this explicitly as `scan.interface.ipRoutePolicy: "operating-system"`.
-When Windows uses pktmon, it captures all NICs; passive PROFINET frames are retained only when their
-Ethernet destination MAC matches the selected adapter, so an unattributed frame cannot become site
-inventory.
+An optional `otter.json` beside the executable stores scan settings and multiple configurations.
+The GUI can edit these settings and run one or all configurations. Local credentials are stored
+in plaintext in that file; restrict its permissions and keep it out of source control.
 
-The Windows executable exposes its build Git tag in Explorer file properties and in the GUI.
-Starting the GUI detaches its console window; CLI commands keep normal terminal input and output.
-
-Tagged GitHub releases also publish signed SLSA provenance covering the SHA-256 digest of every
-Linux archive and Windows executable. This lets consumers verify that an artifact was produced by
-this repository's release workflow and was not modified afterward. SLSA provenance is separate from
-Windows Authenticode signing; an Authenticode publisher signature still requires a trusted
-code-signing certificate or managed signing service.
-
-Validate an export before uploading it:
-
-```powershell
-.\otserver-otter.exe validate .\scan.otserver.json
-```
-
-## Managed controller mode
-
-Local `scan`, GUI, executable-adjacent `otter.json` (including multiple profiles and legacy
-`otscanner.json` fallback), and user API-key uploads continue to work independently. Managed mode
-is a separate, outbound-only command; it does not load or modify that local configuration.
-
-Create a scanner in OTserver's **Manage Otters**, then redeem its single-use enrollment token:
+For central management, enroll the scanner using a token from OTserver:
 
 ```bash
 otserver-otter controller --server-url https://otserver.example \
   --enroll --ack-authorized
-# Supply the enrollment token on stdin, followed by Enter (or use protected input redirection).
 ```
 
-The token is read from stdin rather than a command-line argument. HTTPS certificate validation is
-enabled by default; only loopback URLs permit HTTP for development. For a private CA or a
-self-signed controller certificate, explicitly add `--ignore-self-signed`. This disables all TLS
-certificate and hostname validation for that process. No scanner-side listener is opened.
-Bare loopback addresses such as `127.0.0.1:3000`, `localhost:3000`, and `[::1]:3000` use HTTP;
-other hosts require an explicit `https://` URL. Match the manager's `OTSERVER_PUBLIC_URL`.
-
-Use `--http-proxy URL` and/or `--https-proxy URL` when the controller must be reached through
-explicit proxies. The flags select proxies for HTTP and HTTPS destinations respectively. The other
-destination scheme connects directly. The same flags are required on later starts, including starts
-that reuse saved credentials.
-Restart without `--enroll` to use the saved machine credential:
-
-```bash
-otserver-otter controller --server-url https://otserver.example --ack-authorized
-```
-
-- State defaults to `$XDG_STATE_HOME/otserver-otter` (or `~/.local/state/otserver-otter`) on Linux
-  and `%LOCALAPPDATA%\otserver-otter` on Windows. `--state-dir PATH` selects a dedicated location;
-  one process owns it at a time. Always run under the same OS account and state directory.
-- If a state directory belongs to a different controller URL, use `--enroll --overwrite-state-dir`
-  with a fresh enrollment token to replace its saved enrollment and run state. Existing scan exports
-  remain in the directory. The previous state is preserved if enrollment fails; restart afterward
-  without `--enroll` or `--overwrite-state-dir` to reuse the new credential.
-- Credentials use Linux Secret Service or Windows Credential Manager when available. Headless hosts
-  fall back to an atomic private state file; `--file-credentials` selects this explicitly. Unix
-  directories/files must be owned by the current user with modes 0700/0600. Windows ACLs restrict
-  state to the current user. Managed protocol credential snapshots stay in memory, not state files.
-- `--poll-seconds 30` sets the minimum polling interval (1–300 seconds); the server can request a
-  longer idle interval. Network/429/5xx failures use bounded exponential backoff with jitter up to
-  five minutes. Enrollment and polls report build version, capabilities, computer name, and capture
-  adapter technical/friendly names, descriptions, MAC addresses, and IPv4/IPv6 addresses. OTserver
-  stores this inventory with the scanner for adapter selection in its Payload profile editor.
-- Set an explicit capture `interface` in each profile on multi-adapter hosts. An omitted `sourceMac`
-  is obtained from the selected adapter. All managed scans retain the shared interface validation,
-  read-only protocol behavior, response validation, and process-wide traffic pacing.
-- Heartbeats report bounded stage progress every 15 seconds and renew the two-minute lease. Human
-  cancellation, lost lease, or a terminal/authentication response stops work safely and prevents
-  further upload. Managed output omits probe details and all controller bodies/credentials.
-- Assignment state is durable before starting discovery. Interrupted discovery is reconciled as
-  failed, never silently scanned again. Completed local exports resume byte-identical upload retries;
-  known import IDs resume finishing without another upload. Results remain as `RUN_ID.otserver.json`
-  in the private state directory, including on failure. Manage their retention as operator data.
-- Imports default to synchronous execution. `--queued-imports` requests queued execution and requires
-  `OTSERVER_QUEUED_IMPORTS=on` and healthy manager workers. Scanner completion is independent of import
-  completion: pending/running imports are checked by ID during idle polling; failed queued imports
-  receive at most one explicit retry by ID, without re-uploading terminal scan work.
-- Credentials rotate when less than 30 days remain. The new secret and state reference are durable
-  before replacing the old local credential. Authentication failure stops the agent; use management
-  re-enrollment and `--enroll` to recover. A lost enrollment/rotation response also requires
-  re-enrollment because the server consumes/revokes the prior token immediately.
-
-Controller v1 is independent of the unchanged schema-version-2 scan result contract. The HTTPS lab
-checks enrollment, rotation, restart/upload recovery, cancellation, rejected settings, queued import
-retry, redaction, and revocation:
-
-```bash
-cargo build --locked --no-default-features
-python3 lab/controller_verify.py target/debug/otserver-otter
-```
-
-The same check runs in `./lab/test.sh`. To run the real Rust client against OTserver's REST API, from
-the management repository use:
-
-```bash
-pnpm test:otter-client
-```
-
-This builds the headless client and tests bare-loopback/explicit-HTTP enrollment, a complete managed
-run/import, and saved-credential restart. To use an existing build, set `OTTER_CLIENT_BIN` and run
-`pnpm test:int tests/int/otter-client.int.spec.ts` directly.
-
-### Full remote-management CI/CD gate
-
-From a management checkout containing this repository at `otserver-otter/`, run:
-
-```bash
-pnpm install --frozen-lockfile
-./otserver-otter/lab/test-controller.sh
-```
-
-The runner requires Linux, Rust, Node.js 22, pnpm 10, Python 3, OpenSSL (including development
-headers for the Rust build), and Docker or Podman. It builds the headless client, runs all Rust
-controller tests and the HTTPS fault/recovery lab, then runs **the entire management integration
-replica set and unique upload directory, ignores caller and `.env` database settings, and removes only
-the resources it owns on success, failure, or interruption. Set
-`CONTAINER_RUNTIME=podman` to select a runtime explicitly.
-
-Coverage includes:
-
-| Area                           | Checks                                                                                                                               |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
-| Enrollment and inventory       | Single-use tokens, controller URL validation, computer/adapters, saved-credential restart, explicit controller takeover              |
-| Configurations and credentials | All managed options, encrypted SNMP/OPC UA credentials, replace/clear, immutable snapshots, import overrides                         |
-| Run lifecycle                  | Manual runs, start, progress/heartbeats, completion/partial/failure, cancellation, lease expiry, interrupted-run recovery            |
-| Scheduling                     | Once, interval, cron/time zones, latest-only offline catch-up, occurrence deduplication                                              |
-| Imports                        | Real-client multipart REST upload, schema-v2 validation, sync/queued processing, idempotency, upload recovery, retry by import ID    |
-| Access and administration      | Role/site isolation, machine-principal restrictions, origin checks, audit redaction, rotation, revocation/re-enrollment, UI controls |
-
-The real-client REST tests use Payload's HTTP endpoints and the replica set; HTTPS failures and
-recovery use the local controller lab. UI controls are component-tested. These managed scans disable
-discovery probes; protocol interoperability remains covered by `./lab/test.sh` and `./lab/test-pnio.sh`.
-Stage logs, MongoDB logs, and the management JUnit report are saved under
-`lab/artifacts/controller.*/`. Any failed stage fails the gate.
-
-`.github/workflows/controller.yml` runs this gate on pull requests and pushes to `main`, and supports
-manual runs. It checks out `ruveydac/OTserver` alongside the exact Otter
-revision being tested and uploads reports even on failure. Set the repository variable
-`OTTER_MANAGEMENT_REF` to a compatible management branch/tag/SHA, or pass `management_ref` to a
-manual run; the default is `main`. The selected management revision must contain the
-controller-v1 integration tests. Release/tag runs use the same default and optional
-`OTTER_MANAGEMENT_REF` override. Use **Full remote management** as a required pre-release check.
-
-## Protocols and safety
-
-The scanner sends PROFINET DCP Identify, read-only SNMP requests, and fixed read-only identity
-requests for S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, DNP3, IEC 61850, NetBIOS, SMB, RPC, and
-OPC UA. It never runs SNMP SET, DCP Set, brute-force, exploit, vulnerability, or Modbus requests.
-
-Discovery uses process-wide pacing based on the supplied site ceilings of 50 ARP frames/s and
-500 packets/s, with 30% headroom:
-
-- **ARP: at most 35 explicit requests/s**, evenly spaced by at least 28.572 ms. Linux raw ARP sends
-  and Windows `SendARP` calls are serialized, including temporary raw-socket send retries. Idle time
-  never accumulates credits for a burst, and configurations and targets share the same budget.
-- **Other discovery: approximately 350 operations/s in aggregate**, including ARP, raw Ethernet,
-  TCP connection attempts and identity writes, UDP requests, and SNMP/OPC UA service calls. SNMP
-  bulk-walk values are paced conservatively even when already buffered. Protocol libraries and the
-  OS can generate additional handshake, acknowledgement, retry, and background packets.
-- New IP-target probes consume the aggregate budget (not the strict ARP budget) to bound how fast
-  new TCP/UDP connections start, which indirectly limits kernel neighbor-discovery bursts.
-  Linux receives replies throughout the paced ARP/ICMP sweep; stopping a scan stops further requests
-  and retains collected results. An in-flight Windows `SendARP` call must return before it can stop.
-
-These are site-supplied ceilings, **not a universal guarantee of OT-network safety**. The strict ARP
-bound covers scanner-issued raw frames on Linux and API calls on Windows, not Windows-managed ARP
-retries or ARP generated by IP sockets. `--no-arp` disables the explicit sweep, not kernel ARP.
-Limits are per process, not shared with other scanner processes or background network traffic;
-optional OTserver uploads are outside discovery pacing. If all on-wire ARP must stay below 35/s,
-use an operator-approved network control that covers Layer-2 traffic and validate it with a packet
-capture. Otter does not change host QoS, neighbor tables, or network-device configuration.
-
-All discovery protocols are enabled by default. Disable individual protocols on the CLI with
-`--no-arp`, `--no-profinet`, `--no-s7`, `--no-enip`, `--no-bacnet`, `--no-fins`, `--no-fox`,
-`--no-dnp3`, `--no-iec61850`, `--no-netbios`, `--no-smb`, `--no-rpc`, `--no-opcua`, or `--no-snmp` and `--no-lldp`.
-SNMP inventory and LLDP topology queries share the same SNMP settings but can be enabled
-independently. The GUI exposes the same choices as highlighted on/off toggle buttons.
-
-Exit code `0` means every scan completed, `2` means at least one valid output contains partial
-failures, and `1` means a configuration, scan, or upload failed. A multi-configuration run continues
-after failures and reports exit code `1` after attempting the remaining configurations. Stopping a
-running scan writes a valid partial export containing all results collected before cancellation.
-
-SNMP uses bounded, read-only queries covering MIB-II (RFC 1213) system and interface identity,
-LLDP-MIB topology (IEEE 802.1AB) with the LLDP-EXT-DOT1, LLDP-EXT-DOT3, and LLDP-EXT-PNO
-extensions (IEEE 802.1AB / IEC 61158-6-10), MRP media-redundancy monitoring (IEC 62439-2),
-IF-MIB/IP-MIB interfaces, ENTITY-MIB components, BRIDGE/Q-BRIDGE ports and VLANs, and the generic
-Siemens AUTOMATION-SYSTEM-MIB identity scalars. With ARP explicitly disabled, it probes configured
-IPv4 targets even when Layer 2 discovery cannot see them, but creates an asset only after obtaining
-a valid MAC from an interface, bridge, or LLDP chassis identity. Forwarding-table MACs are port
-evidence only and never asset identities. ENTITY-MIB observations preserve every reported component, containment position,
-serial claim, and supported component-to-interface mapping; ENTITY and interface indexes remain
-observation-local references.
-Only a unique root chassis or stack supplies normalized ENTITY-MIB device identity; module-only
-or ambiguous inventories remain component evidence. SNMP observations include scan-local observation
-IDs, subjects, and component-scoped serial claims.
-
-With ARP enabled, native protocols, SNMP, and LLDP probe only discovered, unambiguous MAC/IP pairs
-from ARP or DCP. An unanswered target does not trigger a second IP-protocol sweep. To probe selected
-targets independently of ARP (for example, routed hosts), use `--no-arp` or turn off ARP in the GUI.
-MAC-less responses remain in `unresolved` and are never assigned a next-hop MAC.
-
-Use `--allow-dcp-source` (or `"allowDcpSource": true` / the GUI toggle) when DCP responders may be
-outside the configured target range. DCP runs first, its reported IPs are added to the ARP sweep, and
-the resulting ARP observation is merged with the DCP device by MAC, including OUI vendor resolution.
-Those unambiguous DCP identities are then eligible for all further IP protocol probes.
-DCP observations export the PROFINET vendor and device IDs as numeric `vendorId` and `deviceId`
-fields, while retaining the complete parsed block data under `raw`.
-EtherNet/IP preserves each valid List Identity transport response, and S7 preserves the accepted
-TSAP access path and both identity SZL payloads.
-PNIO observations retain every original record and additionally expose `raw.physicalEntities`,
-using observation-local `pnio:<api>:<slot>[:<subslot>]` references, module/submodule containment,
-identification numbers, I&M identity/revisions, and scoped serial claims. Module I&M identities
-never become device serials; the existing device-level manufacturer/software fields come only from
-the primary access point at API 0, slot 0, subslot 1. Scan metadata includes the selected interface's
-current IPv4 addresses on both platforms.
-
-OPC UA discovery connects to ports 4840, 4841, and 48400 by default (configurable via `opcuaPorts`).
-The scanner prefers anonymous authentication and reads only asset identification, health, and
-location variables; it never writes values or calls methods that modify server state.
-Each OPC UA asset retains its own normalized fields and scoped serial claim under `raw.assets`.
-The root identity comes from a single entry identified by `raw.normalizedAssetRef`, so multiple
-represented devices cannot fill one another's missing identity fields. Hardware revisions and
-reported patch identifiers are exported alongside the original identification data; patch identifiers
-are inventory evidence, not a patch-compliance verdict.
-
-DNP3 (IEEE 1815) discovery connects to TCP port 20000 and sends one read-only cold start: a link
-reset followed by a Read of Object Group 0 Variation 0 device attributes with the "all objects"
-qualifier. Outstations silently drop frames addressed elsewhere, so the reset and read are pipelined
-for four common outstation and master address pairs and the pair that answers identifies the device.
-Reported attributes include software and hardware version, product name, manufacturer, serial
-number, user-assigned name, ID code, location, and DNP3 conformance level. Discovery never writes or
-operates points, assigns classes, freezes counters, restarts a device, or uses Secure Authentication;
-DNP3/UDP and TLS-wrapped DNP3 are not probed.
-DNP3 hardware revisions are normalized as `hardwareVersion`, separately from software/firmware.
-
-IEC 61850 discovery connects to MMS/TCP port 102, browses the logical-device model, and reads only
-advertised identity, health, breaker-position, blocking, and operation-count attributes. It does not
-access control, report, setting-group, file, or write services.
-IEC 61850 preserves per-node normalized identity and status evidence under `raw.nodeObservations`.
-Root fields stay within one logical device, identified by `raw.normalizedLogicalDevice`;
-`raw.fieldSources` records the reporting node, and serial claims remain scoped to their nameplate.
-
-BACnet application software is exported as `applicationSoftwareVersion`, independently of
-`firmwareVersion`. Fox exposes `applicationName`, `applicationSoftwareVersion`, `runtimeName`, and
-`runtimeVersion`; it preserves both listener responses under `raw.transportResponses` and retains
-successful identity evidence when another listener fails.
-
-NetBIOS discovery sends one unicast wildcard Node Status (`NBSTAT`) query to UDP port 137
-(RFC 1002). It exports the active computer name, preferring the workstation name over the server
-name, plus the registered name table, suffixes, flags, workgroup, reported unit ID, and raw response
-as `netbios` observations. The unit ID remains raw evidence, including when it is all zeros; device
-identity uses the shared ARP/DCP correlation. With `--no-arp`, responses without a correlated MAC
-remain in `unresolved`. Discovery uses no credentials, broadcasts, registration requests, or SMB
-sessions. Disable it with `--no-netbios`, `"noNetbios": true`, or the GUI NetBIOS toggle.
-OTserver importers must recognize the `netbios` source added to the schema-version-2 contract.
-
-### Windows discovery without credentials
-
-SMB and RPC probes work from both Linux and Windows and need no credentials or capture driver.
-They use the same authorized, paced, MAC-correlated target path as the other native probes.
-
-| Probe                  | Requests                                                                                            | Evidence                                                                                                                   |
-| ---------------------- | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| SMB, TCP 445           | SMB2 NEGOTIATE (dialects 2.02, 2.10, 3.0, 3.02), one SPNEGO/NTLM Type 1 SESSION_SETUP               | Negotiated dialect, signing mode, server GUID, computer/domain names, optional reported NT major/minor/build               |
-| SMB1 fallback, TCP 445 | One fresh connection, NT LM 0.12 NEGOTIATE, at most one extended-security Type 1 SESSION_SETUP_ANDX | Same NTLM names/build evidence where reported; native OS/LAN-manager strings; classic-security negotiation/domain evidence |
-| RPC, TCP 135           | One endpoint-mapper v3 bind, NDR transfer syntax, NTLM Type 1                                       | Accepted EPM service, computer/domain names, optional reported NT major/minor/build                                        |
-
-Both stop at the server challenge: no NTLM Type 3, RPC AUTH3, completed login, share enumeration,
-endpoint enumeration, DCOM activation, or WMI/WinRM commands.
-SMB keeps validated negotiation evidence if identity is refused or times out. Each SMB phase has
-a two-second deadline; the RPC exchange has a two-second deadline. Responses and NTLM strings
-are bounded and validated before use.
-
-SMB2/3 is always attempted first. SMB1 fallback reconnects **once**, only after a correlated SMB2
-`STATUS_NOT_SUPPORTED` or a close/reset before any negotiation response bytes. Malformed, partial,
-mismatched, or timed-out responses do not trigger fallback, and accepted SMB2 negotiation never
-falls back because authentication was refused. SMB1 negotiation and its optional identity phase
-each have a two-second deadline. It uses the same pacing, cancellation, and SMB disable controls.
-No Windows SMB1 component is enabled or installed; the scanner implements the bounded wire probe
-directly on both platforms.
-
-For SMB1 with extended security, the scanner sends only the first SPNEGO/NTLM Type 1 token and
-closes after the challenge. Older NTLM challenges may omit target-info/version fields; any reported
-native Windows OS string can still supply OS evidence, with original strings retained separately.
-`raw.smbVersion` is 1, `raw.dialect` is `NT LM 0.12`, and `raw.serverStrings` retains native OS,
-LAN-manager and optional domain strings. Non-ASCII OEM bytes remain in the original raw response
-instead of being assigned a guessed codepage. Without extended security, the scanner retains
-negotiation/domain evidence and stops: it does not attempt a classic, anonymous, or guest login,
-send LM/NT challenge responses, or chain AndX commands. Such servers may therefore provide no OS
-version. The fallback uses direct TCP 445, not NetBIOS sessions on TCP 139.
-
-The observations retain schema version 2 and the existing `os-fingerprint` source. `raw.protocol`
-identifies `smb` or `rpc`; `raw.ntlm` retains names, the original challenge, `reportedVersion`, and
-`windowsCandidates`. A version is normalized as, for example,
-`Windows-compatible NT 10.0 build 17763`. That build can represent **Windows 10 1809 or Windows
-Server 2019**, so both remain candidates. Similarly, build 26100 is shared by Windows 11 24H2 and
-Windows Server 2025. Unknown builds retain their reported numeric version without a guessed release.
-NTLM-compatible implementations such as Samba can synthesize Windows version values; a reported
-version is not authenticated proof of Windows. SMB dialects never supply OS identity. Missing version
-data leaves OS identity unset, and these requests cannot establish edition, cumulative-update revision
-(UBR), installed KBs, or patch compliance. Exact installed caption/release/patch inventory requires
-a separately authorized authenticated inventory path.
-
-Disable the probes with `--no-smb` / `--no-rpc`, `"noSmb": true` / `"noRpc": true`, or their GUI
-toggles. Legacy `--no-protocols` / `noProtocols` disables them too. Existing configurations need no
-new fields. With ARP explicitly disabled, MAC-less replies remain in `unresolved`; names and server
-GUIDs never replace MAC correlation.
-
-### GUI
-
-The GUI keeps a selectable, auto-scrolling log panel to the right of its configuration, with an
-always-visible clear action, scan status, and configuration-save result. The output field accepts a
-filename directly or opens the native save-file picker. When `otter.json` contains multiple
-configurations, the GUI can run the selected configuration or run all configurations sequentially;
-**Stop Scan** stops the current scan, writes its partial output when possible, and skips all pending
-entries.
-
-The scan log records one entry per probed IP and protocol, for example
-`[12:43] 192.168.1.10 Protocol snmp Success`. Every log line is timestamped. SNMP attempts also show
-the version and sanitized security choices, such as
-`[12:43] 192.168.1.10 SNMP attempt version=3 security=authPriv authentication=SHA-256 encryption=AES-128 Success`.
-
-### SNMP settings
-
-SNMP settings and credentials live in the `snmp` block of `otter.json` and are fully editable in the
-GUI. The `snmp` value is a single credential object or a list of credentials; a list is tried in
-order per target until one succeeds, so one configuration can combine an SNMPv3 user with several
-SNMPv1/v2c communities. Without any settings, SNMPv2c with the community `public` is used, so SNMP
-never blocks a scan. Set `version` to `1` for a legacy SNMPv1 agent. For SNMPv3 set `version` to `3`
-plus `username`, optional `contextName`, and the `authProtocol`/`authPassword` and
-`privacyProtocol`/`privacyPassword` pairs. Credentials are stored in plaintext in `otter.json`; keep
-the file out of source control and restrict its permissions. Credentials are never written to logs
-or scan exports. Set `version` to `auto` to opt into fallback: the scanner tries SNMPv3 first when a
-username is configured, then SNMPv2c, then SNMPv1, stopping at the first successful version.
-Explicit `1`, `2c`, and `3` selections never fall back. The GUI manages the list in a table of every
-active credential in try order, with **Remove**, **Add Credential**, and masked passwords.
-
-SNMPv3 settings may include an optional `contextName`. Most physical devices use the default empty
-context and can omit it; simulators and partitioned agents may require it.
-
-### OPC UA settings
-
-If an OPC UA server requires username authentication, set `opcuaCredentials` in the config — a single
-`{ "username", "password" }` object or a list of them. Anonymous access is always tried first; the
-configured credentials are tried top to bottom only when it fails. The legacy single
-`opcuaUsername`/`opcuaPassword` pair remains supported. The GUI shows the same credential table as
-for SNMP: rows in try order with **Remove**, **Add Credential**, and the edit fields below. Passwords
-travel unencrypted because the scanner uses SecurityPolicy None, and are never written to logs or
-scan exports.
-
-## Configuration and direct import
-
-Place an optional `otter.json` beside the executable to provide scan defaults and an OTserver
-destination. Existing `otscanner.json` files are loaded when `otter.json` is absent. The existing
-single-object form remains supported:
-
-```json
-{
-  "targets": ["192.168.1.0/24"],
-  "interface": "eth0",
-  "sourceMac": "00:11:22:33:44:55",
-  "output": "scan.otserver.json",
-  "snmp": {
-    "version": "2c",
-    "community": "public"
-  },
-  "noArp": false,
-  "noProfinet": false,
-  "allowDcpSource": false,
-  "noS7": false,
-  "noEnip": false,
-  "noBacnet": false,
-  "noFins": false,
-  "noFox": false,
-  "noDnp3": false,
-  "noNetbios": false,
-  "noSmb": false,
-  "noRpc": false,
-  "noOpcua": false,
-  "opcuaPorts": [4840, 4841, 48400],
-  "opcuaCredentials": [{ "username": "inventory", "password": "..." }],
-  "noSnmp": false,
-  "noLldp": false,
-  "serverUrl": "https://otserver.example",
-  "site": "PAYLOAD_SITE_ID",
-  "apiKey": "PAYLOAD_USER_API_KEY"
-}
-```
-
-The root can instead be an array of configurations. Every array entry requires a unique, non-empty
-`name`, and resolved output paths must be unique so one scan cannot overwrite another:
-
-```json
-[
-  {
-    "name": "Line A",
-    "targets": ["192.168.1.0/24"],
-    "interface": "eth0",
-    "sourceMac": "00:11:22:33:44:55",
-    "output": "line-a.otserver.json"
-  },
-  {
-    "name": "Line B",
-    "targets": ["192.168.2.0/24"],
-    "interface": "eth1",
-    "sourceMac": "00:11:22:33:44:66",
-    "output": "line-b.otserver.json"
-  }
-]
-```
-
-The GUI exposes **Add Configuration**, a configuration selector, **Run Selected**, and **Run All**.
-Adding a configuration clones the selected settings, assigns a unique name and output filename, and
-converts a single-object file to the array form when necessary. The CLI `scan` command runs array
-entries sequentially in file order and continues with later entries after a configuration, scan, or
-upload failure.
-
-An SNMPv3 block looks like this instead:
-
-```json
-{
-  "snmp": {
-    "version": "3",
-    "username": "inventory",
-    "contextName": "optional-snmp-context",
-    "authProtocol": "sha256",
-    "authPassword": "...",
-    "privacyProtocol": "aes128",
-    "privacyPassword": "..."
-  }
-}
-```
-
-To try several credentials in one scan, use a list. Entries are probed in order per target and
-duplicate entries are skipped:
-
-```json
-{
-  "snmp": [
-    {
-      "version": "3",
-      "username": "inventory",
-      "authProtocol": "sha256",
-      "authPassword": "..."
-    },
-    { "version": "2c", "community": "public" },
-    { "version": "2c", "community": "legacy-private" }
-  ]
-}
-```
-
-Command-line values override every selected file entry, and `OTSERVER_API_KEY` overrides every
-entry's `apiKey`. A shared `--output` override therefore cannot be used for a multi-entry run because
-the resolved paths would collide. Relative paths are resolved from the current working directory.
-The config contains credentials in plaintext; keep it out of source control and restrict its
-permissions (for example, `chmod 600 otter.json`). The safer automation setup omits `apiKey`
-from the file and supplies `OTSERVER_API_KEY` through the process environment.
-
-When `serverUrl`, `site`, and an API key are present, `scan` writes and validates the local JSON and
-then posts it to OTserver's REST API. The local file remains available if the upload fails. The site
-must be its Payload document ID, and the API key user must have read/write access there. Explicit
-flags can also select the destination:
-
-```bash
-OTSERVER_API_KEY='...' otserver-otter scan \
-  --target 192.168.1.0/24 \
-  --interface eth0 \
-  --source-mac 00:11:22:33:44:55 \
-  --server-url https://otserver.example \
-  --site PAYLOAD_SITE_ID \
-  --ack-authorized
-```
-
-For a controller or API endpoint with an intentionally untrusted certificate, add
-`--ignore-self-signed`; this disables TLS certificate and hostname validation for that process.
-`--http-proxy URL` and `--https-proxy URL` select explicit proxies for HTTP and HTTPS upload
-destinations. The other scheme connects directly.
-
-Uploads use a 10-second connection timeout and a five-minute total deadline, including response
-body reads. OTserver responses are limited to 16 MiB, including chunked responses; upload failures
-retain the completed local scan JSON.
-
-`--ack-authorized` is intentionally never read from configuration and remains mandatory for every
-scan.
-
-## Virtual OT lab
-
-The Docker lab exercises the complete Linux scanner against deterministic virtual devices for ARP,
-PROFINET DCP, S7, EtherNet/IP, BACnet/IP, Omron FINS, Niagara Fox, DNP3, IEC 61850, NetBIOS, SMB, RPC,
-OPC UA, SNMPv2c, SNMPv3, and LLDP:
-
-```bash
-./lab/test.sh
-```
-
-It requires Linux containers, Docker Engine with Compose, and permission to use the Docker daemon.
-The scanner and Siemens containers receive only `NET_RAW`; the lab does not use host networking or
-publish protocol ports. Windows developers can run the same command through Docker Desktop with
-WSL2. Its Siemens DCP response is delayed by 55 seconds, so the test fails if the one-minute DCP
-collection window regresses. Scan JSON and Compose logs are retained under `lab/artifacts/`.
-
-To exercise the native Windows executable against the Docker Desktop responders, run PowerShell on
-the Windows host:
-
-```powershell
-.\lab\test-windows.ps1
-```
-
-The Windows version is a protocol-client smoke test, not a multi-device discovery test. It binds the
-responder ports only to Docker/WSL's host-only Hyper-V adapter and runs the real `.exe` against that
-single host-routed endpoint. Consequently, Windows ARP sees the Hyper-V adapter's MAC and all
-forwarded protocol responses belong to that one temporary identity; Docker's internal container
-MACs are not visible to the Windows host. The importable scan is deleted after validation and only a
-plain-text summary and Compose log are retained.
-
-This smoke test covers Windows ARP, S7, EtherNet/IP, BACnet, FINS, Fox, DNP3, OPC UA, SNMP, and LLDP
-client paths. It does not verify distinct device MAC correlation. Docker Desktop also does not bridge
-raw Ethernet frames between its Linux bridge and a Windows capture driver, so the harness disables
-PROFINET DCP. Active Windows DCP and multi-device MAC discovery require physical Layer-2 test devices
-or a dedicated external Layer-2 test interface. Run this validation ad hoc after changing Npcap
-capture code or updating the installed Npcap version.
-
-Images use pinned Snap7, libIEC61850, and SNMP Simulator packages plus checksum-pinned OpENer and BACnet Stack
-sources; the repository's small FINS, Fox, and DNP3 responders implement only the fixed read-only
-identity requests sent by this scanner. The OPC UA responder uses the maintained asyncua (opcua-asyncio)
-Python stack.
-NetBIOS interoperability uses Samba's `nmbd` with a fixed computer name and workgroup.
-SMB and RPC interoperability use real Samba `smbd` and `samba-dcerpcd` services, without completing
-authentication. Rust tests cover synthetic Windows build challenges, shared client/server builds,
-missing versions, malformed frames, split TCP reads, and stopping before authentication. The Linux
-lab does not establish interoperability with every Windows release; validate actual Windows targets
-with their configured firewalls and NTLM policies. The Docker Desktop Windows smoke harness excludes
-SMB/RPC because host Windows services already own TCP 445/135.
-An additional isolated Samba service offers **SMB1 only** (`server min/max protocol = NT1`), so
-the lab verifies the real fallback, NTLM names, native strings, independent disablement, and
-MAC-less unresolved export. Classic-security handling and old short NTLM challenges have focused
-Rust wire fixtures; they are not represented as live legacy-Windows interoperability results.
+Enter the enrollment token at the prompt. On later starts, omit `--enroll` to reuse the saved
+credential. Configure and schedule scans in OTserver. Remote controllers require HTTPS;
+HTTP is supported only for loopback addresses.
+
+See [AGENTS.md](AGENTS.md) for configuration examples, direct uploads, controller operation,
+platform details, and troubleshooting constraints.
 
 ## Development
 
-Run the checks before committing:
+Build from source with Rust:
 
 ```bash
-cargo fmt -- --check
-cargo check --locked
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
-cargo llvm-cov --lib --fail-under-lines 90 --summary-only -- --test-threads=1
-./lab/test.sh
+cargo build --locked --release
 ```
 
-Scanner branch, loop, and parser logic needs a focused Rust unit test. Protocol interoperability
-belongs in the Docker lab. The canonical wire contract is
-[`contracts/otserver-scan-v2.schema.json`](contracts/otserver-scan-v2.schema.json); a contract
-change requires coordinated updates in the [OTserver](https://github.com/ruveydac/OTserver) importer.
+For a headless build, add `--no-default-features`.
+See [AGENTS.md](AGENTS.md) for protocol rules, export-contract requirements, test commands,
+and the virtual OT lab.
 
 ## License
 
-OTserver Otter is dual-licensed with OTserver: it is available under
-[GNU AGPLv3](LICENCE.md), or under a commercial license for proprietary use
-without AGPLv3 copyleft obligations. For commercial licensing, enterprise
-features, or managed hosting, visit [otserver.org/enterprise](https://otserver.org/enterprise/).
+OTserver Otter is available under [GNU AGPLv3](LICENCE.md) or a commercial license for proprietary
+use without AGPLv3 copyleft obligations. For commercial licensing, enterprise features, or managed
+hosting, visit [otserver.org/enterprise](https://otserver.org/enterprise/).
 
-The scanner and the detection needed to find assets and device capabilities
-will remain 100% open source. Optional enterprise add-ons, such as SSO
-integrations or customized dashboards, do not restrict the open-source core.
+The scanner and detection needed to find assets and device capabilities will remain open source.
+Optional enterprise add-ons do not restrict the open-source core.
