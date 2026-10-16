@@ -1,13 +1,27 @@
+<div align="center">
+
 # OTserver Otter
 
-Read-only discovery of industrial devices for [OTserver](https://github.com/ruveydac/OTserver).
+### Read-only OT discovery for the [OTserver inventory](https://github.com/ruveydac/OTserver)
+
+Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Fox · DNP3 · IEC 61850 · NetBIOS · SMB · RPC · OPC UA · SNMP · LLDP
+
+[![Website](https://img.shields.io/badge/otserver.org-111111?logo=firefoxbrowser&logoColor=white)](https://otserver.org)
+[![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Platforms](https://img.shields.io/badge/Windows_%7C_Linux-0078D6?logo=windows&logoColor=white)](#quick-start)
+[![OTserver](https://img.shields.io/badge/OTserver-Next.js-000000?logo=javascript&logoColor=white)](https://github.com/ruveydac/OTserver)
+[![AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENCE.md)
+
+[Quick start](#quick-start) · [Protocols](#what-it-discovers) · [Configuration](#configuration-and-managed-scans) · [Development](#development)
+
+</div>
+
+---
 
 Otter is a Windows and Linux discovery tool with a command-line interface and an optional GUI.
 It collects device identities, firmware, network interfaces, and topology, then exports JSON
 that you can import into OTserver. It can also upload results directly or run as a centrally
 managed scanner.
-
-[Website](https://otserver.org) · [Download](https://github.com/ruveydac/otserver-otter/releases) · [Quick start](#quick-start) · [License](#license)
 
 ## What it discovers
 
