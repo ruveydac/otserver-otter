@@ -111,6 +111,53 @@ pub struct ScanArgs {
     pub server_url: Option<String>,
     #[arg(long)]
     pub site: Option<String>,
+    /// Disable TLS certificate and hostname validation for HTTP clients.
+    #[arg(long)]
+    pub ignore_self_signed: bool,
+    /// Proxy HTTP requests through URL. HTTPS requests remain direct unless --https-proxy is supplied.
+    #[arg(long, value_name = "URL")]
+    pub http_proxy: Option<String>,
+    /// Proxy HTTPS requests through URL. HTTP requests remain direct unless --http-proxy is supplied.
+    #[arg(long, value_name = "URL")]
+    pub https_proxy: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HttpOptions {
+    pub ignore_self_signed: bool,
+    pub http_proxy: Option<String>,
+    pub https_proxy: Option<String>,
+}
+
+impl HttpOptions {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if let Some(proxy) = self.http_proxy.as_deref() {
+            reqwest::Proxy::http(proxy).map_err(|_| "HTTP proxy URL is invalid.")?;
+        }
+        if let Some(proxy) = self.https_proxy.as_deref() {
+            reqwest::Proxy::https(proxy).map_err(|_| "HTTPS proxy URL is invalid.")?;
+        }
+        Ok(())
+    }
+
+    pub fn apply(
+        &self,
+        mut builder: reqwest::ClientBuilder,
+    ) -> Result<reqwest::ClientBuilder, &'static str> {
+        self.validate()?;
+        if self.ignore_self_signed {
+            builder = builder.tls_danger_accept_invalid_certs(true);
+        }
+        if let Some(proxy) = self.http_proxy.as_deref() {
+            builder = builder
+                .proxy(reqwest::Proxy::http(proxy).map_err(|_| "HTTP proxy URL is invalid.")?);
+        }
+        if let Some(proxy) = self.https_proxy.as_deref() {
+            builder = builder
+                .proxy(reqwest::Proxy::https(proxy).map_err(|_| "HTTPS proxy URL is invalid.")?);
+        }
+        Ok(builder)
+    }
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -258,6 +305,7 @@ pub struct UploadOptions {
     pub endpoint: reqwest::Url,
     pub site: String,
     pub api_key: String,
+    pub http: HttpOptions,
 }
 
 pub struct ScanOptions {
@@ -509,6 +557,12 @@ pub fn resolve_scan(
     config: ScannerConfig,
     environment_api_key: Option<String>,
 ) -> Result<ScanOptions, String> {
+    let http = HttpOptions {
+        ignore_self_signed: args.ignore_self_signed,
+        http_proxy: args.http_proxy,
+        https_proxy: args.https_proxy,
+    };
+    http.validate().map_err(str::to_owned)?;
     let no_native_protocols = args.no_protocols || config.no_protocols.unwrap_or(false);
     let protocols = ProtocolOptions {
         arp: !(args.no_arp || config.no_arp.unwrap_or(false)),
@@ -548,6 +602,7 @@ pub fn resolve_scan(
             endpoint: import_endpoint(&server_url)?,
             site,
             api_key,
+            http,
         }),
         _ => {
             return Err(
@@ -1035,11 +1090,17 @@ async fn send_import(
             .to_string(),
         )
         .part("file", file);
-    let mut response = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(IMPORT_TIMEOUT)
-        .build()
+    let client = options
+        .http
+        .apply(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(IMPORT_TIMEOUT),
+        )
         .map_err(|error| format!("Could not initialize OTserver upload: {error}"))?
+        .build()
+        .map_err(|error| format!("Could not initialize OTserver upload: {error}"))?;
+    let mut response = client
         .post(options.endpoint.clone())
         .header(
             reqwest::header::AUTHORIZATION,
@@ -1582,6 +1643,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_explicit_proxy_urls() {
+        assert_eq!(
+            HttpOptions {
+                http_proxy: Some("not a URL".into()),
+                ..HttpOptions::default()
+            }
+            .validate(),
+            Err("HTTP proxy URL is invalid.")
+        );
+        assert_eq!(
+            HttpOptions {
+                https_proxy: Some("not a URL".into()),
+                ..HttpOptions::default()
+            }
+            .validate(),
+            Err("HTTPS proxy URL is invalid.")
+        );
+    }
+
+    #[test]
     fn resolves_config_with_cli_and_environment_precedence() {
         let config = parse_config(
             br#"{
@@ -1601,6 +1682,9 @@ mod tests {
         let config = config.configs()[0].clone();
         let mut cli = args();
         cli.interface = Some("cli-interface".into());
+        cli.ignore_self_signed = true;
+        cli.http_proxy = Some("http://proxy.example:8080".into());
+        cli.https_proxy = Some("http://secure-proxy.example:8080".into());
         let resolved = resolve_scan(cli, config, Some("environment-key".into())).unwrap();
 
         assert_eq!(resolved.targets, ["192.0.2.0/24"]);
@@ -1629,6 +1713,14 @@ mod tests {
         );
         assert_eq!(upload.api_key, "environment-key");
         assert_eq!(upload.site, "site-1");
+        assert_eq!(
+            upload.http,
+            HttpOptions {
+                ignore_self_signed: true,
+                http_proxy: Some("http://proxy.example:8080".into()),
+                https_proxy: Some("http://secure-proxy.example:8080".into()),
+            }
+        );
     }
 
     #[test]
@@ -1867,6 +1959,11 @@ mod tests {
             "--no-opcua",
             "--no-snmp",
             "--no-lldp",
+            "--ignore-self-signed",
+            "--http-proxy",
+            "http://proxy.example:8080",
+            "--https-proxy",
+            "http://secure-proxy.example:8080",
         ])
         .unwrap();
         let Some(Commands::Scan(args)) = cli.command else {
@@ -1886,6 +1983,15 @@ mod tests {
         assert!(args.no_opcua);
         assert!(args.no_snmp);
         assert!(args.no_lldp);
+        assert!(args.ignore_self_signed);
+        assert_eq!(
+            args.http_proxy.as_deref(),
+            Some("http://proxy.example:8080")
+        );
+        assert_eq!(
+            args.https_proxy.as_deref(),
+            Some("http://secure-proxy.example:8080")
+        );
     }
 
     #[cfg(not(feature = "gui"))]
@@ -2315,7 +2421,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uploads_payload_multipart_with_api_key() {
+    async fn uploads_payload_multipart_with_api_key_through_http_proxy() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -2346,7 +2452,7 @@ mod tests {
                 }
             }
             let request = String::from_utf8_lossy(&request);
-            assert!(request.starts_with("POST /api/asset-imports HTTP/1.1"));
+            assert!(request.starts_with("POST http://127.0.0.1:"));
             assert!(request.contains("users API-Key secret-key"));
             assert!(request.contains("name=\"_payload\""));
             assert!(request.contains("\"site\":\"site-1\""));
@@ -2369,6 +2475,10 @@ mod tests {
             endpoint: reqwest::Url::parse(&format!("http://{address}/api/asset-imports")).unwrap(),
             site: "site-1".into(),
             api_key: "secret-key".into(),
+            http: HttpOptions {
+                http_proxy: Some(format!("http://{address}")),
+                ..HttpOptions::default()
+            },
         };
 
         let imported = send_import(
@@ -2400,6 +2510,7 @@ mod tests {
                     .unwrap(),
                 site: "site-1".into(),
                 api_key: "test-key".into(),
+                http: HttpOptions::default(),
             },
             b"{}".to_vec(),
             "scan.json",

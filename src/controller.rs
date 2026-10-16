@@ -3,7 +3,7 @@ mod store;
 #[cfg(test)]
 mod tests;
 
-use crate::{LogOutput, ScanArgs, ScanOptions, ScannerConfig, resolve_scan, scan};
+use crate::{HttpOptions, LogOutput, ScanArgs, ScanOptions, ScannerConfig, resolve_scan, scan};
 use clap::Args;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,15 @@ pub struct ControllerArgs {
     /// Request queued imports (requires OTSERVER_QUEUED_IMPORTS=on on the manager).
     #[arg(long)]
     queued_imports: bool,
+    /// Disable TLS certificate and hostname validation for HTTP clients.
+    #[arg(long)]
+    ignore_self_signed: bool,
+    /// Proxy HTTP requests through URL. HTTPS requests remain direct unless --https-proxy is supplied.
+    #[arg(long, value_name = "URL")]
+    http_proxy: Option<String>,
+    /// Proxy HTTPS requests through URL. HTTP requests remain direct unless --http-proxy is supplied.
+    #[arg(long, value_name = "URL")]
+    https_proxy: Option<String>,
 }
 
 // No Debug on objects containing controller or protocol credentials.
@@ -304,18 +313,23 @@ fn backoff(attempt: u32, jitter: u64) -> Duration {
 }
 
 impl Api {
-    fn new(base: Url) -> Result<Self, Error> {
+    fn new(base: Url, http: &HttpOptions) -> Result<Self, Error> {
+        let client = http
+            .apply(
+                Client::builder()
+                    .connect_timeout(Duration::from_secs(10))
+                    .timeout(Duration::from_secs(10))
+                    // Never forward machine credentials or enrollment data to a redirect target.
+                    .redirect(reqwest::redirect::Policy::none()),
+            )
+            .map_err(Error::Local)?
+            .build()
+            .map_err(|_| Error::Local("Could not initialize controller TLS client."))?;
         Ok(Self {
             base,
             credential: String::new(),
             queued_imports: false,
-            client: Client::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(10))
-                // Never forward machine credentials or enrollment data to a redirect target.
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(|_| Error::Local("Could not initialize controller TLS client."))?,
+            client,
         })
     }
 
@@ -981,7 +995,12 @@ async fn run_inner(args: ControllerArgs) -> Result<(), Error> {
             "State directory belongs to a different controller URL. To replace its saved enrollment and run state, re-enroll with --enroll --overwrite-state-dir. Retained scan exports will be kept.",
         ));
     }
-    let mut api = Api::new(base)?;
+    let http = HttpOptions {
+        ignore_self_signed: args.ignore_self_signed,
+        http_proxy: args.http_proxy,
+        https_proxy: args.https_proxy,
+    };
+    let mut api = Api::new(base, &http)?;
     api.queued_imports = args.queued_imports;
     if args.enroll {
         use std::io::{BufRead, Read};

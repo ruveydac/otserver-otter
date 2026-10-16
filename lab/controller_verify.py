@@ -150,8 +150,8 @@ def main(binary):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         state = root / "state"
-        environment = {**os.environ, "SSL_CERT_FILE": str(certificate)}
-        command = [binary, "controller", "--server-url", url, "--state-dir", str(state), "--poll-seconds", "1", "--file-credentials", "--queued-imports", "--ack-authorized"]
+        environment = os.environ.copy()
+        command = [binary, "controller", "--server-url", url, "--ignore-self-signed", "--state-dir", str(state), "--poll-seconds", "1", "--file-credentials", "--queued-imports", "--ack-authorized"]
         process = None
         try:
             process = subprocess.Popen([*command, "--enroll"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment)

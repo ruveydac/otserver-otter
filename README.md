@@ -161,9 +161,16 @@ otserver-otter controller --server-url https://otserver.example \
 ```
 
 The token is read from stdin rather than a command-line argument. HTTPS certificate validation is
-mandatory; only loopback URLs permit HTTP for development. No scanner-side listener is opened.
+enabled by default; only loopback URLs permit HTTP for development. For a private CA or a
+self-signed controller certificate, explicitly add `--ignore-self-signed`. This disables all TLS
+certificate and hostname validation for that process. No scanner-side listener is opened.
 Bare loopback addresses such as `127.0.0.1:3000`, `localhost:3000`, and `[::1]:3000` use HTTP;
 other hosts require an explicit `https://` URL. Match the manager's `OTSERVER_PUBLIC_URL`.
+
+Use `--http-proxy URL` and/or `--https-proxy URL` when the controller must be reached through
+explicit proxies. The flags select proxies for HTTP and HTTPS destinations respectively. The other
+destination scheme connects directly. The same flags are required on later starts, including starts
+that reuse saved credentials.
 Restart without `--enroll` to use the saved machine credential:
 
 ```bash
@@ -596,6 +603,11 @@ OTSERVER_API_KEY='...' otserver-otter scan \
   --site PAYLOAD_SITE_ID \
   --ack-authorized
 ```
+
+For a controller or API endpoint with an intentionally untrusted certificate, add
+`--ignore-self-signed`; this disables TLS certificate and hostname validation for that process.
+`--http-proxy URL` and `--https-proxy URL` select explicit proxies for HTTP and HTTPS upload
+destinations. The other scheme connects directly.
 
 Uploads use a 10-second connection timeout and a five-minute total deadline, including response
 body reads. OTserver responses are limited to 16 MiB, including chunked responses; upload failures

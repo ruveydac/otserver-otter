@@ -60,8 +60,11 @@ fn assignment(api: &Api) -> Assignment {
 
 async fn server(responses: Vec<(u16, Value)>) -> (Api, tokio::task::JoinHandle<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut api =
-        Api::new(base_url(&format!("http://{}", listener.local_addr().unwrap())).unwrap()).unwrap();
+    let mut api = Api::new(
+        base_url(&format!("http://{}", listener.local_addr().unwrap())).unwrap(),
+        &HttpOptions::default(),
+    )
+    .unwrap();
     api.credential = credential().credential;
     let task = tokio::spawn(async move {
         let mut requests = Vec::new();
@@ -235,7 +238,11 @@ async fn errors_redact_server_bodies_and_classify_auth_and_retry() {
 
 #[test]
 fn configuration_maps_profile_options_and_separate_credentials() {
-    let api = Api::new(base_url("https://example.com").unwrap()).unwrap();
+    let api = Api::new(
+        base_url("https://example.com").unwrap(),
+        &HttpOptions::default(),
+    )
+    .unwrap();
     let mut job = assignment(&api);
     for option in [
         "noProtocols",
@@ -278,7 +285,11 @@ fn configuration_maps_profile_options_and_separate_credentials() {
 
 #[test]
 fn managed_configuration_rejects_unsafe_overrides_and_invalid_targets() {
-    let api = Api::new(base_url("https://example.com").unwrap()).unwrap();
+    let api = Api::new(
+        base_url("https://example.com").unwrap(),
+        &HttpOptions::default(),
+    )
+    .unwrap();
     for (key, value) in [
         ("output", json!("/tmp/file")),
         ("apiKey", json!("secret")),
@@ -304,7 +315,11 @@ fn managed_configuration_rejects_unsafe_overrides_and_invalid_targets() {
 
 #[test]
 fn credentials_reject_unknown_or_invalid_protocol_settings() {
-    let api = Api::new(base_url("https://example.com").unwrap()).unwrap();
+    let api = Api::new(
+        base_url("https://example.com").unwrap(),
+        &HttpOptions::default(),
+    )
+    .unwrap();
     for secrets in [
         json!({"apiKey":"secret"}),
         json!({"snmp":[{"version":"4"}]}),
@@ -342,7 +357,11 @@ async fn rejected_configuration_reports_a_specific_reason_without_discovery() {
 
 #[test]
 fn rejected_configuration_distinguishes_null_type_target_and_credential_errors() {
-    let api = Api::new(base_url("http://localhost:3000").unwrap()).unwrap();
+    let api = Api::new(
+        base_url("http://localhost:3000").unwrap(),
+        &HttpOptions::default(),
+    )
+    .unwrap();
     for (key, value, reason) in [
         ("sourceMac", Value::Null, "null option"),
         ("noArp", json!("do-not-log-secret"), "invalid option types"),
@@ -591,8 +610,14 @@ fn failure_diagnostics_do_not_forward_arbitrary_secret_text() {
 
 #[tokio::test]
 async fn recovered_ready_assignment_uploads_once_and_finishes_separately_from_queued_import() {
-    let lease =
-        assignment(&Api::new(base_url("https://example.com").unwrap()).unwrap()).lease_expires_at;
+    let lease = assignment(
+        &Api::new(
+            base_url("https://example.com").unwrap(),
+            &HttpOptions::default(),
+        )
+        .unwrap(),
+    )
+    .lease_expires_at;
     let (mut api, task) = server(vec![
         (200, json!({"cancelRequested":false,"leaseExpiresAt":lease})),
         (200, json!({"cancelRequested":false,"leaseExpiresAt":lease})),
@@ -657,7 +682,11 @@ async fn cancellation_stops_work_before_it_is_polled() {
 
 #[tokio::test]
 async fn lost_lease_never_starts_upload() {
-    let api = Api::new(base_url("https://example.com").unwrap()).unwrap();
+    let api = Api::new(
+        base_url("https://example.com").unwrap(),
+        &HttpOptions::default(),
+    )
+    .unwrap();
     let ran = AtomicBool::new(false);
     let result = leased(&api, "run1", Instant::now(), 90, async {
         ran.store(true, Ordering::Relaxed);
@@ -759,4 +788,33 @@ fn overwrite_state_dir_requires_explicit_enrollment() {
         panic!("expected controller command")
     };
     assert!(args.overwrite_state_dir && args.enroll);
+}
+
+#[test]
+fn controller_accepts_http_connection_flags() {
+    let cli = crate::Cli::try_parse_from([
+        "otserver-otter",
+        "controller",
+        "--server-url",
+        "https://example.com",
+        "--ignore-self-signed",
+        "--http-proxy",
+        "http://proxy.example:8080",
+        "--https-proxy",
+        "http://secure-proxy.example:8080",
+        "--ack-authorized",
+    ])
+    .unwrap();
+    let Some(crate::Commands::Controller(args)) = cli.command else {
+        panic!("expected controller command");
+    };
+    assert!(args.ignore_self_signed);
+    assert_eq!(
+        args.http_proxy.as_deref(),
+        Some("http://proxy.example:8080")
+    );
+    assert_eq!(
+        args.https_proxy.as_deref(),
+        Some("http://secure-proxy.example:8080")
+    );
 }
