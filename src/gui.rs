@@ -1,6 +1,6 @@
 use crate::{
-    BatchResult, LogOutput, ScanArgs, ScannerConfig, ScannerConfigs, format_log_line, load_config,
-    nonempty_opt, prepare_scans, run_scan_batch, save_config_sync,
+    BatchResult, HttpOptions, LogOutput, ScanArgs, ScannerConfig, ScannerConfigs, controller,
+    format_log_line, load_config, nonempty_opt, prepare_scans, run_scan_batch, save_config_sync,
 };
 use eframe::egui;
 use otserver_otter::contract::Device;
@@ -21,6 +21,23 @@ enum ScanMessage {
     Log(String),
     Devices(Vec<Device>),
     Finished(BatchResult),
+}
+
+enum ControllerMessage {
+    Enrolled,
+    Installed(String),
+}
+
+fn local_scan_configs(configs: Vec<(String, ScannerConfig)>) -> Vec<(String, ScannerConfig)> {
+    configs
+        .into_iter()
+        .map(|(name, mut config)| {
+            config.server_url = None;
+            config.site = None;
+            config.api_key = None;
+            (name, config)
+        })
+        .collect()
 }
 
 impl LogOutput for GuiLogger {
@@ -251,9 +268,13 @@ pub struct GuiApp {
     opcua_enabled: bool,
     snmp_enabled: bool,
     lldp_enabled: bool,
-    server_url: String,
-    site: String,
-    api_key: String,
+    controller_url: String,
+    enrollment_token: String,
+    overwrite_enrollment: bool,
+    controller_http: HttpOptions,
+    controller_info: Option<controller::EnrollmentInfo>,
+    controller_status: String,
+    controller_rx: Option<Receiver<Result<ControllerMessage, String>>>,
     ack_authorized: bool,
 
     interfaces: Vec<CaptureInterface>,
@@ -319,9 +340,14 @@ impl GuiApp {
             opcua_enabled: true,
             snmp_enabled: true,
             lldp_enabled: true,
-            server_url: String::new(),
-            site: String::new(),
-            api_key: String::new(),
+            controller_url: String::new(),
+            enrollment_token: String::new(),
+            overwrite_enrollment: false,
+            controller_http: HttpOptions::default(),
+            controller_info: None,
+            controller_status:
+                "Not enrolled. Create a scanner in OTserver and copy its enrollment token.".into(),
+            controller_rx: None,
             ack_authorized: false,
             interfaces,
             log_text: format!("{}\n", format_log_line("OTserver Otter GUI ready.")),
@@ -415,9 +441,6 @@ impl GuiApp {
         self.opcua_credentials = opcua;
         self.selected_opcua = 0;
         self.load_opcua_buffers();
-        self.server_url = config.server_url.unwrap_or_default();
-        self.site = config.site.unwrap_or_default();
-        self.api_key = config.api_key.unwrap_or_default();
         #[cfg(windows)]
         self.refresh_npcap();
     }
@@ -541,9 +564,6 @@ impl GuiApp {
         config.opcua_credentials = self.opcua_credentials_config();
         config.opcua_username = None;
         config.opcua_password = None;
-        config.server_url = nonempty_opt(&self.server_url);
-        config.site = nonempty_opt(&self.site);
-        config.api_key = nonempty_opt(&self.api_key);
         config
     }
 
@@ -624,8 +644,7 @@ impl GuiApp {
             ack_authorized: true,
             ..ScanArgs::default()
         };
-        let env_key = std::env::var("OTSERVER_API_KEY").ok();
-        let (scans, failures) = match prepare_scans(args, configs, env_key) {
+        let (scans, failures) = match prepare_scans(args, local_scan_configs(configs), None) {
             Ok(prepared) => prepared,
             Err(err) => {
                 self.status = format!("Configuration error: {err}");
@@ -663,10 +682,119 @@ impl GuiApp {
             let _ = tx.send(ScanMessage::Finished(result));
         });
     }
+
+    fn refresh_enrollment(&mut self) {
+        match controller::enrollment_info(None) {
+            Ok(info) => {
+                if let Some(info) = &info {
+                    self.controller_url.clone_from(&info.server_url);
+                    self.controller_http = info.http.clone();
+                    self.controller_status = format!(
+                        "Enrolled as {} at site {}. Configure managed scans in OTserver.",
+                        info.name, info.site
+                    );
+                }
+                self.controller_info = info;
+            }
+            Err(error) => self.controller_status = error,
+        }
+    }
+
+    fn start_controller_action(&mut self, install: bool) {
+        if !self.ack_authorized || self.controller_rx.is_some() {
+            return;
+        }
+        let url = self.controller_url.clone();
+        let token = std::mem::take(&mut self.enrollment_token);
+        let overwrite = self.overwrite_enrollment;
+        let http = self.controller_http.clone();
+        let (tx, rx) = mpsc::channel();
+        self.controller_rx = Some(rx);
+        self.controller_status = if install {
+            "Installing controller. Complete any operating-system authorization prompt..."
+        } else {
+            "Enrolling scanner..."
+        }
+        .into();
+        std::thread::spawn(move || {
+            let result = if install {
+                controller::install_from_gui().map(ControllerMessage::Installed)
+            } else {
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| "Could not start enrollment worker.".to_owned())
+                    .and_then(|rt| {
+                        rt.block_on(controller::enroll_from_gui(url, token, overwrite, http))
+                    })
+                    .map(|()| ControllerMessage::Enrolled)
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    fn controller_controls(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.heading("OTserver controller");
+            if let Some(info) = &self.controller_info {
+                ui.label(format!("Enrolled: {} ({})", info.name, info.server_url));
+            }
+            ui.label("Enroll with a single-use token from OTserver > Otter Scanners. Managed scan settings and protocol credentials come from OTserver.");
+            let busy = self.controller_rx.is_some();
+            ui.add_enabled_ui(!busy, |ui| {
+                ui.label("Controller URL");
+                ui.add(egui::TextEdit::singleline(&mut self.controller_url).desired_width(f32::INFINITY).hint_text("https://otserver.example"));
+                ui.label("Enrollment token");
+                ui.add(egui::TextEdit::singleline(&mut self.enrollment_token).password(true).desired_width(f32::INFINITY));
+                ui.checkbox(&mut self.overwrite_enrollment, "Replace enrollment if this state belongs to a different controller");
+                egui::CollapsingHeader::new("Connection settings").show(ui, |ui| {
+                    ui.checkbox(&mut self.controller_http.ignore_self_signed, "Disable TLS certificate and hostname validation");
+                    for (label, proxy) in [("HTTP proxy", &mut self.controller_http.http_proxy), ("HTTPS proxy", &mut self.controller_http.https_proxy)] {
+                        let mut value = proxy.clone().unwrap_or_default();
+                        ui.label(label);
+                        if ui.add(egui::TextEdit::singleline(&mut value).password(true).desired_width(f32::INFINITY)).changed() { *proxy = nonempty_opt(&value); }
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(self.ack_authorized && !self.controller_url.trim().is_empty() && !self.enrollment_token.trim().is_empty(), egui::Button::new("Enroll")).clicked() {
+                        self.start_controller_action(false);
+                    }
+                    if self.controller_info.is_some() && ui.add_enabled(self.ack_authorized, egui::Button::new("Install controller")).clicked() {
+                        self.start_controller_action(true);
+                    }
+                });
+            });
+            if !self.ack_authorized { ui.label("Confirm authorization below before enrolling or installing."); }
+            if busy { ui.spinner(); }
+            ui.label(&self.controller_status);
+        });
+    }
 }
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(rx) = &self.controller_rx {
+            let result = match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(
+                    "Controller worker stopped unexpectedly. Retry the action.".into(),
+                )),
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(result) = result {
+                self.controller_rx = None;
+                match result {
+                    Ok(ControllerMessage::Enrolled) => {
+                        self.refresh_enrollment();
+                        self.overwrite_enrollment = false;
+                    }
+                    Ok(ControllerMessage::Installed(message)) => self.controller_status = message,
+                    Err(error) => {
+                        self.controller_status = format!("Controller setup failed: {error}")
+                    }
+                }
+            }
+        }
         let scan_messages: Vec<_> = self
             .log_rx
             .as_ref()
@@ -712,8 +840,8 @@ impl eframe::App for GuiApp {
             }
         }
 
-        if self.is_scanning {
-            ctx.request_repaint();
+        if self.is_scanning || self.controller_rx.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         egui::TopBottomPanel::top("app-header").show(ctx, |ui| {
@@ -725,7 +853,7 @@ impl eframe::App for GuiApp {
         });
 
         egui::TopBottomPanel::bottom("app-controls").show(ctx, |ui| {
-            let controls_enabled = !self.is_scanning;
+            let controls_enabled = !self.is_scanning && self.controller_rx.is_none();
             ui.horizontal_wrapped(|ui| {
                 ui.add_enabled(
                     controls_enabled,
@@ -1296,29 +1424,8 @@ impl eframe::App for GuiApp {
                 });
 
                 ui.add_space(8.0);
+                self.controller_controls(ui);
 
-                ui.group(|ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.heading("OTserver Direct Upload (Optional)");
-                    if text_row(
-                        ui,
-                        "Server Base URL:",
-                        egui::TextEdit::singleline(&mut self.server_url)
-                            .hint_text("https://otserver.example"),
-                    ) {
-                        self.save_config();
-                    }
-                    if text_row(ui, "Site ID:", egui::TextEdit::singleline(&mut self.site)) {
-                        self.save_config();
-                    }
-                    if text_row(
-                        ui,
-                        "API Key:",
-                        egui::TextEdit::singleline(&mut self.api_key).password(true),
-                    ) {
-                        self.save_config();
-                    }
-                });
                 });
         });
 
@@ -1539,7 +1646,11 @@ pub fn run_gui() -> Result<(), String> {
     eframe::run_native(
         "OTserver Otter",
         options,
-        Box::new(move |_cc| Ok(Box::new(GuiApp::new(configs)))),
+        Box::new(move |_cc| {
+            let mut app = GuiApp::new(configs);
+            app.refresh_enrollment();
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|err| {
         let message = format!("GUI error: {err}");
@@ -1565,6 +1676,102 @@ mod tests {
     use otserver_otter::contract::{Device, Observation, Source};
     use otserver_otter::profinet::{CaptureInterface, interface_mac};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn gui_scans_do_not_upload_using_hidden_legacy_api_credentials() {
+        let config = ScannerConfig {
+            targets: Some(vec!["192.0.2.1".into()]),
+            interface: Some("eth0".into()),
+            source_mac: Some("00:11:22:33:44:55".into()),
+            server_url: Some("https://old.example".into()),
+            site: Some("site1".into()),
+            api_key: Some("legacy-secret".into()),
+            ..ScannerConfig::default()
+        };
+        let configs = super::local_scan_configs(vec![("Local scan".into(), config.clone())]);
+        let (scans, failures) =
+            crate::prepare_scans(crate::ScanArgs::default(), configs, None).unwrap();
+        assert!(failures.is_empty());
+        assert!(scans[0].options.upload.is_none());
+        let app = GuiApp::new(ScannerConfigs::Single(Box::new(config)));
+        assert_eq!(app.to_config().api_key.as_deref(), Some("legacy-secret"));
+    }
+
+    #[test]
+    fn controller_actions_require_local_authorization() {
+        let mut app = GuiApp::new(ScannerConfigs::default());
+        app.controller_url = "https://example.com".into();
+        app.enrollment_token = "t".repeat(43);
+        app.start_controller_action(false);
+        app.start_controller_action(true);
+        assert!(app.controller_rx.is_none());
+        assert_eq!(app.enrollment_token, "t".repeat(43));
+    }
+
+    #[test]
+    fn controller_form_masks_tokens_and_has_real_enrollment_controls() {
+        let mut app = GuiApp::new(ScannerConfigs::default());
+        app.enrollment_token = "secret-enrollment-token".into();
+        let context = eframe::egui::Context::default();
+        let output = context.run(eframe::egui::RawInput::default(), |ctx| {
+            eframe::egui::CentralPanel::default().show(ctx, |ui| app.controller_controls(ui));
+        });
+        let rendered = format!("{:?}", output.shapes);
+        assert!(rendered.contains("Enroll"));
+        assert!(!rendered.contains("secret-enrollment-token"));
+        assert!(!rendered.contains("API Key") && !rendered.contains("Direct Upload"));
+        assert!(app.controller_rx.is_none());
+    }
+
+    #[test]
+    fn enrollment_button_dispatches_work_and_returns_url_validation_errors() {
+        use eframe::egui::{self, epaint::Shape};
+        let mut app = GuiApp::new(ScannerConfigs::default());
+        app.ack_authorized = true;
+        app.controller_url = "http://remote.example".into();
+        app.enrollment_token = "t".repeat(43);
+        let context = egui::Context::default();
+        let output = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.controller_controls(ui));
+        });
+        let position = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                Shape::Text(text) if text.galley.job.text == "Enroll" => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("enrollment button text");
+        for pressed in [true, false] {
+            let _ = context.run(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::default(),
+                        },
+                    ],
+                    ..egui::RawInput::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.controller_controls(ui));
+                },
+            );
+        }
+        let result = app
+            .controller_rx
+            .take()
+            .expect("enrollment worker")
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(matches!(result, Err(message) if message.contains("requires HTTPS")));
+        assert!(app.enrollment_token.is_empty());
+    }
 
     #[test]
     fn asset_title_prefers_first_ip_and_falls_back_to_mac() {

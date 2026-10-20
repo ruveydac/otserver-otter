@@ -16,3 +16,5 @@ trap cleanup EXIT INT TERM
 
 OTTER_DCP_RESPONSE_DELAY_SECONDS=0 $COMPOSE up --build --detach siemens
 $COMPOSE run --build --rm --no-deps -e OTTER_PNIO_ONLY=1 test
+OTTER_PNIO_FALLBACK_TEST=1 $COMPOSE up --detach --force-recreate siemens
+$COMPOSE run --rm --no-deps -e OTTER_PNIO_ONLY=1 -e OTTER_PNIO_FALLBACK_TEST=1 test

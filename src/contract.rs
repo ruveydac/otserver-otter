@@ -264,6 +264,22 @@ pub fn merge_devices(devices: Vec<Device>) -> Vec<Device> {
     merged.into_values().collect()
 }
 
+pub fn unique_ip_identities(devices: &[Device]) -> BTreeMap<String, String> {
+    let mut values = BTreeMap::<String, BTreeSet<String>>::new();
+    for device in devices {
+        for ip in &device.ip_addresses {
+            values
+                .entry(ip.clone())
+                .or_default()
+                .insert(device.mac_address.clone());
+        }
+    }
+    values
+        .into_iter()
+        .filter_map(|(ip, macs)| (macs.len() == 1).then(|| (ip, macs.into_iter().next().unwrap())))
+        .collect()
+}
+
 pub fn validate(scan: &ScanExport) -> Result<(), String> {
     if scan.format != "otserver-scan" || scan.schema_version != 2 {
         return Err("Unsupported scanner file. Expected otserver-scan schemaVersion 2.".into());

@@ -1,5 +1,6 @@
 use super::*;
 use clap::Parser;
+use std::future::ready;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -52,10 +53,28 @@ fn assignment(api: &Api) -> Assignment {
         configuration: json!({"name":"Test", "targets":["192.0.2.1"], "interface":"eth0", "sourceMac":"00:11:22:33:44:55", "serverUrl":api.base.as_str(), "site":"site1"}),
         credentials: json!({}),
         upload_path: "/api/asset-imports".into(),
-        lease_expires_at: (OffsetDateTime::now_utc() + time::Duration::seconds(120))
+        lease_expires_at: (OffsetDateTime::now_utc() + time::Duration::minutes(30))
             .format(&Rfc3339)
             .unwrap(),
     }
+}
+
+fn ready_upload(store: &store::Store, attempts: u8) -> State {
+    std::fs::write(store.result_path("run1"), b"{\"schemaVersion\":2}").unwrap();
+    let state = State {
+        scanner: Some(scanner()),
+        assignment: Some(RunState {
+            id: "run1".into(),
+            phase: Phase::Ready,
+            status: "completed".into(),
+            import_id: None,
+            message: None,
+            upload_attempts: attempts,
+        }),
+        ..State::default()
+    };
+    store.save(&state).unwrap();
+    state
 }
 
 async fn server(responses: Vec<(u16, Value)>) -> (Api, tokio::task::JoinHandle<Vec<String>>) {
@@ -66,7 +85,14 @@ async fn server(responses: Vec<(u16, Value)>) -> (Api, tokio::task::JoinHandle<V
     )
     .unwrap();
     api.credential = credential().credential;
-    let task = tokio::spawn(async move {
+    (api, serve(listener, responses))
+}
+
+fn serve(
+    listener: TcpListener,
+    responses: Vec<(u16, Value)>,
+) -> tokio::task::JoinHandle<Vec<String>> {
+    tokio::spawn(async move {
         let mut requests = Vec::new();
         for (status, value) in responses {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -92,12 +118,15 @@ async fn server(responses: Vec<(u16, Value)>) -> (Api, tokio::task::JoinHandle<V
                 }
             }
             requests.push(String::from_utf8(data).unwrap());
+            if status == 0 {
+                // Drop the connection without a response to simulate a network interruption.
+                continue;
+            }
             let body = value.to_string();
             socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
         }
         requests
-    });
-    (api, task)
+    })
 }
 
 #[test]
@@ -147,11 +176,99 @@ fn malformed_controller_url_has_an_actionable_redacted_error() {
     assert!(!error.to_string().contains("secret"));
 }
 
-#[test]
-fn backoff_is_bounded_and_jittered() {
-    assert_eq!(backoff(0, 0), Duration::from_millis(500));
-    assert_ne!(backoff(4, 0), backoff(4, 900));
-    assert!(backoff(100, u64::MAX) <= Duration::from_secs(300));
+#[tokio::test]
+async fn polling_retries_connection_loss_every_five_minutes_and_recovers() {
+    let (mut api, task) = server(vec![
+        (200, json!({"action":"idle", "retryAfterSeconds":45})),
+        (0, Value::Null),
+        (503, json!({"credential":"do-not-log"})),
+        (429, json!({})),
+        (200, json!({"action":"idle", "retryAfterSeconds":60})),
+        (401, json!({})),
+    ])
+    .await;
+    let store = PrivateStore::new();
+    let mut state = State {
+        scanner: Some(scanner()),
+        credential_expires_at: credential().credential_expires_at,
+        ..State::default()
+    };
+    for seconds in [45, 300, 300, 300, 60] {
+        assert_eq!(
+            poll_once(&mut api, store.get(), &mut state, 30, true).await,
+            Ok(Duration::from_secs(seconds))
+        );
+    }
+    assert_eq!(
+        poll_once(&mut api, store.get(), &mut state, 30, true).await,
+        Err(Error::Auth)
+    );
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 6);
+    assert!(requests.iter().all(|request| {
+        request.starts_with("POST /api/otter/v1/poll ")
+            && request.contains(&format!("authorization: Otter {}", "a".repeat(43)))
+    }));
+}
+
+#[tokio::test]
+async fn polling_retries_an_offline_controller_without_losing_retained_work() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut api = Api::new(
+        base_url(&format!("http://{address}")).unwrap(),
+        &HttpOptions::default(),
+    )
+    .unwrap();
+    api.credential = credential().credential;
+    let store = PrivateStore::new();
+    let mut state = State {
+        scanner: Some(scanner()),
+        credential_expires_at: credential().credential_expires_at,
+        assignment: Some(RunState {
+            id: "run1".into(),
+            phase: Phase::Finishing,
+            status: "completed".into(),
+            import_id: Some("import1".into()),
+            message: None,
+            upload_attempts: 0,
+        }),
+        ..State::default()
+    };
+    store.get().save(&state).unwrap();
+    drop(listener);
+    for _ in 0..2 {
+        assert_eq!(
+            poll_once(&mut api, store.get(), &mut state, 30, true).await,
+            Ok(Duration::from_secs(300))
+        );
+        assert!(state.assignment.as_ref().unwrap().phase == Phase::Finishing);
+        assert!(store.get().load().unwrap().assignment.unwrap().phase == Phase::Finishing);
+    }
+    let listener = TcpListener::bind(address).await.unwrap();
+    let job = assignment(&api);
+    let task = serve(
+        listener,
+        vec![
+            (
+                200,
+                json!({"action":"run", "run":{
+                    "id":job.id, "configuration":job.configuration, "credentials":job.credentials,
+                    "uploadPath":job.upload_path, "leaseExpiresAt":job.lease_expires_at
+                }}),
+            ),
+            (200, json!({"status":"completed"})),
+        ],
+    );
+    assert_eq!(
+        poll_once(&mut api, store.get(), &mut state, 30, true).await,
+        Ok(Duration::from_secs(30))
+    );
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].starts_with("POST /api/otter/v1/runs/run1/finish "));
+    assert!(requests[1].contains("\"importID\":\"import1\""));
+    assert!(store.get().load().unwrap().assignment.unwrap().phase == Phase::Terminal);
 }
 
 #[test]
@@ -396,6 +513,7 @@ fn file_credentials_and_assignment_survive_atomic_state_replacement() {
         status: "partial".into(),
         import_id: Some("import1".into()),
         message: None,
+        upload_attempts: 0,
     });
     store.get().save(&state).unwrap();
     let recovered = store.get().load().unwrap();
@@ -505,6 +623,7 @@ async fn recovered_scanning_assignment_is_failed_without_rescanning_or_uploading
             status: "failed".into(),
             import_id: None,
             message: None,
+            upload_attempts: 0,
         }),
         ..State::default()
     };
@@ -529,6 +648,7 @@ async fn finish_rejects_a_nonterminal_status_response() {
             status: "completed".into(),
             import_id: Some("import1".into()),
             message: None,
+            upload_attempts: 0,
         }),
         ..State::default()
     };
@@ -557,6 +677,7 @@ async fn failure_reason_survives_a_failed_finish_request_and_restart() {
             status: "failed".into(),
             import_id: None,
             message: None,
+            upload_attempts: 0,
         }),
         ..State::default()
     };
@@ -606,6 +727,7 @@ fn failure_diagnostics_do_not_forward_arbitrary_secret_text() {
     }))
     .unwrap();
     assert!(legacy.message.is_none());
+    assert_eq!(legacy.upload_attempts, 0);
 }
 
 #[tokio::test]
@@ -637,6 +759,7 @@ async fn recovered_ready_assignment_uploads_once_and_finishes_separately_from_qu
             status: "partial".into(),
             import_id: None,
             message: None,
+            upload_attempts: 0,
         }),
         ..State::default()
     };
@@ -680,6 +803,205 @@ async fn cancellation_stops_work_before_it_is_polled() {
     task.await.unwrap();
 }
 
+#[tokio::test(start_paused = true)]
+async fn upload_retries_network_failures_after_two_minutes() {
+    let store = PrivateStore::new();
+    let mut state = ready_upload(store.get(), 0);
+    let start = Instant::now();
+    let mut attempts = Vec::new();
+    let imported = upload_with_retries(store.get(), &mut state, || {
+        attempts.push(start.elapsed());
+        let saved = store.get().load().unwrap().assignment.unwrap();
+        assert_eq!(usize::from(saved.upload_attempts), attempts.len());
+        ready(if attempts.len() < 3 {
+            Err(Error::Retry)
+        } else {
+            Ok(serde_json::from_value(json!({"id":"import1", "status":"completed"})).unwrap())
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(imported.id, "import1");
+    assert_eq!(attempts, [0, 120, 240].map(Duration::from_secs));
+}
+
+#[tokio::test(start_paused = true)]
+async fn upload_stops_after_five_retries_even_after_restart() {
+    let store = PrivateStore::new();
+    let mut state = ready_upload(store.get(), 0);
+    let start = Instant::now();
+    let mut attempts = Vec::new();
+    let result = upload_with_retries(store.get(), &mut state, || {
+        attempts.push(start.elapsed());
+        ready(Err(Error::Retry))
+    })
+    .await;
+    assert!(matches!(result, Err(Error::UploadRetriesExhausted)));
+    assert_eq!(
+        attempts,
+        [0, 120, 240, 360, 480, 600].map(Duration::from_secs)
+    );
+    let mut recovered = store.get().load().unwrap();
+    let result =
+        upload_with_retries(store.get(), &mut recovered, || ready(Err(Error::Invalid))).await;
+    assert!(matches!(result, Err(Error::UploadRetriesExhausted)));
+    assert_eq!(recovered.assignment.unwrap().upload_attempts, 6);
+}
+
+#[tokio::test(start_paused = true)]
+async fn interrupted_upload_retry_resumes_the_saved_budget_and_waits_two_minutes() {
+    let store = PrivateStore::new();
+    let mut state = ready_upload(store.get(), 0);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            upload_with_retries(store.get(), &mut state, || ready(Err(Error::Retry)))
+        )
+        .await
+        .is_err()
+    );
+    let mut recovered = store.get().load().unwrap();
+    assert_eq!(recovered.assignment.as_ref().unwrap().upload_attempts, 1);
+    let restart = Instant::now();
+    let imported = upload_with_retries(store.get(), &mut recovered, || {
+        assert_eq!(restart.elapsed(), Duration::from_secs(120));
+        ready(Ok(serde_json::from_value(
+            json!({"id":"import1", "status":"completed"}),
+        )
+        .unwrap()))
+    })
+    .await
+    .unwrap();
+    assert_eq!(imported.id, "import1");
+    let saved = store.get().load().unwrap();
+    assert_eq!(saved.assignment.unwrap().upload_attempts, 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn upload_does_not_retry_auth_terminal_invalid_or_local_errors() {
+    for error in [
+        Error::Auth,
+        Error::Terminal,
+        Error::Invalid,
+        Error::Local("Unreadable result"),
+    ] {
+        let store = PrivateStore::new();
+        let mut state = ready_upload(store.get(), 0);
+        let start = Instant::now();
+        let expected = error.to_string();
+        let mut error = Some(error);
+        let result = upload_with_retries(store.get(), &mut state, || {
+            ready(Err(error
+                .take()
+                .expect("non-network failures must not retry")))
+        })
+        .await;
+        assert_eq!(result.err().unwrap().to_string(), expected);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert_eq!(state.assignment.unwrap().upload_attempts, 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn upload_does_not_resend_an_import_that_was_accepted_but_failed_processing() {
+    let store = PrivateStore::new();
+    let mut state = ready_upload(store.get(), 0);
+    let start = Instant::now();
+    let imported = upload_with_retries(store.get(), &mut state, || {
+        ready(Ok(serde_json::from_value(
+            json!({"id":"import1", "status":"failed"}),
+        )
+        .unwrap()))
+    })
+    .await
+    .unwrap();
+    assert_eq!(imported.status, "failed");
+    assert_eq!(start.elapsed(), Duration::ZERO);
+    assert_eq!(state.assignment.unwrap().upload_attempts, 1);
+}
+
+#[tokio::test]
+async fn exhausted_uploads_report_failure_and_retry_only_finishing() {
+    let lease = (OffsetDateTime::now_utc() + time::Duration::minutes(30))
+        .format(&Rfc3339)
+        .unwrap();
+    let (api, task) = server(vec![
+        (200, json!({"cancelRequested":false,"leaseExpiresAt":lease})),
+        (200, json!({"cancelRequested":false,"leaseExpiresAt":lease})),
+        (503, json!({})),
+        (200, json!({"status":"failed"})),
+    ])
+    .await;
+    let store = PrivateStore::new();
+    let mut state = ready_upload(store.get(), 6);
+    assert_eq!(
+        execute(&api, store.get(), &mut state, assignment(&api)).await,
+        Err(Error::Retry)
+    );
+    let mut recovered = store.get().load().unwrap();
+    let run = recovered.assignment.as_ref().unwrap();
+    assert!(run.phase == Phase::Finishing);
+    assert_eq!(run.status, "failed");
+    assert_eq!(run.message, Some(Error::UploadRetriesExhausted.to_string()));
+    execute(&api, store.get(), &mut recovered, assignment(&api))
+        .await
+        .unwrap();
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[2..].iter().all(|request| {
+        request.starts_with("POST /api/otter/v1/runs/run1/finish ")
+            && request.contains("initial attempt and 5 retries")
+    }));
+    assert!(recovered.assignment.unwrap().phase == Phase::Terminal);
+    assert!(store.get().result_path("run1").exists());
+}
+
+#[tokio::test]
+async fn upload_retry_wait_keeps_heartbeats_and_stops_on_cancellation() {
+    let lease = (OffsetDateTime::now_utc() + time::Duration::minutes(30))
+        .format(&Rfc3339)
+        .unwrap();
+    let (api, task) = server(vec![
+        (200, json!({"cancelRequested":false,"leaseExpiresAt":lease})),
+        (200, json!({"cancelRequested":true})),
+    ])
+    .await;
+    let store = PrivateStore::new();
+    let mut state = ready_upload(store.get(), 0);
+    let result = leased(
+        &api,
+        "run1",
+        Instant::now() + Duration::from_secs(30),
+        90,
+        upload_with_retries(store.get(), &mut state, || ready(Err(Error::Retry))),
+    )
+    .await;
+    assert!(matches!(result, Err(Error::Local("cancelled"))));
+    assert_eq!(state.assignment.unwrap().upload_attempts, 1);
+    assert_eq!(task.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn lease_expiry_cancels_an_upload_retry_wait() {
+    let (api, task) = server(vec![(503, json!({}))]).await;
+    let store = PrivateStore::new();
+    let mut state = ready_upload(store.get(), 0);
+    let result = leased(
+        &api,
+        "run1",
+        Instant::now() + Duration::from_secs(10),
+        90,
+        upload_with_retries(store.get(), &mut state, || {
+            tokio::time::pause();
+            ready(Err(Error::Retry))
+        }),
+    )
+    .await;
+    assert!(matches!(result, Err(Error::Terminal)));
+    assert_eq!(state.assignment.unwrap().upload_attempts, 1);
+    task.await.unwrap();
+}
+
 #[tokio::test]
 async fn lost_lease_never_starts_upload() {
     let api = Api::new(
@@ -695,6 +1017,28 @@ async fn lost_lease_never_starts_upload() {
     .await;
     assert_eq!(result, Err(Error::Terminal));
     assert!(!ran.load(Ordering::Relaxed));
+}
+
+#[test]
+fn lease_deadline_accepts_thirty_minutes_but_respects_shorter_server_deadlines() {
+    for (seconds, expected) in [(120, 115), (1800, 1795), (3600, 1795)] {
+        let expiry = (OffsetDateTime::now_utc() + time::Duration::seconds(seconds))
+            .format(&Rfc3339)
+            .unwrap();
+        let remaining = lease_deadline(&expiry).unwrap() - Instant::now();
+        assert!(remaining <= Duration::from_secs(expected));
+        assert!(remaining >= Duration::from_secs(expected - 1));
+    }
+}
+
+#[test]
+fn lease_deadline_rejects_expiry_within_the_safety_margin() {
+    for seconds in [-1, 0, 4] {
+        let expiry = (OffsetDateTime::now_utc() + time::Duration::seconds(seconds))
+            .format(&Rfc3339)
+            .unwrap();
+        assert_eq!(lease_deadline(&expiry), Err(Error::Terminal));
+    }
 }
 
 #[test]
@@ -816,5 +1160,139 @@ fn controller_accepts_http_connection_flags() {
     assert_eq!(
         args.https_proxy.as_deref(),
         Some("http://secure-proxy.example:8080")
+    );
+}
+
+fn controller_args(arguments: &[&str]) -> ControllerArgs {
+    let cli = crate::Cli::try_parse_from(
+        ["otserver-otter", "controller", "--ack-authorized"]
+            .into_iter()
+            .chain(arguments.iter().copied()),
+    )
+    .unwrap();
+    let Some(crate::Commands::Controller(args)) = cli.command else {
+        panic!("expected controller")
+    };
+    args
+}
+
+#[tokio::test]
+async fn enrollment_only_saves_credentials_and_connection_settings_without_polling() {
+    let issued = credential();
+    let (api, requests) = server(vec![(
+        201,
+        json!({
+            "credential": issued.credential, "credentialExpiresAt": issued.credential_expires_at,
+            "scanner": {"id":"scanner1", "name":"Enrolled scanner", "site":"site1"}
+        }),
+    )])
+    .await;
+    let mut private = PrivateStore::new();
+    private.store.take();
+    let args = controller_args(&[
+        "--server-url",
+        api.base.as_str(),
+        "--state-dir",
+        private.path.to_str().unwrap(),
+        "--enroll",
+        "--enroll-only",
+        "--file-credentials",
+        "--queued-imports",
+        "--poll-seconds",
+        "75",
+        "--https-proxy",
+        "http://proxy.example:8080",
+        "--ignore-self-signed",
+    ]);
+    let token = "t".repeat(43);
+    let (store, state, _) = initialize(&args, Some(&token)).await.unwrap();
+    let requests = requests.await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("POST /api/otter/v1/enroll "));
+    assert!(!requests[0].to_lowercase().contains("authorization:"));
+    assert_eq!(state.settings.poll_seconds, 75);
+    assert!(state.settings.queued_imports && state.settings.http.ignore_self_signed);
+    assert_eq!(store.credential(&state).unwrap(), issued.credential);
+    let saved = std::fs::read_to_string(private.path.join("agent-state.json")).unwrap();
+    assert!(!saved.contains(&token));
+    drop(store);
+    // Installed services omit the URL and connection switches, reusing private saved settings.
+    let restart = controller_args(&["--state-dir", private.path.to_str().unwrap()]);
+    let (_, restarted, client) = initialize(&restart, None).await.unwrap();
+    assert_eq!(restarted.settings.poll_seconds, 75);
+    assert!(restarted.settings.file_credentials && client.queued_imports);
+    assert_eq!(
+        restarted.settings.http.https_proxy.as_deref(),
+        Some("http://proxy.example:8080")
+    );
+}
+
+#[tokio::test]
+async fn failed_reenrollment_preserves_previous_machine_credential_and_settings() {
+    let (api, requests) = server(vec![(400, json!({"error":"rejected"}))]).await;
+    let mut private = PrivateStore::new();
+    let old = credential();
+    let mut state = State {
+        server_url: "https://previous.example/".into(),
+        scanner: Some(scanner()),
+        settings: Settings {
+            poll_seconds: 80,
+            ..Settings::default()
+        },
+        ..State::default()
+    };
+    private
+        .get()
+        .persist_credential(&mut state, &old, true)
+        .unwrap();
+    private.store.take();
+    let args = controller_args(&[
+        "--server-url",
+        api.base.as_str(),
+        "--state-dir",
+        private.path.to_str().unwrap(),
+        "--enroll",
+        "--enroll-only",
+        "--overwrite-state-dir",
+        "--poll-seconds",
+        "25",
+    ]);
+    assert!(initialize(&args, Some(&"t".repeat(43))).await.is_err());
+    requests.await.unwrap();
+    let store = store::Store::open(Some(private.path.clone())).unwrap();
+    let state = store.load().unwrap();
+    assert_eq!(state.server_url, "https://previous.example/");
+    assert_eq!(state.settings.poll_seconds, 80);
+    assert_eq!(store.credential(&state).unwrap(), old.credential);
+}
+
+#[test]
+fn installation_requires_enrollment_and_excludes_automatic_reenrollment_arguments() {
+    let mut private = PrivateStore::new();
+    private.store.take();
+    assert_eq!(
+        install::install(Some(private.path.clone()), false).unwrap_err(),
+        "Enroll this scanner before installing the controller."
+    );
+    assert!(controller_args(&["--install"]).install);
+    assert!(
+        crate::Cli::try_parse_from([
+            "otserver-otter",
+            "controller",
+            "--ack-authorized",
+            "--enroll-only"
+        ])
+        .is_err()
+    );
+    assert!(
+        crate::Cli::try_parse_from([
+            "otserver-otter",
+            "controller",
+            "--ack-authorized",
+            "--enroll",
+            "--enroll-only",
+            "--install"
+        ])
+        .is_err()
     );
 }

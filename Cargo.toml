@@ -56,6 +56,7 @@ keyring = { version = "3.6", features = ["sync-secret-service", "crypto-rust", "
 winresource = { version = "0.1", default-features = false }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 async-opcua = { version = "0.19", features = ["server"] }
 iec61850-server = { version = "0.2", default-features = false, features = ["std", "full-server"] }
 

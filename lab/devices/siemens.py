@@ -21,6 +21,7 @@ EPM_INTERFACE_UUID = "e1af8308-5d1f-11c9-91a4-08002b14a0fa"
 PNIO_INTERFACE_UUID = "dea00001-6c97-11d1-8271-00a02442df7d"
 PNIO_OBJECT_UUID = "dea00000-6c97-11d1-8271-0001002a0007"
 RESPONSE_DELAY_SECONDS = float(os.environ.get("OTTER_DCP_RESPONSE_DELAY_SECONDS", "0"))
+PNIO_FALLBACK_TEST = os.environ.get("OTTER_PNIO_FALLBACK_TEST") == "1"
 
 
 def block(option: int, suboption: int, payload: bytes) -> bytes:
@@ -63,6 +64,8 @@ def dcp_blocks(mac: bytes) -> bytes:
 
 
 def respond_dcp(packet: Ether) -> None:
+    if PNIO_FALLBACK_TEST:
+        return
     request = bytes(packet)
     if (
         len(request) < 30
@@ -279,8 +282,9 @@ def read_body(request: bytes) -> bytes:
         + record
     )
     count = 64 + len(record)
+    status = 0xDE80B000 if PNIO_FALLBACK_TEST and index in (0xF821, 0xF840, 0xF000, 0xAFF2) else 0
     return (
-        (0).to_bytes(4, "little")
+        status.to_bytes(4, "little")
         + count.to_bytes(4, "little")
         + count.to_bytes(4, "little")
         + (0).to_bytes(4, "little")

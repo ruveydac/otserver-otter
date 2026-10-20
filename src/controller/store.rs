@@ -10,22 +10,7 @@ pub(super) struct Store {
 
 impl Store {
     pub(super) fn open(directory: Option<PathBuf>) -> Result<Self, Error> {
-        let directory = directory
-            .or_else(|| {
-                #[cfg(windows)]
-                let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-                #[cfg(not(windows))]
-                let base = std::env::var_os("XDG_STATE_HOME")
-                    .map(PathBuf::from)
-                    .or_else(|| {
-                        std::env::var_os("HOME")
-                            .map(|home| PathBuf::from(home).join(".local/state"))
-                    });
-                base.map(|base| base.join("otserver-otter"))
-            })
-            .ok_or(Error::Local(
-                "Choose --state-dir for managed scanner state.",
-            ))?;
+        let directory = Self::directory(directory)?;
         if !directory.exists() {
             std::fs::create_dir_all(directory.parent().ok_or(Error::Invalid)?)
                 .map_err(|_| Error::Local("Could not create managed state parent directory."))?;
@@ -55,18 +40,53 @@ impl Store {
             .open(directory.join("agent.lock"))
             .map_err(|_| Error::Local("Could not open managed scanner lock."))?;
         lock.try_lock()
-            .map_err(|_| Error::Local("Another managed scanner is using this state directory."))?;
+            .map_err(|_| Error::Local("Another managed scanner is using this state directory. Stop that controller before enrolling or changing its installation."))?;
         Ok(Self {
             directory,
             _lock: lock,
         })
     }
 
+    pub(super) fn directory(directory: Option<PathBuf>) -> Result<PathBuf, Error> {
+        let directory = directory
+            .or_else(|| {
+                #[cfg(windows)]
+                let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+                #[cfg(not(windows))]
+                let base = std::env::var_os("XDG_STATE_HOME")
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("HOME")
+                            .map(|home| PathBuf::from(home).join(".local/state"))
+                    });
+                base.map(|base| base.join("otserver-otter"))
+            })
+            .ok_or(Error::Local(
+                "Choose --state-dir for managed scanner state.",
+            ))?;
+        if directory.is_absolute() {
+            Ok(directory)
+        } else {
+            std::env::current_dir()
+                .map(|base| base.join(directory))
+                .map_err(|_| Error::Local("Could not resolve managed state directory."))
+        }
+    }
+
     pub(super) fn load(&self) -> Result<State, Error> {
-        let path = self.directory.join("agent-state.json");
+        Self::read_state(&self.directory)
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.directory
+    }
+
+    pub(super) fn read_state(directory: &Path) -> Result<State, Error> {
+        let path = directory.join("agent-state.json");
         if !path.exists() {
             return Ok(State::default());
         }
+        check_private(directory, true)?;
         check_private(&path, false)?;
         let mut data = Vec::new();
         File::open(path)

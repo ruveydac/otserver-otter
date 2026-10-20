@@ -177,6 +177,20 @@
           "fields": { "name": "Remote I/O", "status": "online" },
           "raw": {},
           "warnings": []
+        },
+        {
+          "source": "profinet-dcp",
+          "observedAt": "2026-10-13T09:00:07Z",
+          "ipAddress": "192.0.2.2",
+          "macAddress": "02:10:00:00:00:02",
+          "fields": {
+            "vendorId": 42,
+            "deviceId": 7,
+            "vendor": "SIEMENS AG",
+            "protocols": ["profinet"]
+          },
+          "raw": { "vendorId": 42, "deviceId": 7 },
+          "warnings": []
         }
       ],
       "interfaces": [],

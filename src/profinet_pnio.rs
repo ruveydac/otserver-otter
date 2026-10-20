@@ -14,6 +14,7 @@ const RPC_CLIENT_PORT: u16 = EPM_PORT;
 const DEFAULT_RECORD_DATA_LENGTH: u32 = 32_768;
 const MAX_RECORD_DATA_LENGTH: u32 = 32_768;
 const MAX_RPC_BODY_LENGTH: usize = MAX_RECORD_DATA_LENGTH as usize + 128;
+pub(crate) const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const EPM_INTERFACE: &str = "e1af8308-5d1f-11c9-91a4-08002b14a0fa";
 const PNIO_INTERFACE: &str = "dea00001-6c97-11d1-8271-00a02442df7d";
@@ -140,6 +141,12 @@ pub(crate) struct RecordRead {
     pub parsed: Value,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct RecordScan {
+    pub records: Vec<RecordRead>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct UdpFrame<'a> {
     pub source_mac: [u8; 6],
@@ -165,7 +172,10 @@ pub(crate) fn read_records(
     timeout: Duration,
     cancelled: &AtomicBool,
     mut transact: impl FnMut(u16, &[u8], Duration, &AtomicBool) -> Result<(RpcHeader, Vec<u8>), String>,
-) -> Result<Vec<RecordRead>, String> {
+) -> Result<RecordScan, String> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("PROFINET PNIO record scan was cancelled.".into());
+    }
     let activity_uuid = Uuid::new_v4();
     let mut sequence = 0;
     let epm_request = build_epm_request(activity_uuid, sequence, None)?;
@@ -175,6 +185,9 @@ pub(crate) fn read_records(
     let mut epm = parse_epm_response(&epm_packet)?;
     let mut endpoint = epm.endpoint.take();
     if endpoint.is_none() {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("PROFINET PNIO endpoint lookup was cancelled.".into());
+        }
         sequence += 1;
         let request = build_epm_request(activity_uuid, sequence, Some(&epm.handle))?;
         let (header, mut body) = transact(EPM_PORT, &request, timeout, cancelled)?;
@@ -197,23 +210,39 @@ pub(crate) fn read_records(
         index,
         data_length: DEFAULT_RECORD_DATA_LENGTH,
     };
-    let mut records = Vec::new();
-    let mut read_one = |target: RecordTarget| -> Result<RecordRead, String> {
-        sequence = sequence.wrapping_add(1);
-        let request = build_read_request(&endpoint, &target, sequence)?;
-        let (header, body) = transact(endpoint.port, &request, timeout, cancelled)?;
-        let response = parse_read_response(&header, &body, &target)?;
-        let parsed = parse_record(target.index, &response.data)?;
-        Ok(RecordRead {
-            target: response.target,
-            data: response.data,
-            parsed,
-        })
+    let mut result = RecordScan::default();
+    let mut read_one = |target: RecordTarget| -> Option<RecordRead> {
+        if cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut read = || -> Result<RecordRead, String> {
+            sequence = sequence.wrapping_add(1);
+            let request = build_read_request(&endpoint, &target, sequence)?;
+            let (header, body) = transact(endpoint.port, &request, timeout, cancelled)?;
+            let response = parse_read_response(&header, &body, &target)?;
+            let parsed = parse_record(target.index, &response.data)?;
+            Ok(RecordRead {
+                target: response.target,
+                data: response.data,
+                parsed,
+            })
+        };
+        match read() {
+            Ok(record) => Some(record),
+            Err(error) => {
+                result.warnings.push(format!(
+                    "PNIO record 0x{:04X} (API {}, slot {}, subslot {}) failed: {error}",
+                    target.index, target.api, target.slot, target.subslot,
+                ));
+                None
+            }
+        }
     };
 
-    let api_record = read_one(primary(0xF821))?;
-    let apis = api_record.parsed["apis"]
-        .as_array()
+    let api_record = read_one(primary(0xF821));
+    let apis = api_record
+        .as_ref()
+        .and_then(|record| record.parsed["apis"].as_array())
         .map(|values| {
             values
                 .iter()
@@ -222,25 +251,31 @@ pub(crate) fn read_records(
         })
         .filter(|values| !values.is_empty())
         .unwrap_or_else(|| vec![0]);
-    records.push(api_record);
+    result.records.extend(api_record);
 
     let mut module_targets = BTreeSet::new();
     for api in apis {
         for index in [0xF840, 0xF000] {
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
             let target = RecordTarget {
                 api,
                 ..primary(index)
             };
-            let Ok(record) = read_one(target) else {
+            let Some(record) = read_one(target) else {
                 continue;
             };
             collect_module_targets(&record.parsed, api, &mut module_targets);
-            records.push(record);
+            result.records.push(record);
         }
     }
     module_targets.insert((0, 0, 1));
     let mut im_targets = BTreeSet::new();
     for (api, slot, subslot) in module_targets {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
         let target = RecordTarget {
             api,
             slot,
@@ -248,7 +283,7 @@ pub(crate) fn read_records(
             index: 0xAFF0,
             data_length: DEFAULT_RECORD_DATA_LENGTH,
         };
-        let Ok(record) = read_one(target) else {
+        let Some(record) = read_one(target) else {
             continue;
         };
         let supported = record.parsed["imSupported"].as_u64().unwrap_or(0) as u16;
@@ -263,20 +298,28 @@ pub(crate) fn read_records(
                 im_targets.insert((api, slot, subslot, index));
             }
         }
-        records.push(record);
+        result.records.push(record);
     }
     for (api, slot, subslot, index) in im_targets {
-        if let Ok(record) = read_one(RecordTarget {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        if let Some(record) = read_one(RecordTarget {
             api,
             slot,
             subslot,
             index,
             data_length: DEFAULT_RECORD_DATA_LENGTH,
         }) {
-            records.push(record);
+            result.records.push(record);
         }
     }
-    Ok(records)
+    if cancelled.load(Ordering::Relaxed) {
+        result
+            .warnings
+            .push("PROFINET PNIO record scan was cancelled; results are incomplete.".into());
+    }
+    Ok(result)
 }
 
 fn collect_module_targets(value: &Value, api: u32, targets: &mut BTreeSet<(u32, u16, u16)>) {
@@ -1718,7 +1761,7 @@ mod tests {
         let cancelled = AtomicBool::new(false);
         let endpoint = endpoint(false);
         let mut epm_calls = 0;
-        let records = read_records(
+        let scan = read_records(
             Duration::from_millis(10),
             &cancelled,
             |port, request, _, _| {
@@ -1760,6 +1803,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(epm_calls, 2);
+        assert!(scan.warnings.is_empty());
+        let records = scan.records;
         assert_eq!(records.len(), 15);
         assert!(records.iter().any(|record| record.target.index == 0xF821));
         assert!(records.iter().any(|record| record.target.index == 0xF840));
@@ -1790,6 +1835,143 @@ mod tests {
         let parsed = parse_record(0xAFF5, &im5_record()).unwrap();
         assert_eq!(parsed["im5Data"][0]["vendorId"], "1234");
         assert_eq!(parsed["assetManagementBlocks"].as_array().unwrap().len(), 3);
+    }
+
+    fn record_reply(
+        request: &[u8],
+        data: impl FnOnce(&RecordTarget) -> Result<Vec<u8>, String>,
+    ) -> Result<(RpcHeader, Vec<u8>), String> {
+        let header = parse_rpc_header(request)?;
+        let mut endpoint = endpoint(false);
+        endpoint.activity_uuid = header.activity_uuid;
+        let packet = if header.operation == 2 {
+            epm_response_packet(&header, Some(&endpoint), &EpmHandle::default())
+        } else {
+            let target = RecordTarget {
+                api: read_u32(request, 124, true)?,
+                slot: read_u16(request, 128, true)?,
+                subslot: read_u16(request, 130, true)?,
+                index: read_u16(request, 134, true)?,
+                data_length: read_u32(request, 136, true)?,
+            };
+            response_packet(&target, &endpoint, &data(&target)?, header.sequence)
+        };
+        parse_rpc_fragment(&packet)
+    }
+
+    #[test]
+    fn reads_primary_im_records_when_api_and_module_enumeration_fail() {
+        for malformed in [false, true] {
+            let mut requested = Vec::new();
+            let scan = read_records(
+                RESPONSE_TIMEOUT,
+                &AtomicBool::new(false),
+                |_, request, _, _| {
+                    record_reply(request, |target| {
+                        requested.push(target.clone());
+                        if matches!(target.index, 0xF821 | 0xF840 | 0xF000) {
+                            if malformed {
+                                return Ok(vec![0]);
+                            }
+                            return Err("response timed out".into());
+                        }
+                        Ok(record_for_index(target.index))
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(scan.warnings.len(), 3);
+            for index in [0xF821, 0xF840, 0xF000] {
+                assert!(scan.warnings.iter().any(|warning| {
+                    warning.contains(&format!("0x{index:04X} (API 0, slot 0, subslot 1)"))
+                }));
+            }
+            assert_eq!(
+                scan.records
+                    .iter()
+                    .map(|record| record.target.index)
+                    .collect::<Vec<_>>(),
+                [0xAFF0, 0xAFF1, 0xAFF2, 0xAFF3, 0xAFF4, 0xAFF5]
+            );
+            assert_eq!(scan.records[0].parsed["softwareRevision"], "V1.2.3");
+            assert!(
+                requested
+                    .iter()
+                    .all(|target| (target.api, target.slot, target.subslot) == (0, 0, 1))
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_partial_records_and_reports_failed_targets() {
+        let scan = read_records(
+            RESPONSE_TIMEOUT,
+            &AtomicBool::new(false),
+            |_, request, _, _| {
+                let mut rejected = false;
+                let (header, mut body) = record_reply(request, |target| {
+                    if target.index == 0xF840 {
+                        return Err("response timed out".into());
+                    }
+                    if target.index == 0xAFF0 && target.slot == 1 {
+                        rejected = true;
+                    }
+                    if target.index == 0xAFF2 {
+                        return Ok(vec![0]);
+                    }
+                    Ok(record_for_index(target.index))
+                })?;
+                if rejected {
+                    body[..4].copy_from_slice(&0xDE80_B000_u32.to_le_bytes());
+                }
+                Ok((header, body))
+            },
+        )
+        .unwrap();
+        assert_eq!(scan.warnings.len(), 3);
+        assert!(scan.warnings.iter().any(|warning| {
+            warning.contains("0xAFF0 (API 0, slot 1, subslot 1)") && warning.contains("DE80B000")
+        }));
+        assert!(
+            scan.warnings
+                .iter()
+                .any(|warning| warning.contains("0xAFF2 (API 0, slot 0, subslot 1)"))
+        );
+        assert!(
+            scan.records
+                .iter()
+                .any(|record| record.target.index == 0xAFF5 && record.target.slot == 0)
+        );
+        assert!(!scan.records.iter().any(|record| record.target.slot == 1
+            && record.target.index >= 0xAFF0
+            && record.target.index <= 0xAFF5));
+    }
+
+    #[test]
+    fn cancellation_retains_completed_records_and_stops_further_reads() {
+        let cancelled = AtomicBool::new(false);
+        let scan = read_records(RESPONSE_TIMEOUT, &cancelled, |_, request, _, _| {
+            assert!(!cancelled.load(Ordering::Relaxed));
+            record_reply(request, |target| {
+                if target.index == 0xAFF0 {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+                Ok(record_for_index(target.index))
+            })
+        })
+        .unwrap();
+        assert_eq!(scan.records.last().unwrap().target.index, 0xAFF0);
+        assert!(
+            scan.warnings
+                .iter()
+                .any(|warning| warning.contains("cancelled"))
+        );
+        assert!(
+            read_records(RESPONSE_TIMEOUT, &cancelled, |_, _, _, _| panic!(
+                "must not transmit"
+            ))
+            .is_err()
+        );
     }
 
     #[test]

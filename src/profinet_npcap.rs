@@ -1,4 +1,4 @@
-//! Active Windows PROFINET DCP through an independently installed Npcap driver.
+//! Active Windows ARP and PROFINET discovery through an independently installed Npcap driver.
 //!
 //! Npcap's `Packet.dll` API is loaded directly from its native System32 subdirectory so an obsolete
 //! WinPcap-compatible DLL cannot take precedence.
@@ -107,6 +107,40 @@ const DCP_FILTER: [BpfInsn; 10] = [
         k: 0,
     },
 ];
+
+const ARP_FILTER: [BpfInsn; 4] = [
+    BpfInsn {
+        code: 0x28,
+        jt: 0,
+        jf: 0,
+        k: 12,
+    },
+    BpfInsn {
+        code: 0x15,
+        jt: 0,
+        jf: 1,
+        k: 0x0806,
+    },
+    BpfInsn {
+        code: 0x06,
+        jt: 0,
+        jf: 0,
+        k: 0xffff,
+    },
+    BpfInsn {
+        code: 0x06,
+        jt: 0,
+        jf: 0,
+        k: 0,
+    },
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaptureFilter {
+    Dcp,
+    Arp,
+    All,
+}
 
 enum Adapter {}
 
@@ -325,10 +359,17 @@ pub fn capture(
     cancelled: &AtomicBool,
     mut on_frame: impl FnMut(&[u8]) -> Result<(), String>,
 ) -> Result<(), String> {
-    capture_inner(interface, request, wait, cancelled, true, |frame| {
-        on_frame(frame)?;
-        Ok(None)
-    })
+    capture_inner(
+        interface,
+        request,
+        wait,
+        cancelled,
+        CaptureFilter::Dcp,
+        |frame| {
+            on_frame(frame)?;
+            Ok(None)
+        },
+    )
 }
 
 pub fn capture_raw(
@@ -338,7 +379,36 @@ pub fn capture_raw(
     cancelled: &AtomicBool,
     on_frame: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>, String>,
 ) -> Result<(), String> {
-    capture_inner(interface, request, wait, cancelled, false, on_frame)
+    capture_inner(
+        interface,
+        request,
+        wait,
+        cancelled,
+        CaptureFilter::All,
+        on_frame,
+    )
+}
+
+pub fn capture_arp(
+    interface: &str,
+    requests: impl Iterator<Item = [u8; 42]>,
+    wait: Duration,
+    cancelled: &AtomicBool,
+    mut on_frame: impl FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    let api = Api::load()?;
+    capture_with_api(
+        &api,
+        interface,
+        requests,
+        wait,
+        cancelled,
+        CaptureFilter::Arp,
+        |frame| {
+            on_frame(frame)?;
+            Ok(None)
+        },
+    )
 }
 
 fn capture_inner(
@@ -346,7 +416,7 @@ fn capture_inner(
     request: &[u8],
     wait: Duration,
     cancelled: &AtomicBool,
-    dcp_only: bool,
+    filter: CaptureFilter,
     on_frame: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>, String>,
 ) -> Result<(), String> {
     if cancelled.load(Ordering::Relaxed) {
@@ -354,19 +424,29 @@ fn capture_inner(
     }
     let api = Api::load()?;
     capture_with_api(
-        &api, interface, request, wait, cancelled, dcp_only, on_frame,
+        &api,
+        interface,
+        std::iter::once(request),
+        wait,
+        cancelled,
+        filter,
+        on_frame,
     )
 }
 
-fn capture_with_api(
+fn capture_with_api<F: AsRef<[u8]>>(
     api: &Api,
     interface: &str,
-    request: &[u8],
+    requests: impl Iterator<Item = F>,
     wait: Duration,
     cancelled: &AtomicBool,
-    dcp_only: bool,
+    filter: CaptureFilter,
     mut on_frame: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>, String>,
 ) -> Result<(), String> {
+    let mut requests = requests.fuse().peekable();
+    if cancelled.load(Ordering::Relaxed) || requests.peek().is_none() {
+        return Ok(());
+    }
     let device = CString::new(find_device(api, interface)?)
         .map_err(|_| "Npcap returned an invalid adapter name.".to_string())?;
     // SAFETY: device is NUL-terminated and remains alive throughout the call.
@@ -429,10 +509,17 @@ fn capture_with_api(
             unsafe { GetLastError() },
         ));
     }
-    // Best effort: restrict the driver to DCP Identify responses. If the filter cannot be
-    // installed, the same filtering is applied before frames reach the callback.
-    if dcp_only && let Some(set_bpf) = api.set_bpf {
-        let mut instructions = DCP_FILTER;
+    // Best effort: reject unrelated traffic in the driver as well as at the callback.
+    if filter != CaptureFilter::All
+        && let Some(set_bpf) = api.set_bpf
+    {
+        let mut dcp = DCP_FILTER;
+        let mut arp = ARP_FILTER;
+        let instructions = if filter == CaptureFilter::Dcp {
+            &mut dcp[..]
+        } else {
+            &mut arp[..]
+        };
         let mut program = BpfProgram {
             length: instructions.len() as u32,
             instructions: instructions.as_mut_ptr(),
@@ -443,44 +530,54 @@ fn capture_with_api(
     }
     let tx_packet = allocate_packet(api)?;
     let rx_packet = allocate_packet(api)?;
-    let request_length = u32::try_from(request.len()).map_err(|_| "DCP request is too large.")?;
     let mut receive_buffer = vec![0_u8; RECEIVE_BUFFER_SIZE];
     let receive_length = u32::try_from(receive_buffer.len()).expect("bounded receive buffer");
 
-    if cancelled.load(Ordering::Relaxed) {
-        return Ok(());
-    }
-    // Send one Identify-All request. Its standards-compliant response delay factor spreads
-    // replies across the capture window; repeating it would multiply traffic on a busy OT cell.
-    // SAFETY: Npcap does not mutate or retain the caller-owned buffer, which outlives the
-    // synchronous PacketSendPacket call.
-    unsafe {
-        (api.init_packet)(
-            tx_packet.packet,
-            request.as_ptr().cast_mut().cast(),
-            request_length,
-        )
+    let kind = if filter == CaptureFilter::Arp {
+        crate::traffic::Kind::Arp
+    } else {
+        crate::traffic::Kind::Other
     };
-    // SAFETY: adapter and packet remain valid; synchronous send completes before returning.
-    if crate::traffic::send_blocking(crate::traffic::Kind::Other, || unsafe {
-        (api.send_packet)(adapter.handle, tx_packet.packet, 1)
-    }) == 0
-    {
-        return Err(format!(
-            "Npcap could not transmit DCP Identify on {interface}."
-        ));
-    }
-
-    let started = Instant::now();
-    while started.elapsed() < wait {
+    let mut last_sent = Instant::now();
+    loop {
         if cancelled.load(Ordering::Relaxed) {
             break;
         }
-        let remaining = wait.saturating_sub(started.elapsed());
-        // SAFETY: read_event belongs to the still-open adapter and remains valid for this call.
-        let wait_result = unsafe {
-            WaitForSingleObject(read_event, wait_millis(capture_wait_duration(remaining)))
+        let poll_ms = if let Some(request) = requests.next() {
+            let request = request.as_ref();
+            let length = u32::try_from(request.len()).map_err(|_| "Npcap request is too large.")?;
+            // SAFETY: Packet.dll reads but does not retain this buffer during synchronous send.
+            unsafe {
+                (api.init_packet)(tx_packet.packet, request.as_ptr().cast_mut().cast(), length)
+            };
+            let sent = crate::traffic::send_blocking(kind, || {
+                if cancelled.load(Ordering::Relaxed) {
+                    return None;
+                }
+                // SAFETY: adapter, packet and request remain valid until the send returns.
+                Some(unsafe { (api.send_packet)(adapter.handle, tx_packet.packet, 1) })
+            });
+            match sent {
+                None => break,
+                Some(0) => {
+                    return Err(format!(
+                        "Npcap could not transmit a discovery request on {interface}."
+                    ));
+                }
+                Some(_) => {}
+            }
+            last_sent = Instant::now();
+            // Drain available replies between paced sends, without a timeout per target.
+            0
+        } else {
+            let remaining = wait.saturating_sub(last_sent.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            wait_millis(capture_wait_duration(remaining))
         };
+        // SAFETY: read_event belongs to the still-open adapter and remains valid for this call.
+        let wait_result = unsafe { WaitForSingleObject(read_event, poll_ms) };
         match wait_result {
             WAIT_TIMEOUT => continue,
             WAIT_OBJECT_0 => {}
@@ -521,7 +618,9 @@ fn capture_with_api(
             return Err("Npcap returned an oversized capture buffer.".into());
         }
         let mut deliver = |frame: &[u8]| {
-            if dcp_only && !is_identify_response(frame) {
+            if (filter == CaptureFilter::Dcp && !is_identify_response(frame))
+                || (filter == CaptureFilter::Arp && frame.get(12..14) != Some(&[0x08, 0x06]))
+            {
                 return Ok(());
             }
             if let Some(response) = on_frame(frame)? {
@@ -535,8 +634,12 @@ fn capture_with_api(
                         response_length,
                     )
                 };
-                if crate::traffic::send_blocking(crate::traffic::Kind::Other, || unsafe {
-                    (api.send_packet)(adapter.handle, tx_packet.packet, 1)
+                if crate::traffic::send_blocking(kind, || unsafe {
+                    if cancelled.load(Ordering::Relaxed) {
+                        1
+                    } else {
+                        (api.send_packet)(adapter.handle, tx_packet.packet, 1)
+                    }
                 }) == 0
                 {
                     return Err(format!(
@@ -546,7 +649,7 @@ fn capture_with_api(
             }
             Ok(())
         };
-        if dcp_only {
+        if filter == CaptureFilter::Dcp {
             parse_bpf_records(&receive_buffer[..valid], &mut deliver)?;
         } else {
             parse_bpf_records_raw(&receive_buffer[..valid], &mut deliver)?;
@@ -851,5 +954,14 @@ mod tests {
         let mut ipv4 = vec![0_u8; 60];
         ipv4[12..14].copy_from_slice(&[0x08, 0x00]);
         assert_eq!(run_filter(&super::DCP_FILTER, &ipv4), 0);
+    }
+
+    #[test]
+    fn arp_filter_rejects_unrelated_traffic() {
+        let mut frame = vec![0; 60];
+        for (ethertype, accepted) in [(0x0806_u16, true), (0x0800, false), (0x8892, false)] {
+            frame[12..14].copy_from_slice(&ethertype.to_be_bytes());
+            assert_eq!(run_filter(&super::ARP_FILTER, &frame) > 0, accepted);
+        }
     }
 }
