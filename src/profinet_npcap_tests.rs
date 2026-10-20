@@ -19,6 +19,9 @@ struct MockAdapter {
     kernel_buffer: usize,
     fail_buffer_setup: bool,
     sends: usize,
+    sent_at: Vec<Instant>,
+    sends_at_receive: Vec<usize>,
+    fail_send: bool,
     closes: usize,
     response: Vec<u8>,
 }
@@ -38,6 +41,9 @@ impl MockAdapter {
             kernel_buffer: 0,
             fail_buffer_setup,
             sends: 0,
+            sent_at: Vec::new(),
+            sends_at_receive: Vec::new(),
+            fail_send: false,
             closes: 0,
             response: super::tests::bpf_record(&frame),
         }
@@ -106,7 +112,14 @@ unsafe extern "C" fn send(adapter: *mut Adapter, _: *mut Packet, _: c_uchar) -> 
     unsafe {
         let adapter = state(adapter);
         adapter.sends += 1;
-        if adapter.filter == CAPTURE_HW_FILTER && adapter.kernel_buffer >= adapter.response.len() {
+        adapter.sent_at.push(Instant::now());
+        if adapter.fail_send {
+            return 0;
+        }
+        if !adapter.response.is_empty()
+            && adapter.filter == CAPTURE_HW_FILTER
+            && adapter.kernel_buffer >= adapter.response.len()
+        {
             SetEvent(adapter.event);
         }
     }
@@ -117,7 +130,9 @@ unsafe extern "C" fn send(adapter: *mut Adapter, _: *mut Packet, _: c_uchar) -> 
 unsafe extern "C" fn receive(adapter: *mut Adapter, packet: *mut Packet, _: c_uchar) -> c_uchar {
     // SAFETY: PacketInitPacket provided the writable receive buffer, bounded by length.
     unsafe {
-        let response = &state(adapter).response;
+        let adapter = state(adapter);
+        adapter.sends_at_receive.push(adapter.sends);
+        let response = &adapter.response;
         if response.len() > (*packet).length as usize {
             return 0;
         }
@@ -183,10 +198,10 @@ fn receives_dcp_when_opened_adapter_has_no_kernel_buffer() {
     capture_with_api(
         &mock_api(),
         INTERFACE,
-        &[0; 60],
+        std::iter::once([0; 60]),
         Duration::from_millis(100),
         &cancelled,
-        true,
+        CaptureFilter::Dcp,
         |frame| {
             frames.push(frame.to_vec());
             cancelled.store(true, Ordering::Relaxed);
@@ -211,14 +226,168 @@ fn failed_kernel_buffer_setup_stops_before_sending() {
     let error = capture_with_api(
         &mock_api(),
         INTERFACE,
-        &[0; 60],
+        std::iter::once([0; 60]),
         Duration::from_millis(100),
         &AtomicBool::new(false),
-        true,
+        CaptureFilter::Dcp,
         |_| Ok(None),
     )
     .unwrap_err();
     assert!(error.contains("could not allocate capture buffer"));
     assert_eq!(adapter.sends, 0);
     assert_eq!(adapter.closes, 1);
+}
+
+#[test]
+fn arp_sweep_paces_sends_without_waiting_for_each_missing_reply() {
+    let mut adapter = MockAdapter::new(false);
+    adapter.response.clear();
+    OPEN_ADAPTER.set((&mut adapter as *mut MockAdapter).cast());
+    let wait = Duration::from_secs(1);
+    capture_with_api(
+        &mock_api(),
+        INTERFACE,
+        std::iter::repeat_n([0; 42], 5),
+        wait,
+        &AtomicBool::new(false),
+        CaptureFilter::Arp,
+        |_| panic!("silent targets have no reply"),
+    )
+    .unwrap();
+    assert_eq!(adapter.sends, 5);
+    let interval =
+        Duration::from_nanos(1_000_000_000_u64.div_ceil(crate::traffic::ARP_REQUESTS_PER_SECOND));
+    assert!(
+        adapter
+            .sent_at
+            .windows(2)
+            .all(|pair| pair[1] - pair[0] >= interval)
+    );
+    assert!(
+        adapter.sent_at[4] - adapter.sent_at[0] < wait,
+        "the response window belongs to the whole sweep"
+    );
+    assert!(
+        adapter.sent_at[4].elapsed() >= wait,
+        "late replies need a full grace period after the final send"
+    );
+    assert!(adapter.sends_at_receive.is_empty());
+    assert_eq!(adapter.closes, 1);
+}
+
+#[test]
+fn arp_sweep_receives_between_sends_and_stops_on_cancellation() {
+    use crate::discovery::{reply, request};
+    use std::cell::RefCell;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::net::Ipv4Addr;
+
+    let source_mac = [0, 1, 2, 3, 4, 5];
+    let target_mac = [0, 17, 34, 51, 68, 85];
+    let source_ip = Ipv4Addr::new(192, 0, 2, 10);
+    let targets = [
+        Ipv4Addr::new(192, 0, 2, 1),
+        Ipv4Addr::new(192, 0, 2, 2),
+        Ipv4Addr::new(192, 0, 2, 3),
+    ];
+    let mut adapter = MockAdapter::new(false);
+    // An unsolicited reply for target 2 arrives alongside target 1's reply on the first read.
+    for ip in targets[..2].iter().rev() {
+        let mut frame = request(source_mac, source_ip, *ip);
+        frame[..6].copy_from_slice(&source_mac);
+        frame[6..12].copy_from_slice(&target_mac);
+        frame[20..22].copy_from_slice(&[0, 2]);
+        frame[22..28].copy_from_slice(&target_mac);
+        frame[28..32].copy_from_slice(&ip.octets());
+        frame[32..38].copy_from_slice(&source_mac);
+        frame[38..42].copy_from_slice(&source_ip.octets());
+        adapter.response.extend(super::tests::bpf_record(&frame));
+    }
+    OPEN_ADAPTER.set((&mut adapter as *mut MockAdapter).cast());
+    let requested = RefCell::new(BTreeSet::new());
+    let cancelled = AtomicBool::new(false);
+    let mut replies = BTreeMap::new();
+    let mut reads = 0;
+    capture_with_api(
+        &mock_api(),
+        INTERFACE,
+        targets.iter().map(|&ip| {
+            requested.borrow_mut().insert(ip);
+            request(source_mac, source_ip, ip)
+        }),
+        Duration::from_secs(60),
+        &cancelled,
+        CaptureFilter::Arp,
+        |frame| {
+            reads += 1;
+            if let Some((ip, mac)) = reply(frame, &requested.borrow(), source_mac, source_ip) {
+                replies.insert(ip, mac);
+            }
+            if reads == 2 {
+                assert_eq!(replies, BTreeMap::from([(targets[0], target_mac)]));
+            }
+            if reads == 4 {
+                cancelled.store(true, Ordering::Relaxed);
+            }
+            Ok(None)
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        replies,
+        BTreeMap::from([(targets[0], target_mac), (targets[1], target_mac)])
+    );
+    assert_eq!(adapter.sends, 2);
+    assert_eq!(adapter.sends_at_receive, [1, 2]);
+    assert_eq!(adapter.closes, 1);
+}
+
+#[test]
+fn arp_sweep_skips_empty_or_cancelled_work_and_propagates_failures() {
+    let mut adapter = MockAdapter::new(false);
+    OPEN_ADAPTER.set((&mut adapter as *mut MockAdapter).cast());
+    for (count, cancelled) in [(0, false), (2, true)] {
+        capture_with_api(
+            &mock_api(),
+            INTERFACE,
+            std::iter::repeat_n([0; 42], count),
+            Duration::ZERO,
+            &AtomicBool::new(cancelled),
+            CaptureFilter::Arp,
+            |_| panic!("must not read"),
+        )
+        .unwrap();
+    }
+    assert_eq!(adapter.sends, 0);
+    assert_eq!(adapter.closes, 0);
+    adapter.fail_send = true;
+    let error = capture_with_api(
+        &mock_api(),
+        INTERFACE,
+        std::iter::repeat_n([0; 42], 2),
+        Duration::ZERO,
+        &AtomicBool::new(false),
+        CaptureFilter::Arp,
+        |_| panic!("failed send must stop capture"),
+    )
+    .unwrap_err();
+    assert!(error.contains("could not transmit"));
+    assert_eq!(adapter.sends, 1);
+    assert_eq!(adapter.closes, 1);
+
+    adapter.fail_send = false;
+    adapter.response = vec![0; 2];
+    let error = capture_with_api(
+        &mock_api(),
+        INTERFACE,
+        std::iter::repeat_n([0; 42], 2),
+        Duration::ZERO,
+        &AtomicBool::new(false),
+        CaptureFilter::Arp,
+        |_| panic!("malformed BPF must not be delivered"),
+    )
+    .unwrap_err();
+    assert!(error.contains("truncated BPF packet header"));
+    assert_eq!(adapter.sends, 2);
+    assert_eq!(adapter.closes, 2);
 }

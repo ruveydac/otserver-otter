@@ -8,6 +8,7 @@ services:
     cap_add: [NET_RAW]
     environment:
       OTTER_DCP_RESPONSE_DELAY_SECONDS: '${OTTER_DCP_RESPONSE_DELAY_SECONDS:-55}'
+      OTTER_PNIO_FALLBACK_TEST: '${OTTER_PNIO_FALLBACK_TEST:-0}'
     healthcheck: &process-health
       test: [CMD-SHELL, 'kill -0 1']
       interval: 1s

@@ -35,6 +35,13 @@ instructions are in `README.md`; detailed operator and development guidance foll
 - PNIO record replies may use the advertised endpoint port or EPM port 34964 as their UDP source.
   In either case, require the target MAC/IP, client UDP port, and matching RPC object, interface,
   activity, sequence, and operation before accepting or acknowledging fragments.
+- With PROFINET enabled, run PNIO after merging ARP and DCP discovery. Probe every unambiguous
+  discovered MAC/IPv4 pair in the shared IP probe scope; `allowDcpSource` permits discovered
+  out-of-range targets. Never invent a MAC for an undiscovered IP. Use the shared two-second RPC
+  timeout on Windows and Linux. Report missing interface/device IPv4, unavailable Npcap, ambiguous
+  addresses, and per-record failures in exported warnings. Failed records must retain successful
+  reads; failed API/module enumeration must still permit primary I&M0 at API 0, slot 0, subslot 1
+  and its advertised optional records. Cancellation stops further requests and retains partial data.
 - Active DCP must verify that its source MAC belongs to the selected physical interface. Send
   Identify-All once with `ResponseDelayFactor` `0x0080`; never use zero or rapid retries.
   After a successful send, collect replies for at least 60 seconds unless cancelled or capture
@@ -73,7 +80,8 @@ instructions are in `README.md`; detailed operator and development guidance foll
   and no redirects. Bare loopback addresses normalize to HTTP; other hosts require explicit HTTPS.
   Require local `--ack-authorized`; apply snapshots through the shared scan path.
   Keep machine credentials in Secret Service/Windows Credential Manager where available, with an
-  atomic permission-restricted file fallback. Report the computer name and at most 32 available
+  atomic permission-restricted file fallback. Unattended installations explicitly use that file store
+  to operate without an interactive login. Report the computer name and at most 32 available
   adapters (technical/friendly names, description, MAC, and up to 16 IPv4/IPv6 addresses) at
   enrollment and during polling; never include credentials in this report or persist protocol
   credential snapshots.
@@ -108,7 +116,13 @@ instructions are in `README.md`; detailed operator and development guidance foll
 ## Platform Rules
 
 - Linux raw Ethernet uses `AF_PACKET` and requires root or `CAP_NET_RAW`.
-- Windows ARP uses Win32 IP Helper. Active DCP dynamically loads installed Npcap `Packet.dll` from
+- Windows ARP prefers Npcap on the selected adapter: send one paced request per target, drain replies
+  between sends, and apply one response grace period after the final send. Reuse Linux ARP framing
+  and reply validation; accept only requested targets. Keep sends under the shared blocking gate.
+  Without an available Npcap binding, use serial Win32 `SendARP`; each call waits for resolution or
+  an OS timeout, so sparse ranges are slow. Log the selected path. Never retry a failed raw sweep
+  through `SendARP`, or parallelize blocking `SendARP` calls to bypass pacing.
+  Active DCP dynamically loads installed Npcap `Packet.dll` from
   its native System32 subdirectory and binds the selected physical adapter by GUID. Driver
   installation must remain explicit and must never be a scan side effect.
 - If Npcap is unavailable, passive Windows discovery uses Microsoft pktmon.
@@ -161,6 +175,11 @@ array runs proceed sequentially and continue after configuration, scan, or uploa
 **Stop Scan** writes partial output when possible and skips pending configurations. Exit code `0`
 means all scans completed, `2` means valid output contains partial failures, and `1` means a
 configuration, scan, or upload failed; failures take precedence in multi-configuration runs.
+GUI scans are local-export only: strip legacy `serverUrl`/`site`/`apiKey` from transient scan inputs
+and never read `OTSERVER_API_KEY` there. Preserve those fields for CLI/config-file direct uploads.
+The GUI's controller section enrolls with a masked single-use token and offers **Install controller**
+after enrollment. Run enrollment/installation off the UI thread, require the authorization checkbox,
+and never persist the token or managed protocol credentials.
 
 All discovery protocols are enabled by default. CLI `--no-<protocol>` switches and JSON `noArp`,
 `noProfinet`, `noS7`, `noEnip`, `noBacnet`, `noFins`, `noFox`, `noDnp3`, `noIec61850`, `noNetbios`,
@@ -221,9 +240,10 @@ the user needs read/write access there. Write and validate the local JSON before
 retain it on upload failure. `otserver-otter validate scan.otserver.json` validates an export.
 
 For direct uploads and controller connections, `--http-proxy URL` / `--https-proxy URL` select
-explicit proxies per destination scheme; the other scheme connects directly. The flags must be
-supplied again on later starts. `--ignore-self-signed` disables all TLS certificate and hostname
-validation for that process, not just self-signed certificate rejection.
+explicit proxies per destination scheme; the other scheme connects directly. Direct-upload flags
+must be supplied again on later starts; controller connection options are saved in private state.
+`--ignore-self-signed` disables all TLS certificate and hostname validation, not just self-signed
+certificate rejection. In controller mode that choice is saved for subsequent starts too.
 
 ## Managed controller operation
 
@@ -231,6 +251,30 @@ Enroll with `otserver-otter controller --server-url https://otserver.example --e
 and supply the single-use token on stdin. Restart without `--enroll` to reuse credentials. Match
 OTserver's `OTSERVER_PUBLIC_URL`; bare `127.0.0.1:3000`, `localhost:3000`, and `[::1]:3000` normalize
 to HTTP. Other hosts require explicit HTTPS. No scanner-side listener is opened.
+
+- `controller --enroll-only --enroll --server-url URL --ack-authorized` saves enrollment without
+  polling; the GUI uses the same initialization path. Omit `--server-url` after enrollment to reuse
+  the saved URL. Poll interval, queued-import mode, credential storage, proxies and TLS override
+  survive restarts in private state. Fresh GUI enrollment can replace connection settings.
+- `controller --install --ack-authorized` installs and starts only the managed controller, then
+  exits; combine `--enroll --install --server-url URL` for first-time setup. Run under the intended
+  normal OS user. Stop an existing controller before re-enrolling/updating; never kill an active scan
+  to install over it. Retain enrollment and exports on install failure and allow retry.
+- Linux installation copies to `~/.local/bin/otserver-otter`, writes the systemd user unit
+  `otserver-otter-controller.service`, enables lingering for boot/after-logout operation, and verifies
+  `cap_net_raw=ep` on the installed executable. Escalate only the required `setcap`/`loginctl` commands
+  through terminal sudo or desktop PolicyKit. Do not run the controller or entire installer as root,
+  grant `CAP_NET_ADMIN`, or set `NoNewPrivileges` on a unit relying on executable capabilities.
+- Windows installation uses `%LOCALAPPDATA%\Programs\OTserver Otter` and a SID-named Task Scheduler
+  task with a login trigger, S4U/non-interactive current-user principal, IgnoreNew instance policy,
+  unlimited execution time and battery operation. Start it immediately if idle. S4U permits operation
+  after logout without storing a Windows password but needs batch-logon rights; report denied task
+  registration with actionable guidance. It cannot use Windows-integrated network credentials/EFS.
+  Npcap stays separately installed and must permit capture for the task's user.
+- Both installers move only the enrollment-issued machine credential into the existing private-file
+  store and pin rotation to file storage, allowing startup without a desktop keyring. Never save
+  server-supplied SNMP/OPC UA snapshots. Keep tokens, machine secrets and proxy values out of service
+  commands/task definitions. Escape systemd specifiers/environment syntax and Windows argument paths.
 
 - Default state lives at `$XDG_STATE_HOME/otserver-otter` or `~/.local/state/otserver-otter` on Linux,
   and `%LOCALAPPDATA%\otserver-otter` on Windows. `--state-dir PATH` overrides it. One process owns
@@ -241,17 +285,27 @@ to HTTP. Other hosts require explicit HTTPS. No scanner-side listener is opened.
 - `--enroll --overwrite-state-dir` permits controller takeover with a fresh token. Preserve old
   state on failed enrollment and retain scan exports. Omit both flags on subsequent starts.
 - `--poll-seconds 30` sets the minimum interval (1–300 seconds); the server may request longer idle
-  intervals. Network/429/5xx failures use bounded exponential backoff with jitter up to five minutes.
+  intervals. Once enrolled, polling network/429/5xx failures and unavailable adapter inventory keep the
+  controller running and retry every five minutes until recovery. Successful polling restores the
+  normal interval; authentication rejection still requires re-enrollment.
 - Set a capture interface explicitly on multi-adapter hosts. An omitted source MAC comes from the
   selected adapter. Managed scans use the shared validation, read-only probes, and traffic pacing.
-- Heartbeats report bounded progress every 15 seconds and renew a two-minute lease. Cancellation,
-  lease loss, terminal responses, or authentication rejection stop work and prevent stale uploads.
+- Heartbeats report bounded progress every 15 seconds and renew a 30-minute lease. Cap accepted
+  leases at 30 minutes and stop five seconds before expiry; preserve shorter server deadlines.
+  Cancellation, lease loss, terminal responses, or authentication rejection stop work and prevent
+  stale uploads.
   Managed output omits probe details and controller bodies/credentials.
 - Interrupted discovery becomes failed work, never an automatic rescan. Completed exports resume
   byte-identical upload retries; known import IDs resume finishing. Retain `RUN_ID.otserver.json`
   in the state directory, including on failure; operators manage export retention.
-- `--queued-imports` requires `OTSERVER_QUEUED_IMPORTS=on` and healthy manager workers. Scanner
-  completion is distinct from import completion. Idle polling checks pending/running imports by ID;
+- Managed upload network failures and retryable HTTP responses wait two minutes between attempts,
+  with at most five retries after the initial attempt. Persist each attempt before sending so
+  restarts preserve the limit; a resumed retry waits two minutes. Keep heartbeats active during
+  waits and uploads. Exhaustion records a failed run with a retained local export and retries only
+  its finish request. Accepted imports that fail processing are not upload transport failures.
+- `--queued-imports` requires queued imports enabled in the manager's Application settings and
+  healthy manager workers. Scanner completion is distinct from import completion. Idle polling checks
+  pending/running imports by ID;
   failed queued imports receive at most one explicit retry by ID without re-uploading terminal work.
 - Rotate credentials when less than 30 days remain, durably saving the secret/reference first.
   Authentication failure or a lost enrollment/rotation response requires re-enrollment because the
@@ -263,8 +317,10 @@ to HTTP. Other hosts require explicit HTTPS. No scanner-side listener is opened.
   ENTITY-MIB components, BRIDGE/Q-BRIDGE ports/VLANs, and Siemens AUTOMATION-SYSTEM-MIB identity.
   With ARP disabled, only valid interface, bridge, or LLDP chassis MAC evidence may identify an asset;
   forwarding-table MACs remain port evidence. Preserve component-to-interface mappings where present.
-- DCP exports numeric `vendorId`/`deviceId` alongside full parsed blocks. EtherNet/IP preserves every
-  valid List Identity transport response; S7 preserves accepted TSAP access and both identity SZLs.
+- DCP exports numeric `vendorId`/`deviceId` alongside full parsed blocks, plus `fields.vendor`
+  resolved from the bundled manufacturer table (42 → `SIEMENS AG`). Unknown IDs omit `vendor`.
+  EtherNet/IP preserves every valid List Identity transport response; S7 preserves accepted TSAP
+  access and both identity SZLs.
   PNIO component references use `pnio:<api>:<slot>[:<subslot>]` and retain original records,
   containment, identification numbers, I&M revisions, and scoped serial claims.
 - DNP3 uses TCP 20000: link reset followed by Group 0 Variation 0 device-attribute Read with the
@@ -292,6 +348,8 @@ containers, Docker Engine with Compose, and daemon access; Windows developers ma
 Scanner/Siemens containers receive only `NET_RAW`; no host networking or published protocol ports.
 The Siemens DCP responder waits 55 seconds to verify the one-minute capture window. JSON and logs
 remain under `lab/artifacts/`.
+`./lab/test-pnio.sh` also tests ARP-only discovery with silent DCP and rejected API/module
+enumeration, confirming primary firmware recovery and per-record diagnostics.
 
 Run `./lab/test-windows.ps1` from Windows PowerShell for the native executable smoke test. It binds
 responders only to Docker/WSL's host-only Hyper-V adapter. All forwarded replies share that adapter's

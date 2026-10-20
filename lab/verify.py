@@ -432,21 +432,42 @@ def assert_pnio_components(pnio: dict) -> None:
         assert entity["serialClaim"]["original"] == record["parsed"]["serialNumber"]
 
 
+def assert_pnio_fallback(result: dict) -> None:
+    assert result["errors"] == []
+    assert len(result["devices"]) == 1
+    device = by_mac(result, DEVICES["siemens"])
+    assert observation(device, "arp")["fields"]["ipAddress"] == "172.30.0.10"
+    pnio = observation(device, "profinet-dcp")
+    assert pnio["fields"]["softwareRevision"] == "V1.2.3"
+    assert pnio["ipAddress"] == "172.30.0.10"
+    assert {record["index"] for record in pnio["raw"]["pnioRecords"]} == {
+        "0xAFF0", "0xAFF1", "0xAFF3", "0xAFF4", "0xAFF5",
+    }
+    assert len(pnio["warnings"]) == 4
+    for index in ("0xF821", "0xF840", "0xF000", "0xAFF2"):
+        assert any(index in warning and "DE80B000" in warning for warning in pnio["warnings"])
+        assert any(index in warning and "172.30.0.10" in warning for warning in result["warnings"])
+    assert_pnio_components(pnio)
+
+
 def main() -> None:
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
     run_id = uuid.uuid4().hex[:8]
     if os.environ.get("OTTER_PNIO_ONLY") == "1":
+        fallback = os.environ.get("OTTER_PNIO_FALLBACK_TEST") == "1"
         path = ARTIFACTS / f"pnio-{run_id}.otserver.json"
-        assert_pnio(
-            scan(
-                path,
-                ["172.30.0.10"],
-                "--no-arp",
-                "--no-protocols",
-                "--no-snmp",
-                "--no-lldp",
-            )
+        result = scan(
+            path,
+            ["172.30.0.10"],
+            *([] if fallback else ["--no-arp"]),
+            "--no-protocols",
+            "--no-snmp",
+            "--no-lldp",
         )
+        if fallback:
+            assert_pnio_fallback(result)
+        else:
+            assert_pnio(result)
         os.chmod(path, 0o666)
         print("OTserver Otter PNIO virtual lab passed.", flush=True)
         return

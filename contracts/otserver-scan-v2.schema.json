@@ -118,7 +118,11 @@
         "observedAt": { "type": "string", "format": "date-time" },
         "ipAddress": { "type": "string" },
         "macAddress": { "$ref": "#/$defs/mac" },
-        "fields": { "type": "object", "additionalProperties": true },
+        "fields": {
+          "description": "Normalized inventory fields and protocol metadata. PROFINET DCP retains numeric vendorId/deviceId and includes vendor resolved from the bundled manufacturer table when known; unknown vendor IDs omit vendor.",
+          "type": "object",
+          "additionalProperties": true
+        },
         "raw": { "$ref": "#/$defs/rawEvidence" },
         "warnings": { "type": "array", "items": { "type": "string" } }
       }

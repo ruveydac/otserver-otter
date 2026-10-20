@@ -1,4 +1,5 @@
 //! Outbound controller v1 client. Local scans still use the shared safety/pacing path.
+mod install;
 mod store;
 #[cfg(test)]
 mod tests;
@@ -18,25 +19,32 @@ use tokio::time::Instant;
 
 #[derive(Args)]
 pub struct ControllerArgs {
-    /// HTTPS controller URL, or a loopback address such as 127.0.0.1:3000 for HTTP development.
-    #[arg(long)]
+    /// Controller URL (HTTPS, or HTTP loopback). Reuses the enrolled URL when omitted.
+    #[arg(long, default_value = "", hide_default_value = true)]
     server_url: String,
     /// Read the single-use enrollment token from stdin (never from process arguments).
     #[arg(long)]
     enroll: bool,
+    /// Install and start a background controller for this OS user, then exit.
+    #[arg(long)]
+    install: bool,
+    /// Enroll and save credentials without polling (also used by the GUI).
+    #[arg(long, requires = "enroll", conflicts_with = "install")]
+    enroll_only: bool,
     #[arg(long)]
     state_dir: Option<PathBuf>,
     /// Replace saved enrollment and run state after enrolling with a new controller; retained exports are kept.
     #[arg(long, requires = "enroll")]
     overwrite_state_dir: bool,
-    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
-    poll_seconds: u64,
+    /// Minimum idle polling interval in seconds (default: saved value, initially 30).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=300))]
+    poll_seconds: Option<u64>,
     #[arg(long, required = true, action = clap::ArgAction::SetTrue)]
     ack_authorized: bool,
     /// Use the permission-restricted credential file instead of the OS secret store.
     #[arg(long)]
     file_credentials: bool,
-    /// Request queued imports (requires OTSERVER_QUEUED_IMPORTS=on on the manager).
+    /// Request queued imports (must be enabled in the manager's Application settings).
     #[arg(long)]
     queued_imports: bool,
     /// Disable TLS certificate and hostname validation for HTTP clients.
@@ -48,6 +56,48 @@ pub struct ControllerArgs {
     /// Proxy HTTPS requests through URL. HTTP requests remain direct unless --http-proxy is supplied.
     #[arg(long, value_name = "URL")]
     https_proxy: Option<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Settings {
+    poll_seconds: u64,
+    file_credentials: bool,
+    queued_imports: bool,
+    http: HttpOptions,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            poll_seconds: 30,
+            file_credentials: false,
+            queued_imports: false,
+            http: HttpOptions::default(),
+        }
+    }
+}
+
+#[cfg(feature = "gui")]
+pub(super) struct EnrollmentInfo {
+    pub server_url: String,
+    pub name: String,
+    pub site: String,
+    pub http: HttpOptions,
+}
+
+#[cfg(feature = "gui")]
+pub(super) fn enrollment_info(
+    directory: Option<PathBuf>,
+) -> Result<Option<EnrollmentInfo>, String> {
+    let directory = store::Store::directory(directory).map_err(|e| e.to_string())?;
+    let state = store::Store::read_state(&directory).map_err(|e| e.to_string())?;
+    Ok(state.scanner.map(|scanner| EnrollmentInfo {
+        server_url: state.server_url,
+        name: scanner.name,
+        site: scanner.site,
+        http: state.settings.http,
+    }))
 }
 
 // No Debug on objects containing controller or protocol credentials.
@@ -114,8 +164,8 @@ fn network_adapter_report(
 }
 
 fn scanner_report() -> Result<ScannerReport, Error> {
-    let adapters = otserver_otter::profinet::interfaces()
-        .map_err(|_| Error::Local("Could not enumerate capture interfaces."))?;
+    let adapters =
+        otserver_otter::profinet::interfaces().map_err(|_| Error::InterfacesUnavailable)?;
     let computer_name = ["COMPUTERNAME", "HOSTNAME"]
         .into_iter()
         .find_map(|key| std::env::var(key).ok())
@@ -193,6 +243,8 @@ struct RunState {
     import_id: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    #[serde(default)]
+    upload_attempts: u8,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -214,11 +266,15 @@ struct State {
     assignment: Option<RunState>,
     #[serde(default)]
     pending_imports: Vec<PendingImport>,
+    #[serde(default)]
+    settings: Settings,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum Error {
     Retry,
+    InterfacesUnavailable,
+    UploadRetriesExhausted,
     Auth,
     Terminal,
     Invalid,
@@ -228,7 +284,9 @@ enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Retry => "Controller unavailable; retrying with backoff.",
+            Self::Retry => "Controller unavailable; retrying in 5 minutes.",
+            Self::InterfacesUnavailable => "Could not enumerate capture interfaces; retrying in 5 minutes.",
+            Self::UploadRetriesExhausted => "Scan result upload failed after the initial attempt and 5 retries. Local scan result retained.",
             Self::Auth => "Scanner credential is expired or not accepted. Verify --server-url, OS account, and --state-dir; re-enroll if the controller revoked it.",
             Self::Terminal => "Run is no longer active; local results retained.",
             Self::Invalid => "Controller response or configuration is invalid.",
@@ -299,17 +357,12 @@ fn validate_credential(credential: &Credential) -> Result<(), Error> {
 
 fn lease_deadline(input: &str) -> Result<Instant, Error> {
     let remaining = expires_at(input)? - OffsetDateTime::now_utc();
-    // Fail closed before the server deadline; never trust a lease longer than v1's two minutes.
-    let seconds = remaining.as_seconds_f64().min(120.0) - 5.0;
+    // Fail closed before the server deadline; never trust a lease longer than v1's 30 minutes.
+    let seconds = remaining.as_seconds_f64().min(30.0 * 60.0) - 5.0;
     if seconds <= 0.0 {
         return Err(Error::Terminal);
     }
     Ok(Instant::now() + Duration::from_secs_f64(seconds))
-}
-
-fn backoff(attempt: u32, jitter: u64) -> Duration {
-    let ceiling = (2u64.saturating_pow(attempt.min(8))).min(300);
-    Duration::from_millis(ceiling * 500 + jitter % (ceiling * 500 + 1))
 }
 
 impl Api {
@@ -777,6 +830,34 @@ async fn leased<T>(
     }
 }
 
+async fn upload_with_retries<F>(
+    store: &store::Store,
+    state: &mut State,
+    mut upload: impl FnMut() -> F,
+) -> Result<crate::ImportDocument, Error>
+where
+    F: std::future::Future<Output = Result<crate::ImportDocument, Error>>,
+{
+    loop {
+        let run = state.assignment.as_mut().ok_or(Error::Invalid)?;
+        let attempts = run.upload_attempts;
+        if attempts >= 6 {
+            return Err(Error::UploadRetriesExhausted);
+        }
+        if attempts > 0 {
+            eprintln!("Retrying scan result upload in 2 minutes (retry {attempts} of 5).");
+            tokio::time::sleep(Duration::from_secs(120)).await;
+        }
+        // Reserve the attempt before sending so restarts cannot reset the retry limit.
+        run.upload_attempts = attempts + 1;
+        save(store, state)?;
+        match upload().await {
+            Err(Error::Retry) => continue,
+            result => return result,
+        }
+    }
+}
+
 async fn execute(
     api: &Api,
     store: &store::Store,
@@ -795,6 +876,7 @@ async fn execute(
             status: "failed".into(),
             import_id: None,
             message: None,
+            upload_attempts: 0,
         });
         save(store, state)?;
     }
@@ -889,14 +971,27 @@ async fn execute(
         .import_id
         .is_none()
     {
-        let imported = leased(
+        let imported = match leased(
             api,
             id,
             deadline,
             90,
-            api.upload(id, &path, api.queued_imports),
+            upload_with_retries(store, state, || api.upload(id, &path, api.queued_imports)),
         )
-        .await?;
+        .await
+        {
+            Err(Error::UploadRetriesExhausted) => {
+                return finish(
+                    api,
+                    store,
+                    state,
+                    "failed",
+                    Some(&Error::UploadRetriesExhausted.to_string()),
+                )
+                .await;
+            }
+            result => result?,
+        };
         let import_id = imported
             .id
             .as_str()
@@ -981,12 +1076,56 @@ pub async fn run(args: ControllerArgs) -> Result<(), String> {
 }
 
 async fn run_inner(args: ControllerArgs) -> Result<(), Error> {
+    let (store, mut state, mut api) = initialize(&args, None).await?;
+    if args.install {
+        let directory = store.path().to_owned();
+        drop(store);
+        let message = install::install(Some(directory), false).map_err(|message| {
+            eprintln!("{message}");
+            Error::Local(
+                "Controller installation failed; enrollment and retained exports are kept.",
+            )
+        })?;
+        eprintln!("{message}");
+        return Ok(());
+    }
+    if args.enroll_only {
+        eprintln!("Scanner enrolled; credentials saved. Install or start the controller to poll.");
+        return Ok(());
+    }
+    eprintln!("Polling controller.");
+    let settings = state.settings.clone();
+    loop {
+        let delay = poll_once(
+            &mut api,
+            &store,
+            &mut state,
+            settings.poll_seconds,
+            settings.file_credentials,
+        )
+        .await?;
+        tokio::time::sleep(delay).await;
+    }
+}
+
+async fn initialize(
+    args: &ControllerArgs,
+    supplied_token: Option<&str>,
+) -> Result<(store::Store, State, Api), Error> {
     if !args.ack_authorized {
         return Err(Error::Local("Managed scanning requires --ack-authorized."));
     }
-    let base = base_url(&args.server_url)?;
-    let store = store::Store::open(args.state_dir)?;
+    let requested_base = if args.server_url.is_empty() {
+        None
+    } else {
+        Some(base_url(&args.server_url)?)
+    };
+    let store = store::Store::open(args.state_dir.clone())?;
     let mut state = store.load()?;
+    let base = match requested_base {
+        Some(base) => base,
+        None => base_url(&state.server_url)?,
+    };
     if !state.server_url.is_empty()
         && state.server_url != base.as_str()
         && !(args.enroll && args.overwrite_state_dir)
@@ -995,22 +1134,39 @@ async fn run_inner(args: ControllerArgs) -> Result<(), Error> {
             "State directory belongs to a different controller URL. To replace its saved enrollment and run state, re-enroll with --enroll --overwrite-state-dir. Retained scan exports will be kept.",
         ));
     }
-    let http = HttpOptions {
-        ignore_self_signed: args.ignore_self_signed,
-        http_proxy: args.http_proxy,
-        https_proxy: args.https_proxy,
-    };
-    let mut api = Api::new(base, &http)?;
-    api.queued_imports = args.queued_imports;
+    let mut settings = state.settings.clone();
+    settings.poll_seconds = args.poll_seconds.unwrap_or(settings.poll_seconds);
+    if !(1..=300).contains(&settings.poll_seconds) {
+        return Err(Error::Invalid);
+    }
+    settings.file_credentials |= args.file_credentials;
+    settings.queued_imports |= args.queued_imports;
+    if supplied_token.is_some() {
+        settings.http = HttpOptions::default();
+    }
+    settings.http.ignore_self_signed |= args.ignore_self_signed;
+    if let Some(proxy) = &args.http_proxy {
+        settings.http.http_proxy = Some(proxy.clone());
+    }
+    if let Some(proxy) = &args.https_proxy {
+        settings.http.https_proxy = Some(proxy.clone());
+    }
+    let mut api = Api::new(base, &settings.http)?;
+    api.queued_imports = settings.queued_imports;
     if args.enroll {
         use std::io::{BufRead, Read};
-        eprintln!("Paste the single-use enrollment token, then press Enter:");
         let mut token = String::new();
-        std::io::stdin()
-            .lock()
-            .take(513)
-            .read_line(&mut token)
-            .map_err(|_| Error::Local("Could not read enrollment token from stdin."))?;
+        let token = if let Some(token) = supplied_token {
+            token
+        } else {
+            eprintln!("Paste the single-use enrollment token, then press Enter:");
+            std::io::stdin()
+                .lock()
+                .take(513)
+                .read_line(&mut token)
+                .map_err(|_| Error::Local("Could not read enrollment token from stdin."))?;
+            &token
+        };
         let token = token.trim();
         if !(40..=512).contains(&token.len())
             || !token
@@ -1018,13 +1174,16 @@ async fn run_inner(args: ControllerArgs) -> Result<(), Error> {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         {
             return Err(Error::Local(
-                "Enrollment token is invalid; copy the token from Manage Otters and supply it on stdin.",
+                "Enrollment token is invalid; copy a fresh single-use token from OTserver > Otter Scanners.",
             ));
         }
         let report = scanner_report()?;
         let mut enrollment_request = serde_json::to_value(report).map_err(|_| Error::Invalid)?;
         enrollment_request["token"] = json!(token);
-        let enrollment: Enrollment = api.post("api/otter/v1/enroll", enrollment_request).await?;
+        let enrollment: Enrollment = api.post("api/otter/v1/enroll", enrollment_request).await
+            .map_err(|error| if error == Error::Retry {
+                Error::Local("Could not complete enrollment. Check the controller connection and retry; request a new token if the server already consumed it.")
+            } else { error })?;
         validate_credential(&enrollment.credential)?;
         if !valid_id(&enrollment.scanner.id) || !valid_id(&enrollment.scanner.site) {
             return Err(Error::Invalid);
@@ -1033,105 +1192,146 @@ async fn run_inner(args: ControllerArgs) -> Result<(), Error> {
         state.scanner = Some(enrollment.scanner);
         state.assignment = None;
         state.pending_imports.clear();
-        store.persist_credential(&mut state, &enrollment.credential, args.file_credentials)?;
+        state.settings = settings.clone();
+        store.persist_credential(
+            &mut state,
+            &enrollment.credential,
+            settings.file_credentials,
+        )?;
         api.credential = enrollment.credential.credential;
-        eprintln!("Scanner enrolled; polling controller.");
+        eprintln!("Scanner enrolled.");
     } else {
         api.credential = store.credential(&state)?;
     }
     if state.scanner.is_none() {
         return Err(Error::Local("Enroll this scanner before polling."));
     }
-    let mut attempt = 0;
-    loop {
-        let result = async {
-            let expiry = expires_at(&state.credential_expires_at)?;
-            if expiry <= OffsetDateTime::now_utc() {
-                return Err(Error::Auth);
-            }
-            if expiry - OffsetDateTime::now_utc() < time::Duration::days(30) {
-                let rotated: Credential = api
-                    .post("api/otter/v1/credentials/rotate", json!({}))
-                    .await?;
-                validate_credential(&rotated)?;
-                // Persist first. Any storage failure exits; never fall back to the revoked credential.
-                store.persist_credential(&mut state, &rotated, args.file_credentials)?;
-                api.credential = rotated.credential;
-            }
-            let report = scanner_report()?;
-            let poll: Poll = api.post("api/otter/v1/poll", json!(report)).await?;
-            match poll {
-                Poll::Idle {
-                    retry_after_seconds,
-                } => {
-                    if let Some(run) = &mut state.assignment {
-                        run.phase = Phase::Terminal;
-                    }
-                    imports(&api, &store, &mut state).await?;
-                    Ok(retry_after_seconds.clamp(args.poll_seconds, 300))
-                }
-                Poll::Cancel { run_id } => {
-                    if !valid_id(&run_id) {
-                        return Err(Error::Invalid);
-                    }
-                    if state.assignment.as_ref().is_none_or(|r| r.id != run_id) {
-                        state.assignment = Some(RunState {
-                            id: run_id,
-                            phase: Phase::Finishing,
-                            status: "cancelled".into(),
-                            import_id: None,
-                            message: None,
-                        });
-                    }
-                    finish(&api, &store, &mut state, "cancelled", None).await?;
-                    Ok(args.poll_seconds)
-                }
-                Poll::Run { run } => {
-                    let id = run.id.clone();
-                    match execute(&api, &store, &mut state, run).await {
-                        Err(Error::Local("cancelled")) => {
-                            finish(&api, &store, &mut state, "cancelled", None).await?
-                        }
-                        Err(Error::Invalid)
-                            if state.assignment.as_ref().is_some_and(|run| run.id == id) =>
-                        {
-                            finish(
-                                &api,
-                                &store,
-                                &mut state,
-                                "failed",
-                                Some(
-                                    "Controller response or managed scan configuration is invalid.",
-                                ),
-                            )
-                            .await?
-                        }
-                        other => other?,
-                    }
-                    Ok(args.poll_seconds)
-                }
-            }
+    state.settings = settings;
+    store.save(&state)?;
+    Ok((store, state, api))
+}
+
+#[cfg(feature = "gui")]
+pub(super) async fn enroll_from_gui(
+    server_url: String,
+    token: String,
+    overwrite: bool,
+    http: HttpOptions,
+) -> Result<(), String> {
+    let args = ControllerArgs {
+        server_url,
+        enroll: true,
+        enroll_only: true,
+        install: false,
+        state_dir: None,
+        overwrite_state_dir: overwrite,
+        poll_seconds: None,
+        ack_authorized: true,
+        file_credentials: false,
+        queued_imports: false,
+        ignore_self_signed: http.ignore_self_signed,
+        http_proxy: http.http_proxy,
+        https_proxy: http.https_proxy,
+    };
+    initialize(&args, Some(&token))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "gui")]
+pub(super) fn install_from_gui() -> Result<String, String> {
+    install::install(None, true)
+}
+
+async fn poll_once(
+    api: &mut Api,
+    store: &store::Store,
+    state: &mut State,
+    poll_seconds: u64,
+    file_credentials: bool,
+) -> Result<Duration, Error> {
+    let result = async {
+        let expiry = expires_at(&state.credential_expires_at)?;
+        if expiry <= OffsetDateTime::now_utc() {
+            return Err(Error::Auth);
         }
-        .await;
-        let delay = match result {
-            Ok(seconds) => {
-                attempt = 0;
-                Duration::from_secs(seconds)
-            }
-            Err(Error::Retry) => {
-                attempt += 1;
-                eprintln!("{}", Error::Retry);
-                backoff(attempt, uuid::Uuid::new_v4().as_u128() as u64)
-            }
-            Err(Error::Terminal) => {
+        if expiry - OffsetDateTime::now_utc() < time::Duration::days(30) {
+            let rotated: Credential = api
+                .post("api/otter/v1/credentials/rotate", json!({}))
+                .await?;
+            validate_credential(&rotated)?;
+            // Persist first. Any storage failure exits; never fall back to the revoked credential.
+            store.persist_credential(state, &rotated, file_credentials)?;
+            api.credential = rotated.credential;
+        }
+        let report = scanner_report()?;
+        let poll: Poll = api.post("api/otter/v1/poll", json!(report)).await?;
+        match poll {
+            Poll::Idle {
+                retry_after_seconds,
+            } => {
                 if let Some(run) = &mut state.assignment {
                     run.phase = Phase::Terminal;
                 }
-                save(&store, &state)?;
-                Duration::from_secs(args.poll_seconds)
+                imports(api, store, state).await?;
+                Ok(retry_after_seconds.clamp(poll_seconds, 300))
             }
-            Err(error) => return Err(error),
-        };
-        tokio::time::sleep(delay).await;
+            Poll::Cancel { run_id } => {
+                if !valid_id(&run_id) {
+                    return Err(Error::Invalid);
+                }
+                if state.assignment.as_ref().is_none_or(|r| r.id != run_id) {
+                    state.assignment = Some(RunState {
+                        id: run_id,
+                        phase: Phase::Finishing,
+                        status: "cancelled".into(),
+                        import_id: None,
+                        message: None,
+                        upload_attempts: 0,
+                    });
+                }
+                finish(api, store, state, "cancelled", None).await?;
+                Ok(poll_seconds)
+            }
+            Poll::Run { run } => {
+                let id = run.id.clone();
+                match execute(api, store, state, run).await {
+                    Err(Error::Local("cancelled")) => {
+                        finish(api, store, state, "cancelled", None).await?
+                    }
+                    Err(Error::Invalid)
+                        if state.assignment.as_ref().is_some_and(|run| run.id == id) =>
+                    {
+                        finish(
+                            api,
+                            store,
+                            state,
+                            "failed",
+                            Some("Controller response or managed scan configuration is invalid."),
+                        )
+                        .await?
+                    }
+                    other => other?,
+                }
+                Ok(poll_seconds)
+            }
+        }
+    }
+    .await;
+    match result {
+        Ok(seconds) => Ok(Duration::from_secs(seconds)),
+        Err(error @ (Error::Retry | Error::InterfacesUnavailable)) => {
+            eprintln!("{error}");
+            Ok(Duration::from_secs(300))
+        }
+        Err(Error::Terminal) => {
+            if let Some(run) = &mut state.assignment {
+                run.phase = Phase::Terminal;
+            }
+            save(store, state)?;
+            Ok(Duration::from_secs(poll_seconds))
+        }
+        Err(error) => Err(error),
     }
 }

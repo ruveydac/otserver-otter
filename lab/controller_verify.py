@@ -40,7 +40,7 @@ def main(binary):
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         interfaces = json.loads(subprocess.check_output([binary, "interfaces", "--json"]))
         interface = next(item for item in interfaces if item.get("macAddress")) if any(item.get("macAddress") for item in interfaces) else interfaces[0]
-        data = {"credential": "a" * 43, "rotations": 0, "uploads": [], "finished": {}, "retried": 0, "importCompleted": False, "error": None}
+        data = {"credential": "a" * 43, "rotations": 0, "uploads": [], "uploadTimes": [], "heartbeats": 0, "finished": {}, "retried": 0, "importCompleted": False, "error": None}
         rejected_upload = threading.Event()
 
         class Handler(BaseHTTPRequestHandler):
@@ -99,12 +99,13 @@ def main(binary):
                     }
                     if run == "run3":
                         configuration["output"] = "/forbidden/server/path"
-                    self.send_json({"action": "run", "run": {"id": run, "configuration": configuration, "credentials": {"snmp": [{"community": "lab-secret"}]}, "uploadPath": "/api/asset-imports", "leaseExpiresAt": future(seconds=120)}})
+                    self.send_json({"action": "run", "run": {"id": run, "configuration": configuration, "credentials": {"snmp": [{"community": "lab-secret"}]}, "uploadPath": "/api/asset-imports", "leaseExpiresAt": future(seconds=1800)}})
                 elif self.path.endswith("/start"):
                     self.send_json({"status": "running"})
                 elif self.path.endswith("/heartbeat"):
                     assert 0 <= json.loads(body)["progress"] <= 100
-                    self.send_json({"cancelRequested": "run2" in self.path, "leaseExpiresAt": future(seconds=120)})
+                    data["heartbeats"] += 1
+                    self.send_json({"cancelRequested": "run2" in self.path, "leaseExpiresAt": future(seconds=1800)})
                 elif self.path == "/api/asset-imports":
                     message = BytesParser(policy=default).parsebytes(b"Content-Type: " + self.headers["Content-Type"].encode() + b"\r\n\r\n" + body)
                     parts = {part.get_param("name", header="content-disposition"): part.get_payload(decode=True) for part in message.iter_parts()}
@@ -115,6 +116,7 @@ def main(binary):
                     assert export["format"] == "otserver-scan" and export["schemaVersion"] == 2
                     assert "lab-secret" not in parts["file"].decode()
                     data["uploads"].append(parts["file"])
+                    data["uploadTimes"].append(time.monotonic())
                     if len(data["uploads"]) == 1:
                         self.send_json({"error": "temporarily unavailable"}, 503)
                         rejected_upload.set()
@@ -163,10 +165,13 @@ def main(binary):
             first_logs = process.communicate(timeout=10)
             saved = json.loads((state / "agent-state.json").read_text())
             assert saved["assignment"]["phase"] == "ready" and saved["fileCredential"]["credential"] == "b" * 43
+            assert saved["assignment"]["uploadAttempts"] == 1
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment)
-            last_logs = process.communicate(timeout=45)
+            last_logs = process.communicate(timeout=165)
             assert process.returncode == 1, "revocation must stop the agent"
             assert data["error"] is None and data["rotations"] == 1 and len(data["uploads"]) == 2
+            assert data["uploadTimes"][1] - data["uploadTimes"][0] >= 120
+            assert data["heartbeats"] >= 8, "retry waits must keep heartbeats active"
             assert len(data["finished"]) == 3 and data["retried"] == 1 and data["importCompleted"]
             for log in first_logs + last_logs:
                 assert not any(secret.encode() in log for secret in ["a" * 43, "b" * 43, "t" * 43, "lab-secret"])

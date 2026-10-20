@@ -3,7 +3,8 @@ mod controller;
 pub mod gui;
 use clap::{ArgAction, Args, Parser, Subcommand};
 use otserver_otter::contract::{
-    Device, InterfaceRef, ScanExport, ScanInfo, ScannerInfo, Source, merge_devices, validate,
+    Device, InterfaceRef, ScanExport, ScanInfo, ScannerInfo, Source, merge_devices,
+    unique_ip_identities, validate,
 };
 use otserver_otter::{discovery, profinet, protocols, snmp};
 use serde::{Deserialize, Serialize};
@@ -122,7 +123,7 @@ pub struct ScanArgs {
     pub https_proxy: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct HttpOptions {
     pub ignore_self_signed: bool,
     pub http_proxy: Option<String>,
@@ -808,6 +809,12 @@ pub async fn scan(
     };
     if options.protocols.arp && !cancelled.load(Ordering::Relaxed) {
         logger.log("Executing ARP discovery...".into());
+        #[cfg(windows)]
+        logger.log(if profinet::npcap_interface_available(&options.interface) {
+            "Windows ARP uses Npcap: paced requests with reply collection during the sweep.".into()
+        } else {
+            "Windows ARP uses the driver-free SendARP fallback: each address waits for resolution or an OS timeout. Sparse ranges can be slow; install and bind Npcap to the selected adapter for paced sweeps.".into()
+        });
         match discover(&options.interface, &source_mac, &arp_targets, cancelled).await {
             Ok(found) => {
                 logger.log(format!("ARP discovery found {} device(s).", found.len()));
@@ -846,6 +853,28 @@ pub async fn scan(
         options.protocols.arp,
         options.allow_dcp_source,
     );
+    if options.protocols.profinet && !cancelled.load(Ordering::Relaxed) {
+        logger.log("Reading PROFINET PNIO I&M records for discovered MAC/IP pairs...".into());
+        let selected = options.interface.clone();
+        let mac = source_mac.clone();
+        let targets = probe_targets.clone();
+        let cancellation = Arc::clone(cancelled);
+        let (enriched, result) = tokio::task::spawn_blocking(move || {
+            let result =
+                profinet::enrich_pnio(&selected, &mac, &mut devices, &targets, &cancellation);
+            (devices, result)
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        devices = enriched;
+        let diagnostics =
+            result.unwrap_or_else(|error| vec![format!("PROFINET PNIO scan skipped: {error}")]);
+        for warning in &diagnostics {
+            logger.log(warning.clone());
+        }
+        warnings.extend(diagnostics);
+        logger.devices(configuration, &devices);
+    }
     logger.log(format!(
         "IP protocol targets: {} ({}).",
         probe_targets.len(),
@@ -1576,26 +1605,6 @@ fn apply_probe(
         unresolved.append(&mut result.observations);
     }
     logger.devices(configuration, devices);
-}
-
-fn unique_ip_identities(devices: &[otserver_otter::contract::Device]) -> BTreeMap<String, String> {
-    let mut values = BTreeMap::<String, Vec<String>>::new();
-    for device in devices {
-        for ip in &device.ip_addresses {
-            values
-                .entry(ip.clone())
-                .or_default()
-                .push(device.mac_address.clone());
-        }
-    }
-    values
-        .into_iter()
-        .filter_map(|(ip, mut macs)| {
-            macs.sort();
-            macs.dedup();
-            (macs.len() == 1).then(|| (ip, macs.remove(0)))
-        })
-        .collect()
 }
 
 async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {

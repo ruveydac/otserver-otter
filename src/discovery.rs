@@ -11,7 +11,7 @@ use std::time::Duration;
 #[cfg(any(target_os = "linux", test))]
 use std::time::Instant;
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(windows, target_os = "linux", test))]
 const ARP_ETHERTYPE: [u8; 2] = [0x08, 0x06];
 const BROADCAST: [u8; 6] = [0xff; 6];
 pub const MAX_TARGETS: usize = 65_536;
@@ -150,8 +150,8 @@ fn classify(fingerprint: Fingerprint) -> Option<&'static str> {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn request(source_mac: [u8; 6], source_ip: Ipv4Addr, target: Ipv4Addr) -> [u8; 42] {
+#[cfg(any(windows, target_os = "linux", test))]
+pub(crate) fn request(source_mac: [u8; 6], source_ip: Ipv4Addr, target: Ipv4Addr) -> [u8; 42] {
     let mut frame = [0_u8; 42];
     frame[..6].copy_from_slice(&BROADCAST);
     frame[6..12].copy_from_slice(&source_mac);
@@ -163,8 +163,8 @@ fn request(source_mac: [u8; 6], source_ip: Ipv4Addr, target: Ipv4Addr) -> [u8; 4
     frame
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn reply(
+#[cfg(any(windows, target_os = "linux", test))]
+pub(crate) fn reply(
     frame: &[u8],
     targets: &BTreeSet<Ipv4Addr>,
     source_mac: [u8; 6],
@@ -279,17 +279,46 @@ pub fn interface_ip_addresses(_interface: &str) -> Result<Vec<IpAddr>, String> {
 
 #[cfg(windows)]
 fn platform_scan(
-    _interface: &str,
-    _source_mac: [u8; 6],
+    interface: &str,
+    source_mac: [u8; 6],
     source_ip: Ipv4Addr,
     targets: &[Ipv4Addr],
-    _wait: Duration,
+    wait: Duration,
     cancelled: &AtomicBool,
 ) -> Result<DiscoveryResults, String> {
+    use std::cell::RefCell;
     use windows_sys::Win32::NetworkManagement::IpHelper::SendARP;
+
+    if targets.is_empty() || cancelled.load(Ordering::Relaxed) {
+        return Ok(BTreeMap::new());
+    }
+    let selected = crate::profinet::windows_scan_interface(interface)?;
+    if crate::profinet::npcap::interface_available(&selected.name) {
+        crate::profinet::validate_source_mac(&selected, &format_mac(&source_mac))?;
+        let requested = RefCell::new(BTreeSet::new());
+        let mut replies = BTreeMap::new();
+        crate::profinet::npcap::capture_arp(
+            &selected.name,
+            targets.iter().map(|&ip| {
+                // Capture runs on this same thread, only after the synchronous send succeeds.
+                requested.borrow_mut().insert(ip);
+                request(source_mac, source_ip, ip)
+            }),
+            wait,
+            cancelled,
+            |frame| {
+                if let Some((ip, mac)) = reply(frame, &requested.borrow(), source_mac, source_ip) {
+                    replies.insert(ip, (mac, None));
+                }
+                Ok(())
+            },
+        )?;
+        return Ok(replies);
+    }
 
     // pktmon is a capture-only facility. Use the supported IP Helper API to cause Windows to
     // transmit each ARP request on the adapter owning source_ip and return the resolved MAC.
+    // SendARP waits for resolution/timeout, so the driver-free fallback remains serial.
     // SendARP expects IPAddr values in the same byte layout as inet_addr/SOCKADDR_IN.
     let source = u32::from_ne_bytes(source_ip.octets());
     Ok(resolve_arp(targets, cancelled, |target| {

@@ -1,17 +1,17 @@
-use crate::contract::{Device, Observation, Source, format_mac, hex, mac_bytes, normalize_mac};
+use crate::contract::{
+    Device, Observation, Source, format_mac, hex, mac_bytes, normalize_mac, unique_ip_identities,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::AtomicBool;
-#[cfg(any(windows, target_os = "linux"))]
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 #[cfg(windows)]
 #[path = "profinet_npcap.rs"]
-mod npcap;
+pub(crate) mod npcap;
 #[path = "profinet_pnio.rs"]
 mod pnio;
-#[cfg(any(windows, target_os = "linux"))]
 use std::net::Ipv4Addr;
 #[cfg(windows)]
 use std::net::Ipv6Addr;
@@ -218,12 +218,6 @@ pub fn scan(
         npcap::capture(&selected.name, &request, wait, cancelled, |frame| {
             collect_active_response(&mut devices, frame, source, xid)
         })?;
-        if let Ok(source_ip) = crate::discovery::source_ipv4(&selected.name)
-            && let Err(error) =
-                enrich_windows_pnio(&selected.name, source, source_ip, &mut devices, cancelled)
-        {
-            add_pnio_warning(&mut devices, error);
-        }
         return Ok(devices.into_values().collect());
     }
     let mut devices = BTreeMap::new();
@@ -332,32 +326,62 @@ fn passive_frame_matches_interface(frame: &[u8], selected_mac: [u8; 6]) -> bool 
         && frame[12..14] == PROFINET_ETHERTYPE
 }
 
-fn add_pnio_warning(devices: &mut BTreeMap<String, Device>, error: String) {
-    for device in devices.values_mut() {
-        if let Some(observation) = device
-            .observations
-            .iter_mut()
-            .find(|observation| observation.source == Source::ProfinetDcp)
-        {
-            observation
-                .warnings
-                .push(format!("PROFINET PNIO record scan skipped: {error}"));
+pub fn enrich_pnio(
+    interface: &str,
+    source_mac: &str,
+    devices: &mut [Device],
+    targets: &BTreeSet<Ipv4Addr>,
+    cancelled: &AtomicBool,
+) -> Result<Vec<String>, String> {
+    if devices.is_empty() || cancelled.load(Ordering::Relaxed) {
+        return Ok(Vec::new());
+    }
+    let source = mac_bytes(source_mac)
+        .ok_or_else(|| "A valid source MAC address is required for PNIO reads.".to_string())?;
+    let source_ip = crate::discovery::source_ipv4(interface)?;
+    #[cfg(windows)]
+    {
+        let selected = windows_scan_interface(interface)?;
+        validate_source_mac(&selected, source_mac)?;
+        if !npcap::interface_available(&selected.name) {
+            return Err(
+                "PNIO reads require Npcap bound to the selected adapter; pktmon is capture-only."
+                    .into(),
+            );
         }
+        enrich_windows_pnio(
+            &selected.name,
+            source,
+            source_ip,
+            devices,
+            targets,
+            cancelled,
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        enrich_linux_pnio(interface, source, source_ip, devices, targets, cancelled)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = (source, source_ip, targets);
+        Err("PROFINET PNIO reads are supported on Windows and Linux.".into())
     }
 }
 
-fn attach_pnio_records(device: &mut Device, records: Vec<pnio::RecordRead>) {
-    if records.is_empty() {
+fn attach_pnio_records(device: &mut Device, target_ip: Ipv4Addr, scan: pnio::RecordScan) {
+    let pnio::RecordScan { records, warnings } = scan;
+    if records.is_empty() && warnings.is_empty() {
         return;
     }
     let observed_at = crate::now();
-    let ip_address = device.ip_addresses.first().cloned();
-    let mut fields = BTreeMap::from([
-        ("lastSeen".into(), json!(observed_at.clone())),
-        ("macAddress".into(), json!(device.mac_address.clone())),
-        ("protocols".into(), json!(["profinet", "profinet-pnio"])),
-        ("status".into(), json!("online")),
-    ]);
+    let ip_address = Some(target_ip.to_string());
+    let mut fields = BTreeMap::from([("macAddress".into(), json!(device.mac_address))]);
+    if !records.is_empty() {
+        fields.insert("lastSeen".into(), json!(observed_at));
+        fields.insert("protocols".into(), json!(["profinet", "profinet-pnio"]));
+        fields.insert("status".into(), json!("online"));
+    }
     // Only the primary access point supplies these legacy device-level fields.
     let primary = records.iter().find(|record| {
         (
@@ -402,8 +426,93 @@ fn attach_pnio_records(device: &mut Device, records: Vec<pnio::RecordRead>) {
             "physicalEntities": pnio_physical_entities(&records),
             "pnioRecords": raw_records,
         }),
-        warnings: vec![],
+        warnings,
     });
+}
+
+fn read_device_records(
+    devices: &mut [Device],
+    targets: &BTreeSet<Ipv4Addr>,
+    cancelled: &AtomicBool,
+    mut transact: impl FnMut(
+        [u8; 6],
+        Ipv4Addr,
+        u16,
+        &[u8],
+        Duration,
+        &AtomicBool,
+    ) -> Result<(pnio::RpcHeader, Vec<u8>), String>,
+) -> Vec<String> {
+    let identities = unique_ip_identities(devices);
+    let mut warnings = Vec::new();
+    for device in devices {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        let Some(mac) =
+            mac_bytes(&device.mac_address).filter(|mac| *mac != [0; 6] && mac[0] & 1 == 0)
+        else {
+            warnings.push(format!(
+                "PROFINET PNIO skipped for {}: no valid unicast MAC address.",
+                device.mac_address
+            ));
+            continue;
+        };
+        let ips = device
+            .ip_addresses
+            .iter()
+            .filter_map(|ip| ip.parse::<Ipv4Addr>().ok())
+            .filter(|ip| {
+                !ip.is_unspecified()
+                    && !ip.is_multicast()
+                    && !ip.is_broadcast()
+                    && !ip.is_loopback()
+            })
+            .collect::<BTreeSet<_>>();
+        if ips.is_empty() {
+            warnings.push(format!(
+                "PROFINET PNIO skipped for {}: no usable device IPv4 address.",
+                device.mac_address
+            ));
+        }
+        for ip in ips {
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            if identities.get(&ip.to_string()) != Some(&device.mac_address) {
+                warnings.push(format!(
+                    "PROFINET PNIO skipped for {ip}: multiple MAC addresses claim this IP."
+                ));
+                continue;
+            }
+            if !targets.contains(&ip) {
+                warnings.push(format!(
+                    "PROFINET PNIO skipped for {ip}: outside the selected IP probe scope."
+                ));
+                continue;
+            }
+            match pnio::read_records(
+                pnio::RESPONSE_TIMEOUT,
+                cancelled,
+                |port, request, timeout, cancelled| {
+                    transact(mac, ip, port, request, timeout, cancelled)
+                },
+            ) {
+                Ok(scan) => {
+                    warnings.extend(
+                        scan.warnings
+                            .iter()
+                            .map(|warning| format!("{ip}: {warning}")),
+                    );
+                    attach_pnio_records(device, ip, scan);
+                }
+                Err(error) => warnings.push(format!(
+                    "PROFINET PNIO record scan failed for {ip}: {error}"
+                )),
+            }
+        }
+    }
+    warnings
 }
 
 fn pnio_component(
@@ -517,15 +626,16 @@ fn enrich_linux_pnio(
     interface: &str,
     source_mac: [u8; 6],
     source_ip: Ipv4Addr,
-    devices: &mut BTreeMap<String, Device>,
+    devices: &mut [Device],
+    targets: &BTreeSet<Ipv4Addr>,
     cancelled: &AtomicBool,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     use std::io;
     use std::mem::size_of;
     use std::os::fd::AsRawFd;
 
     if devices.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let (descriptor, mut address) = crate::discovery::open_raw_socket(interface, 0x0800)?;
     // SAFETY: address is initialized and remains valid for the duration of bind.
@@ -600,54 +710,25 @@ fn enrich_linux_pnio(
         }
     };
 
-    for device in devices.values_mut() {
-        if cancelled.load(Ordering::Relaxed) {
-            break;
-        }
-        let Some(target_ip) = device
-            .ip_addresses
-            .iter()
-            .find_map(|value| value.parse::<Ipv4Addr>().ok())
-        else {
-            continue;
-        };
-        let Some(target_mac) = mac_bytes(&device.mac_address) else {
-            continue;
-        };
-        let result = pnio::read_records(
-            Duration::from_secs(2),
-            cancelled,
-            |target_port, request, timeout, cancelled| {
-                pnio::exchange(
-                    source_mac,
-                    source_ip,
-                    target_mac,
-                    target_ip,
-                    target_port,
-                    request,
-                    timeout,
-                    cancelled,
-                    &mut send,
-                    &mut receive,
-                )
-            },
-        );
-        match result {
-            Ok(records) => attach_pnio_records(device, records),
-            Err(error) => {
-                if let Some(observation) = device
-                    .observations
-                    .iter_mut()
-                    .find(|observation| observation.source == Source::ProfinetDcp)
-                {
-                    observation.warnings.push(format!(
-                        "PROFINET PNIO record scan failed for {target_ip}: {error}"
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
+    Ok(read_device_records(
+        devices,
+        targets,
+        cancelled,
+        |target_mac, target_ip, target_port, request, timeout, cancelled| {
+            pnio::exchange(
+                source_mac,
+                source_ip,
+                target_mac,
+                target_ip,
+                target_port,
+                request,
+                timeout,
+                cancelled,
+                &mut send,
+                &mut receive,
+            )
+        },
+    ))
 }
 
 #[cfg(windows)]
@@ -655,99 +736,71 @@ fn enrich_windows_pnio(
     interface: &str,
     source_mac: [u8; 6],
     source_ip: Ipv4Addr,
-    devices: &mut BTreeMap<String, Device>,
+    devices: &mut [Device],
+    targets: &BTreeSet<Ipv4Addr>,
     cancelled: &AtomicBool,
-) -> Result<(), String> {
-    for device in devices.values_mut() {
-        if cancelled.load(Ordering::Relaxed) {
-            break;
-        }
-        let Some(target_ip) = device
-            .ip_addresses
-            .iter()
-            .find_map(|value| value.parse::<Ipv4Addr>().ok())
-        else {
-            continue;
-        };
-        let Some(target_mac) = mac_bytes(&device.mac_address) else {
-            continue;
-        };
-        let result = pnio::read_records(
-            Duration::from_millis(500),
-            cancelled,
-            |target_port, request, timeout, cancelled| {
-                let (request_header, _) = pnio::parse_rpc_fragment(request)?;
-                let raw_request = pnio::ethernet_ipv4_udp_frame(
-                    source_mac,
-                    target_mac,
-                    source_ip,
-                    target_ip,
-                    pnio::rpc_port(),
-                    target_port,
-                    request,
-                )?;
-                let mut fragments = Vec::new();
-                npcap::capture_raw(interface, &raw_request, timeout, cancelled, |frame| {
-                    let Some(udp) = pnio::parse_ipv4_udp_frame(frame) else {
-                        return Ok(None);
-                    };
-                    if udp.source_mac != target_mac
-                        || udp.destination_mac != source_mac
-                        || udp.source_ip != target_ip
-                        || udp.destination_ip != source_ip
-                        || !pnio::response_source_port_matches(target_port, udp.source_port)
-                        || udp.destination_port != pnio::rpc_port()
-                    {
-                        return Ok(None);
-                    }
-                    let Ok((header, body)) = pnio::parse_rpc_fragment(udp.payload) else {
-                        return Ok(None);
-                    };
-                    if header.packet_type != 2
-                        || header.object_uuid != request_header.object_uuid
-                        || header.interface_uuid != request_header.interface_uuid
-                        || header.activity_uuid != request_header.activity_uuid
-                        || header.sequence != request_header.sequence
-                        || header.operation != request_header.operation
-                    {
-                        return Ok(None);
-                    }
-                    let ack = if header.requires_fragment_ack() {
-                        let payload = pnio::build_fragment_ack(&header);
-                        Some(pnio::ethernet_ipv4_udp_frame(
-                            source_mac,
-                            target_mac,
-                            source_ip,
-                            target_ip,
-                            pnio::rpc_port(),
-                            target_port,
-                            &payload,
-                        )?)
-                    } else {
-                        None
-                    };
-                    fragments.push((header, body));
-                    Ok(ack)
-                })?;
-                pnio::reassemble_rpc_fragments(fragments)
-            },
-        );
-        match result {
-            Ok(records) => attach_pnio_records(device, records),
-            Err(error) => {
-                if let Some(observation) = device
-                    .observations
-                    .iter_mut()
-                    .find(|observation| observation.source == Source::ProfinetDcp)
+) -> Result<Vec<String>, String> {
+    Ok(read_device_records(
+        devices,
+        targets,
+        cancelled,
+        |target_mac, target_ip, target_port, request, timeout, cancelled| {
+            let (request_header, _) = pnio::parse_rpc_fragment(request)?;
+            let raw_request = pnio::ethernet_ipv4_udp_frame(
+                source_mac,
+                target_mac,
+                source_ip,
+                target_ip,
+                pnio::rpc_port(),
+                target_port,
+                request,
+            )?;
+            let mut fragments = Vec::new();
+            npcap::capture_raw(interface, &raw_request, timeout, cancelled, |frame| {
+                let Some(udp) = pnio::parse_ipv4_udp_frame(frame) else {
+                    return Ok(None);
+                };
+                if udp.source_mac != target_mac
+                    || udp.destination_mac != source_mac
+                    || udp.source_ip != target_ip
+                    || udp.destination_ip != source_ip
+                    || !pnio::response_source_port_matches(target_port, udp.source_port)
+                    || udp.destination_port != pnio::rpc_port()
                 {
-                    observation.warnings.push(format!(
-                        "PROFINET PNIO record scan failed for {target_ip}: {error}"
-                    ));
+                    return Ok(None);
                 }
-            }
-        }
-    }
-    Ok(())
+                let Ok((header, body)) = pnio::parse_rpc_fragment(udp.payload) else {
+                    return Ok(None);
+                };
+                if header.packet_type != 2
+                    || header.object_uuid != request_header.object_uuid
+                    || header.interface_uuid != request_header.interface_uuid
+                    || header.activity_uuid != request_header.activity_uuid
+                    || header.sequence != request_header.sequence
+                    || header.operation != request_header.operation
+                {
+                    return Ok(None);
+                }
+                let ack = if header.requires_fragment_ack() {
+                    let payload = pnio::build_fragment_ack(&header);
+                    Some(pnio::ethernet_ipv4_udp_frame(
+                        source_mac,
+                        target_mac,
+                        source_ip,
+                        target_ip,
+                        pnio::rpc_port(),
+                        target_port,
+                        &payload,
+                    )?)
+                } else {
+                    None
+                };
+                fragments.push((header, body));
+                Ok(ack)
+            })?;
+            pnio::reassemble_rpc_fragments(fragments)
+        },
+    ))
 }
 
 #[cfg(windows)]
@@ -987,11 +1040,6 @@ pub fn scan(
             continue;
         }
         return Err(format!("Linux PROFINET capture failed: {error}"));
-    }
-    if let Ok(source_ip) = crate::discovery::source_ipv4(interface)
-        && let Err(error) = enrich_linux_pnio(interface, source, source_ip, &mut devices, cancelled)
-    {
-        add_pnio_warning(&mut devices, error);
     }
     Ok(devices.into_values().collect())
 }
@@ -1267,6 +1315,11 @@ pub fn parse_response(frame: &[u8], expected_xid: u32) -> Option<Device> {
         }
         offset += padded_length;
     }
+    if let Some(vendor_id) = fields.get("vendorId").and_then(Value::as_u64)
+        && let Some(vendor) = crate::profinet_database::manufacturer_name(vendor_id as u16)
+    {
+        fields.insert("vendor".into(), json!(vendor));
+    }
     raw.insert("blocks".into(), json!(raw_blocks));
     fields.entry("name".into()).or_insert_with(|| json!(mac));
     let ip = fields
@@ -1322,7 +1375,7 @@ pub fn npcap_interface_available(interface: &str) -> bool {
 }
 
 #[cfg(windows)]
-fn windows_scan_interface(interface: &str) -> Result<CaptureInterface, String> {
+pub(crate) fn windows_scan_interface(interface: &str) -> Result<CaptureInterface, String> {
     let selected = interfaces()?
         .into_iter()
         .find(|item| {
@@ -1347,10 +1400,13 @@ pub fn interface_mac(interface: &CaptureInterface) -> Option<String> {
 }
 
 #[cfg(any(windows, test))]
-fn validate_source_mac(interface: &CaptureInterface, source_mac: &str) -> Result<(), String> {
+pub(crate) fn validate_source_mac(
+    interface: &CaptureInterface,
+    source_mac: &str,
+) -> Result<(), String> {
     let actual = interface_mac(interface).ok_or_else(|| {
         format!(
-            "Windows did not report a hardware MAC address for interface {}. Active PROFINET DCP was not started.",
+            "Windows did not report a hardware MAC address for interface {}. Active Layer-2 discovery was not started.",
             interface.friendly_name
         )
     })?;
@@ -1358,7 +1414,7 @@ fn validate_source_mac(interface: &CaptureInterface, source_mac: &str) -> Result
         .ok_or_else(|| "A valid source MAC address is required.".to_string())?;
     if configured != actual {
         return Err(format!(
-            "Source MAC {configured} does not belong to selected interface {} ({actual}). Active PROFINET DCP was not started because spoofing a source MAC can trigger switch port security and interrupt the network.",
+            "Source MAC {configured} does not belong to selected interface {} ({actual}). Active Layer-2 discovery was not started because spoofing a source MAC can trigger switch port security and interrupt the network.",
             interface.friendly_name
         ));
     }
@@ -1565,9 +1621,22 @@ mod tests {
             mac_address: "00:11:22:33:44:55".into(),
             ..Device::default()
         };
-        attach_pnio_records(&mut device, records.clone());
-        attach_pnio_records(&mut device, records);
+        let target_ip = Ipv4Addr::new(192, 0, 2, 10);
+        for _ in 0..2 {
+            attach_pnio_records(
+                &mut device,
+                target_ip,
+                pnio::RecordScan {
+                    records: records.clone(),
+                    warnings: vec![
+                        "PNIO record 0xAFF1 (API 0, slot 0, subslot 1) failed: timeout".into(),
+                    ],
+                },
+            );
+        }
         let observation = &device.observations[0];
+        assert_eq!(observation.ip_address.as_deref(), Some("192.0.2.10"));
+        assert!(observation.warnings[0].contains("0xAFF1"));
         assert_eq!(observation.fields["manufacturer"], "Primary vendor");
         assert_eq!(observation.fields["softwareRevision"], "V1.0.0");
         assert!(!observation.fields.contains_key("serialNumber"));
@@ -1612,20 +1681,25 @@ mod tests {
     #[test]
     fn pnio_module_only_and_empty_records_do_not_supply_device_identity() {
         let mut device = Device::default();
-        attach_pnio_records(&mut device, vec![]);
+        let target_ip = Ipv4Addr::new(192, 0, 2, 10);
+        attach_pnio_records(&mut device, target_ip, pnio::RecordScan::default());
         assert!(device.observations.is_empty());
         attach_pnio_records(
             &mut device,
-            vec![pnio_record(
-                0,
-                1,
-                1,
-                0xAFF0,
-                json!({
-                    "serialNumber": " ", "orderId": "", "manufacturerName": "Module vendor",
-                    "softwareRevision": "V2.0.0",
-                }),
-            )],
+            target_ip,
+            pnio::RecordScan {
+                records: vec![pnio_record(
+                    0,
+                    1,
+                    1,
+                    0xAFF0,
+                    json!({
+                        "serialNumber": " ", "orderId": "", "manufacturerName": "Module vendor",
+                        "softwareRevision": "V2.0.0",
+                    }),
+                )],
+                warnings: vec![],
+            },
         );
         let observation = &device.observations[0];
         assert!(!observation.fields.contains_key("manufacturer"));
@@ -1634,6 +1708,113 @@ mod tests {
         assert!(module.get("serialClaim").is_none());
         assert!(module.get("catalogNumber").is_none());
         assert_eq!(module["manufacturer"], "Module vendor");
+    }
+
+    #[test]
+    fn pnio_attempts_every_scoped_unambiguous_ip_without_requiring_dcp() {
+        let device = |mac: &str, ips: &[&str]| Device {
+            mac_address: mac.into(),
+            ip_addresses: ips.iter().map(|ip| ip.to_string()).collect(),
+            ..Device::default()
+        };
+        let mut devices = vec![
+            device(
+                "00:11:22:33:44:55",
+                &["192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.2"],
+            ),
+            device("00:11:22:33:44:66", &["192.0.2.1"]),
+            device(
+                "00:11:22:33:44:77",
+                &["::1", "0.0.0.0", "224.0.0.1", "255.255.255.255"],
+            ),
+            device("invalid", &["192.0.2.7"]),
+            device("00:11:22:33:44:88", &["192.0.2.8"]),
+        ];
+        let targets = [1, 2, 3, 7]
+            .map(|last| Ipv4Addr::new(192, 0, 2, last))
+            .into();
+        let mut attempted = Vec::new();
+        let warnings = read_device_records(
+            &mut devices,
+            &targets,
+            &AtomicBool::new(false),
+            |mac, ip, port, _, timeout, _| {
+                assert_eq!(port, 34964);
+                assert_eq!(timeout, Duration::from_secs(2));
+                attempted.push((mac, ip));
+                Err("no EPM response".into())
+            },
+        );
+        assert_eq!(
+            attempted,
+            [2, 3].map(|last| ([0, 17, 34, 51, 68, 85], Ipv4Addr::new(192, 0, 2, last)))
+        );
+        for detail in [
+            "multiple MAC",
+            "no usable device IPv4",
+            "no valid unicast MAC",
+            "outside the selected",
+            "no EPM response",
+        ] {
+            assert!(
+                warnings.iter().any(|warning| warning.contains(detail)),
+                "{warnings:?}"
+            );
+        }
+        assert!(devices.iter().all(|device| device.observations.is_empty()));
+        assert!(
+            read_device_records(
+                &mut devices,
+                &targets,
+                &AtomicBool::new(true),
+                |_, _, _, _, _, _| panic!("cancelled scans must not transmit")
+            )
+            .is_empty()
+        );
+        assert!(
+            enrich_pnio(
+                "invalid-interface",
+                "00:11:22:33:44:55",
+                &mut devices,
+                &targets,
+                &AtomicBool::new(false)
+            )
+            .is_err()
+        );
+        assert!(
+            enrich_pnio(
+                "invalid-interface",
+                "invalid",
+                &mut devices,
+                &targets,
+                &AtomicBool::new(true)
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn pnio_failed_records_export_diagnostics_without_claiming_online_identity() {
+        let mut device = Device {
+            mac_address: "00:11:22:33:44:55".into(),
+            ..Device::default()
+        };
+        attach_pnio_records(
+            &mut device,
+            Ipv4Addr::new(192, 0, 2, 1),
+            pnio::RecordScan {
+                records: vec![],
+                warnings: vec!["PNIO record 0xAFF0 failed".into()],
+            },
+        );
+        let exported = serde_json::to_value(&device.observations[0]).unwrap();
+        assert_eq!(exported["warnings"][0], "PNIO record 0xAFF0 failed");
+        assert_eq!(exported["raw"]["pnioRecords"], json!([]));
+        assert_eq!(
+            exported["fields"],
+            json!({ "macAddress": "00:11:22:33:44:55" })
+        );
     }
 
     #[cfg(any(windows, target_os = "linux"))]
@@ -1718,6 +1899,7 @@ mod tests {
         assert_eq!(observation.fields["deviceId"], 7);
         let exported = serde_json::to_value(observation).unwrap();
         assert_eq!(exported["fields"]["vendorId"], 42);
+        assert_eq!(exported["fields"]["vendor"], "SIEMENS AG");
         assert_eq!(exported["fields"]["deviceId"], 7);
         assert_eq!(observation.raw["dnsServers"][0], "192.0.2.53");
         assert_eq!(observation.raw["deviceRole"]["roles"][1], "io-controller");
@@ -1726,6 +1908,38 @@ mod tests {
         assert_eq!(observation.raw["oemVendorId"], 42);
         assert_eq!(observation.raw["rsiProperties"], 3);
         assert_eq!(observation.raw["protocolProperties"], 0x21);
+    }
+
+    #[test]
+    fn resolves_vendor_from_the_final_device_identity_block() {
+        for (vendor_ids, expected) in [
+            (vec![2_u16], Some("Rockwell Automation")),
+            (vec![0xFDE8], None),
+            (vec![42, 0xFDE8], None),
+            (vec![42, 2], Some("Rockwell Automation")),
+            (vec![], None),
+        ] {
+            let mut blocks = Vec::new();
+            add_block(&mut blocks, 2, 2, b"plc");
+            for id in &vendor_ids {
+                let [high, low] = id.to_be_bytes();
+                add_block(&mut blocks, 2, 3, &[high, low, 0, 7]);
+            }
+            let device = parse_response(&response(9, &blocks), 9).unwrap();
+            let exported = serde_json::to_value(&device.observations[0]).unwrap();
+            assert_eq!(
+                exported["fields"].get("vendor"),
+                expected.map(|name| json!(name)).as_ref()
+            );
+            assert_eq!(
+                exported["fields"].get("vendorId"),
+                vendor_ids.last().map(|id| json!(id)).as_ref()
+            );
+            assert_eq!(
+                exported["raw"].get("vendorId"),
+                exported["fields"].get("vendorId")
+            );
+        }
     }
 
     #[test]
