@@ -4,6 +4,8 @@
 import json
 import os
 import subprocess
+import socket
+import threading
 import uuid
 from pathlib import Path
 
@@ -22,6 +24,7 @@ DEVICES = {
     "iec61850": "02:00:00:00:00:17",
     "netbios": "02:00:00:00:00:18",
     "smb1": "02:00:00:00:00:19",
+    "lldp": "02:00:00:00:00:FE",
 }
 TARGETS = [f"172.30.0.{number}" for number in range(10, 20)]
 
@@ -314,7 +317,7 @@ def assert_full(result: dict) -> None:
         "vendor": "OT Lab Manufacturing",
         "model": "OPC UA Lab Device",
         "serialNumber": "OPCLAB0001",
-        "firmwareVersion": "2.1.0",
+        "softwareRevision": "2.1.0",
         "hardwareVersion": "A1",
         "patchIdentifiers": ["LAB-PATCH-1"],
         "location": "Plant1/Line3/Cell2",
@@ -322,6 +325,10 @@ def assert_full(result: dict) -> None:
         "status": "online",
     } == opcua["fields"]
     assert "opc-ua" in opcua["fields"].get("protocols", [])
+    assert "firmwareVersion" not in opcua["fields"]
+    assert opcua["raw"]["endpoints"][0]["securityPolicyUri"]
+    assert opcua["raw"]["serverBuildInfo"]["fields"]["SoftwareVersion"]
+    assert opcua["raw"]["serverBuildInfo"]["subject"] == "server-application"
     assets = opcua["raw"]["assets"]
     assert len(assets) == 2
     assert opcua["raw"]["normalizedAssetRef"] == assets[0]["ref"]
@@ -476,7 +483,51 @@ def main() -> None:
     netbios_disabled_path = ARTIFACTS / f"netbios-disabled-{run_id}.otserver.json"
     netbios_unresolved_path = ARTIFACTS / f"netbios-unresolved-{run_id}.otserver.json"
     set_snmp({"version": "2c", "community": "lab-public"})
-    assert_full(scan(full_path, TARGETS))
+    # Linux bridges suppress reserved LLDP multicast. Emit the independent fixture in the
+    # scanner's network namespace to exercise AF_PACKET reception without bridge privileges.
+    stopped = threading.Event()
+    def emit_lldp() -> None:
+        def tlv(kind: int, value: bytes) -> bytes:
+            return ((kind << 9) | len(value)).to_bytes(2, "big") + value
+        # A distinct source avoids moving a responder's MAC in the bridge forwarding table.
+        frame = bytes.fromhex("0180C200000E0200000000FE88CC") + b"".join([
+            tlv(1, bytes.fromhex("040200000000FE")), tlv(2, b"\x05eth0"),
+            tlv(3, b"\x00\x78"), tlv(5, b"passive-lab"),
+            tlv(127, bytes.fromhex("0012BB08") + b"LLDP-SERIAL-1"), tlv(0, b""),
+        ])
+        with socket.socket(socket.AF_PACKET, socket.SOCK_RAW) as sender:
+            sender.bind(("eth0", 0))
+            while not stopped.wait(0.5):
+                sender.send(frame)
+    emitter = threading.Thread(target=emit_lldp)
+    emitter.start()
+    try:
+        full = scan(full_path, TARGETS)
+    finally:
+        stopped.set()
+        emitter.join()
+    assert_full(full)
+    passive = observation(by_mac(full, DEVICES["lldp"]), "lldp")
+    assert passive["raw"]["acquisition"]["mechanism"] == "passive-announcement"
+    assert passive["fields"]["serialNumber"] == "LLDP-SERIAL-1"
+    snmp = observation(by_mac(full, DEVICES["siemens"]), "snmp")
+    assert snmp["raw"]["physicalEntities"][0]["uuid"] == "00112233445566778899AABBCCDDEEFF"
+    assert snmp["fields"]["serialNumber"] == "S7LAB0001"
+    assert any(link["raw"].get("remoteInventory", {}).get("serialNumber", {}).get("value") == "NEIGHBOR-SERIAL" for link in full["links"])
+    enip = observation(by_mac(full, DEVICES["ethernet_ip"]), "ethernet-ip")
+    assert len(enip["raw"]["cipReads"]) == 3
+    assert enip["raw"]["cipReads"][0]["outcome"] == "success"
+    assert enip["raw"]["cipReads"][0]["value"]["productCode"] == enip["raw"]["productCode"]
+    dnp3 = observation(by_mac(full, DEVICES["dnp3"]), "dnp3")
+    assert dnp3["raw"]["configurationId"] == "0A1B2C3D"
+    assert dnp3["raw"]["attributeRecords"][0]["dataType"] == 1
+    partial_path = ARTIFACTS / f"fins-partial-{run_id}.otserver.json"
+    partial_flags = [f"--no-{protocol}" for protocol in ("profinet", "s7", "enip", "bacnet", "fox", "dnp3", "iec61850", "opcua", "snmp", "lldp", "netbios", "smb", "rpc")]
+    partial = scan(partial_path, ["172.30.0.20"], *partial_flags)
+    fins = observation(by_mac(partial, "02:00:00:00:00:20"), "omron-fins")
+    assert fins["fields"]["model"] == "CJ2M-CPU32" and fins["warnings"]
+    assert fins["raw"]["transportResponses"][0]["transport"] == "udp"
+    os.chmod(partial_path, 0o666)
     set_snmp(
         {
             "version": "3",

@@ -386,6 +386,7 @@ async fn query_inner(
     let mut warnings = vec![];
     let mut inventory_complete = true;
     let mut lldp_complete = true;
+    let mut walks = Vec::new();
     let mut bridge_mac = None;
     let mut siemens = false;
     if selection.inventory {
@@ -510,7 +511,14 @@ async fn query_inner(
         let if_root = "1.3.6.1.2.1.2.2.1";
         let mut if_values = vec![];
         for column in ["2", "4", "5", "6", "7", "8"] {
-            match collect_walk(&client, &format!("{if_root}.{column}"), MAX_TABLE_ROWS).await {
+            match collect_walk(
+                &client,
+                &format!("{if_root}.{column}"),
+                MAX_TABLE_ROWS,
+                &mut walks,
+            )
+            .await
+            {
                 Ok(values) => if_values.extend(values),
                 Err(error) => {
                     inventory_complete = false;
@@ -545,7 +553,14 @@ async fn query_inner(
         let ifx_root = "1.3.6.1.2.1.31.1.1.1";
         let mut ifx_values = vec![];
         for column in ["1", "15", "18"] {
-            match collect_walk(&client, &format!("{ifx_root}.{column}"), MAX_TABLE_ROWS).await {
+            match collect_walk(
+                &client,
+                &format!("{ifx_root}.{column}"),
+                MAX_TABLE_ROWS,
+                &mut walks,
+            )
+            .await
+            {
                 Ok(values) => ifx_values.extend(values),
                 Err(error) => {
                     inventory_complete = false;
@@ -597,7 +612,7 @@ async fn query_inner(
             }
         }
         let ip_root = "1.3.6.1.2.1.4.20.1";
-        match collect_walk(&client, &format!("{ip_root}.2"), MAX_TABLE_ROWS).await {
+        match collect_walk(&client, &format!("{ip_root}.2"), MAX_TABLE_ROWS, &mut walks).await {
             Ok(values) => {
                 responded.store(true, Ordering::Relaxed);
                 for item in values {
@@ -617,7 +632,14 @@ async fn query_inner(
             }
         }
         let modern_ip_root = "1.3.6.1.2.1.4.34.1";
-        match collect_walk(&client, &format!("{modern_ip_root}.3"), MAX_TABLE_ROWS).await {
+        match collect_walk(
+            &client,
+            &format!("{modern_ip_root}.3"),
+            MAX_TABLE_ROWS,
+            &mut walks,
+        )
+        .await
+        {
             Ok(values) => {
                 for item in values {
                     let key = item.oid.to_string();
@@ -643,7 +665,14 @@ async fn query_inner(
         for column in [
             "2", "4", "5", "7", "8", "9", "10", "11", "12", "13", "14", "15", "17",
         ] {
-            match collect_walk(&client, &format!("{entity_root}.{column}"), MAX_TABLE_ROWS).await {
+            match collect_walk(
+                &client,
+                &format!("{entity_root}.{column}"),
+                MAX_TABLE_ROWS,
+                &mut walks,
+            )
+            .await
+            {
                 Ok(values) => entity_values.extend(values),
                 Err(error) => {
                     inventory_complete = false;
@@ -682,8 +711,15 @@ async fn query_inner(
                 _ => {}
             }
         }
-        for column in ["3", "6", "16"] {
-            match collect_walk(&client, &format!("{entity_root}.{column}"), MAX_TABLE_ROWS).await {
+        for column in ["3", "6", "16", "18", "19"] {
+            match collect_walk(
+                &client,
+                &format!("{entity_root}.{column}"),
+                MAX_TABLE_ROWS,
+                &mut walks,
+            )
+            .await
+            {
                 Ok(values) => {
                     for item in values {
                         let key = item.oid.to_string();
@@ -698,6 +734,14 @@ async fn query_inner(
                             }
                             "6" => entity.parent_position = item.value.as_i32(),
                             "16" => entity.is_fru = item.value.as_i32().map(|value| value == 1),
+                            "18" => entity.uris = item.value.as_str().map(str::to_owned),
+                            "19" => {
+                                entity.uuid = item
+                                    .value
+                                    .as_bytes()
+                                    .filter(|bytes| bytes.len() == 16)
+                                    .map(hex)
+                            }
                             _ => unreachable!(),
                         }
                     }
@@ -709,7 +753,14 @@ async fn query_inner(
         }
         let alias_root = "1.3.6.1.2.1.47.1.3.2.1";
         let mut interface_mappings = Vec::new();
-        match collect_walk(&client, &format!("{alias_root}.2"), MAX_TABLE_ROWS).await {
+        match collect_walk(
+            &client,
+            &format!("{alias_root}.2"),
+            MAX_TABLE_ROWS,
+            &mut walks,
+        )
+        .await
+        {
             Ok(values) => {
                 for item in values {
                     let key = item.oid.to_string();
@@ -734,7 +785,13 @@ async fn query_inner(
         }
         raw.insert("physicalEntities".into(), physical_entities_json(&entities));
         raw.insert("entityInterfaceMappings".into(), interface_mappings.into());
-        if let Some((index, entity)) = preferred_entity(&entities) {
+        if let Some((index, entity)) = preferred_entity(&entities).filter(|_| {
+            !walks.iter().any(|walk| {
+                walk["oid"].as_str().is_some_and(|oid| {
+                    oid == format!("{entity_root}.4") || oid == format!("{entity_root}.5")
+                }) && walk["outcome"] != "success"
+            })
+        }) {
             raw.insert(
                 "identityComponentRef".into(),
                 json!(format!("entity:{index}")),
@@ -756,10 +813,9 @@ async fn query_inner(
                 ("vendor", entity.vendor.as_ref()),
                 ("model", entity.model.as_ref()),
                 ("serialNumber", entity.serial.as_ref()),
-                (
-                    "firmwareVersion",
-                    entity.firmware.as_ref().or(entity.software.as_ref()),
-                ),
+                ("firmwareVersion", entity.firmware.as_ref()),
+                ("softwareRevision", entity.software.as_ref()),
+                ("hardwareVersion", entity.hardware.as_ref()),
             ] {
                 if let Some(value) = value {
                     fields.insert(field.into(), json!(value));
@@ -767,7 +823,14 @@ async fn query_inner(
             }
         }
         let bridge_port_root = "1.3.6.1.2.1.17.1.4.1";
-        match collect_walk(&client, &format!("{bridge_port_root}.2"), MAX_TABLE_ROWS).await {
+        match collect_walk(
+            &client,
+            &format!("{bridge_port_root}.2"),
+            MAX_TABLE_ROWS,
+            &mut walks,
+        )
+        .await
+        {
             Ok(values) => {
                 for item in values {
                     let key = item.oid.to_string();
@@ -794,14 +857,20 @@ async fn query_inner(
             };
             let mut fdb_values = vec![];
             for column in ["2", "3"] {
-                match collect_walk(&client, &format!("{fdb_root}.{column}"), fdb_limit).await {
+                match collect_walk(
+                    &client,
+                    &format!("{fdb_root}.{column}"),
+                    fdb_limit,
+                    &mut walks,
+                )
+                .await
+                {
                     Ok(values) => fdb_values.extend(values),
                     Err(error) => {
                         inventory_complete = false;
                         warnings.push(format!(
                             "SNMP BRIDGE-MIB forwarding table {target}: {error}"
                         ));
-                        fdb_values.clear();
                         break;
                     }
                 }
@@ -838,7 +907,14 @@ async fn query_inner(
             }
 
             let vlan_root = "1.3.6.1.2.1.17.7.1.4.2.1";
-            match collect_walk(&client, &format!("{vlan_root}.4"), MAX_TABLE_ROWS).await {
+            match collect_walk(
+                &client,
+                &format!("{vlan_root}.4"),
+                MAX_TABLE_ROWS,
+                &mut walks,
+            )
+            .await
+            {
                 Ok(values) => {
                     for item in values {
                         let key = item.oid.to_string();
@@ -867,7 +943,14 @@ async fn query_inner(
                 }
             }
             let pvid_root = "1.3.6.1.2.1.17.7.1.4.5.1";
-            match collect_walk(&client, &format!("{pvid_root}.1"), MAX_TABLE_ROWS).await {
+            match collect_walk(
+                &client,
+                &format!("{pvid_root}.1"),
+                MAX_TABLE_ROWS,
+                &mut walks,
+            )
+            .await
+            {
                 Ok(values) => {
                     for item in values {
                         let key = item.oid.to_string();
@@ -893,7 +976,7 @@ async fn query_inner(
                 port.vlans.dedup();
             }
         }
-        match collect_walk(&client, "1.0.62439.1", MAX_TABLE_ROWS).await {
+        match collect_walk(&client, "1.0.62439.1", MAX_TABLE_ROWS, &mut walks).await {
             Ok(values) => {
                 for item in values {
                     raw.insert(item.oid.to_string(), value_json(&item.value));
@@ -907,6 +990,15 @@ async fn query_inner(
         for interface in interfaces.values_mut() {
             interface.ip_addresses.sort();
             interface.ip_addresses.dedup();
+        }
+        for oid in ["1.3.6.1.2.1.1.3.0", "1.3.6.1.2.1.1.4.0"] {
+            crate::traffic::wait().await;
+            if let Ok(item) = client
+                .get(&Oid::parse(oid).map_err(|error| error.to_string())?)
+                .await
+            {
+                raw.insert(item.oid.to_string(), value_json(&item.value));
+            }
         }
     }
 
@@ -965,6 +1057,7 @@ async fn query_inner(
                 &client,
                 &format!("{local_port_root}.{column}"),
                 MAX_TABLE_ROWS,
+                &mut walks,
             )
             .await
             {
@@ -1008,7 +1101,7 @@ async fn query_inner(
             ("LLDP-EXT-DOT3-MIB", "1.0.8802.1.1.2.1.5.4623.1.2"),
             ("LLDP-EXT-PNO-MIB", "1.0.8802.1.1.2.1.5.3791.1.2"),
         ] {
-            match collect_walk(&client, root, MAX_TABLE_ROWS).await {
+            match collect_walk(&client, root, MAX_TABLE_ROWS, &mut walks).await {
                 Ok(values) => local_extension_values.extend(values),
                 Err(error) => {
                     lldp_complete = false;
@@ -1102,6 +1195,7 @@ async fn query_inner(
             &client,
             &format!("{local_management_root}.3"),
             MAX_TABLE_ROWS,
+            &mut walks,
         )
         .await
         {
@@ -1121,12 +1215,18 @@ async fn query_inner(
         let remote_root = "1.0.8802.1.1.2.1.4.1.1";
         let mut lldp = vec![];
         for column in ["4", "5", "6", "7", "8", "9", "10", "11", "12"] {
-            match collect_walk(&client, &format!("{remote_root}.{column}"), MAX_TABLE_ROWS).await {
+            match collect_walk(
+                &client,
+                &format!("{remote_root}.{column}"),
+                MAX_TABLE_ROWS,
+                &mut walks,
+            )
+            .await
+            {
                 Ok(values) => lldp.extend(values),
                 Err(error) if selection.inventory => {
                     lldp_complete = false;
                     warnings.push(format!("SNMP LLDP-MIB {target} column {column}: {error}"));
-                    lldp.clear();
                     break;
                 }
                 Err(error) => {
@@ -1170,6 +1270,7 @@ async fn query_inner(
             &client,
             &format!("{remote_management_root}.3"),
             MAX_TABLE_ROWS,
+            &mut walks,
         )
         .await
         {
@@ -1198,7 +1299,7 @@ async fn query_inner(
             ("LLDP-EXT-DOT3-MIB", "1.0.8802.1.1.2.1.5.4623.1.3"),
             ("LLDP-EXT-PNO-MIB", "1.0.8802.1.1.2.1.5.3791.1.3"),
         ] {
-            match collect_walk(&client, root, MAX_TABLE_ROWS).await {
+            match collect_walk(&client, root, MAX_TABLE_ROWS, &mut walks).await {
                 Ok(values) => remote_extension_values.extend(values),
                 Err(error) => {
                     lldp_complete = false;
@@ -1229,7 +1330,109 @@ async fn query_inner(
                     .insert(name.into(), value_json(&item.value));
             }
         }
+        // Published MED MIBs exist under both the extension branch and the TIA OUI branch.
+        for root in ["1.0.8802.1.1.2.1.5.1.1", "1.0.8802.1.1.2.1.5.4795.1"] {
+            let mut optional_outcomes = Vec::new();
+            if let Ok(values) = collect_walk(
+                &client,
+                &format!("{root}.3.3.1"),
+                MAX_TABLE_ROWS,
+                &mut optional_outcomes,
+            )
+            .await
+            {
+                for item in values {
+                    let oid = item.oid.to_string();
+                    raw.insert(oid.clone(), value_json(&item.value));
+                    if let Some((column, index)) = table_cell(&oid, &format!("{root}.3.3.1"))
+                        && let Some(neighbor) = neighbors.get_mut(&index)
+                        && let Some(name) = med_inventory_name(column.parse::<u8>().unwrap_or(0))
+                    {
+                        neighbor.med.insert(
+                            name.into(),
+                            json!({"oid": oid, "value": value_json(&item.value)}),
+                        );
+                    }
+                }
+            }
+            let oids: Vec<Oid> = (2..=8)
+                .filter_map(|column| Oid::parse(&format!("{root}.2.{column}.0")).ok())
+                .collect();
+            crate::traffic::wait().await;
+            if let Ok(values) = client.get_many(&oids).await {
+                for item in values {
+                    raw.insert(item.oid.to_string(), value_json(&item.value));
+                }
+            }
+            raw.insert(
+                format!("{root}:inventoryCoverage"),
+                json!(optional_outcomes),
+            );
+        }
     }
+    let unresolved_neighbors: Vec<_> = neighbors.iter().filter(|(_, neighbor)| neighbor.chassis_mac().is_none()).map(|(index, neighbor)| json!({"index": index, "chassisSubtype": neighbor.chassis_subtype, "chassisIdHex": neighbor.chassis_id.as_deref().map(hex), "localPort": neighbor.local_port, "portSubtype": neighbor.port_subtype, "portId": neighbor.port, "name": neighbor.name, "inventory": neighbor.med})).collect();
+    let has_unresolved_neighbors = !unresolved_neighbors.is_empty();
+    raw.insert("unresolvedNeighbors".into(), json!(unresolved_neighbors));
+    for walk in &walks {
+        if walk["outcome"] != "success" {
+            if walk["oid"]
+                .as_str()
+                .is_some_and(|oid| oid.starts_with("1.0.8802"))
+            {
+                lldp_complete = false;
+            } else {
+                inventory_complete = false;
+            }
+            warnings.push(format!(
+                "SNMP walk {}: {} (retained {} rows)",
+                walk["oid"], walk["outcome"], walk["rows"]
+            ));
+        }
+    }
+    raw.insert("collectionOutcomes".into(), json!(walks));
+    raw.insert(
+        "acquisition".into(),
+        json!({"mechanism": "management-table-read"}),
+    );
+    let mut field_sources = Map::new();
+    for (field, oid) in [
+        ("name", "1.3.6.1.2.1.1.5.0"),
+        ("description", "1.3.6.1.2.1.1.1.0"),
+        ("location", "1.3.6.1.2.1.1.6.0"),
+        ("model", "1.3.6.1.4.1.4329.6.3.2.1.1.2.0"),
+        ("serialNumber", "1.3.6.1.4.1.4329.6.3.2.1.1.3.0"),
+        ("firmwareVersion", "1.3.6.1.4.1.4329.6.3.2.1.1.5.0"),
+    ] {
+        if fields.contains_key(field) && raw.contains_key(oid) {
+            field_sources.insert(field.into(), json!({"oid": oid, "mutable": matches!(field, "name" | "description" | "location")}));
+        }
+    }
+    if let Some(index) = raw
+        .get("identityComponentRef")
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.strip_prefix("entity:"))
+    {
+        for (field, column) in [
+            ("vendor", 12),
+            ("model", 13),
+            ("serialNumber", 11),
+            ("firmwareVersion", 9),
+            ("softwareRevision", 10),
+            ("hardwareVersion", 8),
+        ] {
+            let oid = format!("1.3.6.1.2.1.47.1.1.1.1.{column}.{index}");
+            if raw
+                .get(&oid)
+                .is_some_and(|value| value.as_str().is_some_and(|text| !text.trim().is_empty()))
+            {
+                field_sources.insert(
+                    field.into(),
+                    json!({"oid": oid, "componentRef": format!("entity:{index}")}),
+                );
+            }
+        }
+    }
+    raw.insert("fieldSources".into(), field_sources.into());
     let identity_mac = local_mac
         .and_then(normalize_mac)
         .or_else(|| bridge_mac.as_deref().and_then(normalize_mac))
@@ -1277,6 +1480,8 @@ async fn query_inner(
                         "remoteCapabilitiesSupported": neighbor.capabilities_supported,
                         "remoteCapabilitiesEnabled": neighbor.capabilities_enabled,
                         "remoteManagementAddresses": neighbor.management_addresses,
+                        "acquisition": {"mechanism": "management-table-read"},
+                        "remoteInventory": neighbor.med,
                         "remotePortVlanId": neighbor.remote_port_vlan_id,
                         "remoteDot3": (!neighbor.remote_dot3.is_empty())
                             .then_some(neighbor.remote_dot3),
@@ -1291,8 +1496,12 @@ async fn query_inner(
     };
     Ok(ResultData {
         identity_mac: identity_mac.clone(),
-        observation: selection.inventory.then(|| Observation {
-            source: Source::Snmp,
+        observation: (selection.inventory || has_unresolved_neighbors).then(|| Observation {
+            source: if selection.inventory {
+                Source::Snmp
+            } else {
+                Source::Lldp
+            },
             observed_at,
             ip_address: Some(target.into()),
             mac_address: identity_mac.clone(),
@@ -1326,6 +1535,7 @@ async fn collect_walk<T: Transport + 'static>(
     client: &Client<T>,
     oid: &str,
     limit: usize,
+    outcomes: &mut Vec<serde_json::Value>,
 ) -> Result<Vec<VarBind>, String> {
     let mut walk = client
         .walk(Oid::parse(oid).map_err(|error| error.to_string())?)
@@ -1338,12 +1548,23 @@ async fn collect_walk<T: Transport + 'static>(
         let Some(value) = walk.next().await else {
             break;
         };
-        let value = value.map_err(|error| error.to_string())?;
+        let value = match value {
+            Ok(value) => value,
+            Err(error) => {
+                outcomes.push(json!({"oid": oid, "outcome": "read-error", "rows": values.len()}));
+                if values.is_empty() {
+                    return Err(error.to_string());
+                }
+                return Ok(values);
+            }
+        };
         if values.len() == limit {
-            return Err(format!("table exceeded safe limit of {limit} rows"));
+            outcomes.push(json!({"oid": oid, "outcome": "limit-reached", "rows": values.len()}));
+            return Ok(values);
         }
         values.push(value);
     }
+    outcomes.push(json!({"oid": oid, "outcome": "success", "rows": values.len()}));
     Ok(values)
 }
 
@@ -1412,6 +1633,8 @@ struct PhysicalEntity {
     model: Option<String>,
     asset_id: Option<String>,
     manufactured_at: Option<String>,
+    uris: Option<String>,
+    uuid: Option<String>,
 }
 
 fn physical_entities_json(entities: &BTreeMap<String, PhysicalEntity>) -> serde_json::Value {
@@ -1437,6 +1660,8 @@ fn physical_entities_json(entities: &BTreeMap<String, PhysicalEntity>) -> serde_
                 "assetId": entity.asset_id,
                 "manufacturedAt": entity.manufactured_at,
                 "isFru": entity.is_fru,
+                "uris": entity.uris,
+                "uuid": entity.uuid,
                 "serialClaim": entity.serial.as_ref().map(|serial| json!({
                     "scope": class.unwrap_or("unknown"),
                     "componentRef": format!("entity:{index}"),
@@ -1448,6 +1673,20 @@ fn physical_entities_json(entities: &BTreeMap<String, PhysicalEntity>) -> serde_
             })
         })
         .collect()
+}
+
+fn med_inventory_name(column: u8) -> Option<&'static str> {
+    [
+        "hardwareRevision",
+        "firmwareRevision",
+        "softwareRevision",
+        "serialNumber",
+        "manufacturer",
+        "model",
+        "assetId",
+    ]
+    .get(usize::from(column.checked_sub(1)?))
+    .copied()
 }
 
 fn entity_class(value: i32) -> &'static str {
@@ -1496,6 +1735,7 @@ struct LocalPort {
 
 #[derive(Default)]
 struct Neighbor {
+    med: Map<String, serde_json::Value>,
     local_port: Option<String>,
     chassis_subtype: Option<i32>,
     chassis_id: Option<Vec<u8>>,
@@ -2516,8 +2756,9 @@ mod tests {
             .await
             .unwrap();
         let root = "1.3.6.1.2.1.2.2.1.2";
+        let mut outcomes = Vec::new();
         let (values, sent_at) = tokio::time::timeout(Duration::from_secs(2), async {
-            tokio::join!(collect_walk(&client, root, 10), async {
+            tokio::join!(collect_walk(&client, root, 10, &mut outcomes), async {
                 let mut buffer = [0; 4096];
                 let (length, peer) = socket.recv_from(&mut buffer).await.unwrap();
                 let message = CommunityMessage::decode(buffer[..length].to_vec().into()).unwrap();
@@ -2553,6 +2794,66 @@ mod tests {
         assert_eq!(values.unwrap().len(), 9);
         // A single bulk response still consumes one pacing slot per buffered value.
         assert!(sent_at.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[tokio::test]
+    async fn walk_retains_rows_on_limits_and_late_agent_errors() {
+        for limit in [1, 10] {
+            let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let client =
+                Client::builder(socket.local_addr().unwrap(), auth(&settings("2c")).unwrap())
+                    .connect()
+                    .await
+                    .unwrap();
+            let responder = tokio::spawn(async move {
+                let mut buffer = [0; 4096];
+                for round in 0..if limit == 1 { 1 } else { 2 } {
+                    let (length, peer) = socket.recv_from(&mut buffer).await.unwrap();
+                    let message =
+                        CommunityMessage::decode(buffer[..length].to_vec().into()).unwrap();
+                    let request = message.pdu.standard().unwrap();
+                    let varbinds = if round == 0 {
+                        (1..=2)
+                            .map(|index| {
+                                VarBind::new(
+                                    Oid::parse(&format!("1.3.6.1.2.1.2.2.1.2.{index}")).unwrap(),
+                                    Value::Integer(index),
+                                )
+                            })
+                            .collect()
+                    } else {
+                        vec![]
+                    };
+                    let response = CommunityMessage::new(
+                        message.version,
+                        message.community,
+                        Pdu {
+                            pdu_type: PduType::Response,
+                            request_id: request.request_id,
+                            error_status: if round == 0 { 0 } else { 5 },
+                            error_index: 0,
+                            varbinds,
+                        },
+                    )
+                    .encode();
+                    socket.send_to(&response, peer).await.unwrap();
+                }
+            });
+            let mut outcomes = Vec::new();
+            let values = collect_walk(&client, "1.3.6.1.2.1.2.2.1.2", limit, &mut outcomes)
+                .await
+                .unwrap();
+            assert_eq!(values.len(), if limit == 1 { 1 } else { 2 });
+            assert_eq!(
+                outcomes[0]["outcome"],
+                if limit == 1 {
+                    "limit-reached"
+                } else {
+                    "read-error"
+                }
+            );
+            responder.await.unwrap();
+        }
     }
 
     #[tokio::test]

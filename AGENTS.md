@@ -323,13 +323,32 @@ to HTTP. Other hosts require explicit HTTPS. No scanner-side listener is opened.
   access and both identity SZLs.
   PNIO component references use `pnio:<api>:<slot>[:<subslot>]` and retain original records,
   containment, identification numbers, I&M revisions, and scoped serial claims.
-- DNP3 uses TCP 20000: link reset followed by Group 0 Variation 0 device-attribute Read with the
+- DNP3 uses TCP 20000: link reset followed by Group 0 Variation 254 device-attribute Read with the
   all-objects qualifier, pipelined for four common outstation/master pairs. Keep hardware revisions
   separate from firmware. Do not probe DNP3/UDP, TLS-wrapped DNP3, or Secure Authentication.
 - IEC 61850 uses MMS/TCP 102 for advertised identity, health, breaker-position, blocking, and
   operation-count attributes. Do not access control, report, setting-group, file, or write services.
 - OPC UA preserves hardware revisions and patch identifiers as inventory evidence, not compliance
   verdicts. Fox retains listener responses in `raw.transportResponses` even on partial failure.
+- EtherNet/IP uses correlated ListIdentity sender contexts. After a valid TCP identity, it opens
+  one bounded explicit-message session for Identity Object GetAttributesAll (class 1, instance 1),
+  TCP/IP Interface configuration and hostname GetAttributeSingle (class 0xF5, instance 1, attributes
+  5 and 6). These are the only additional CIP services; never add ForwardOpen, writes, routing,
+  or rack enumeration here. Retain disagreements as evidence, not identity overrides.
+- LLDP combines SNMP-reported neighbors with a concurrent 30-second passive selected-link capture
+  (Linux AF_PACKET or Windows Npcap). The passive path sends no frames, observes at most 512
+  neighbors, expires TTLs and honors withdrawal/cancellation. Management addresses never expand IP
+  probe scope. Preserve chassis/port subtypes and LLDP-MED inventory; remote inventory must not
+  become the reporting SNMP agent's identity. Missing Npcap does not disable SNMP LLDP collection.
+- SNMP software revisions and OPC UA SoftwareRevision remain `softwareRevision`, never a fallback
+  for firmware. OPC UA endpoint security/certificate evidence and standard server BuildInfo remain
+  application-scoped under `raw`, separate from represented assets. Certificate retention is bounded
+  to 16 KiB per endpoint and endpoint retention to 64 entries. Advertised URLs are never followed.
+- Preserve successful S7 SZLs, BACnet properties, FINS transports and partial SNMP walk rows after
+  later failures. Export collection outcomes and field sources with protocol evidence. Incomplete
+  ENTITY-MIB parent/class walks cannot establish unique root identity. DNP3 attributes retain set,
+  variation, datatype and bytes; only explicit standard-set attributes supply normalized identity.
+  Datatype 254 is an attribute list, not a vendor string convention.
 - NetBIOS retains name tables, suffixes, flags, workgroup, unit ID, and raw replies. Prefer workstation
   over server names. No broadcast, registration, credentials, or SMB session is needed. OTserver must
   recognize the `netbios` source in schema version 2.
@@ -365,6 +384,13 @@ asyncua, and bounded FINS/Fox/DNP3 implementations. NetBIOS uses Samba `nmbd`; S
 fallback, names, native strings, disablement, and MAC-less unresolved output. Classic security and
 old short NTLM challenges use Rust fixtures, not live legacy-Windows interoperability tests.
 Validate actual Windows releases separately with their firewall and NTLM policies.
+
+The lab checks three allowlisted CIP reads against OpENer, typed DNP3/configuration evidence,
+SNMP ENTITY-MIB UUID/URI and remote LLDP-MED scoping, OPC UA application/device version separation,
+and retention of UDP FINS identity after a malformed TCP response. Passive LLDP frames are injected
+in the scanner's isolated network namespace because Linux bridges suppress reserved LLDP multicast;
+this exercises AF_PACKET reception/decoding, not physical switch forwarding or Windows capture.
+The scanner lab Docker build uses BuildKit registry/target caches for repeatable incremental builds.
 
 ### Remote-management gate setup
 

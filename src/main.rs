@@ -760,18 +760,19 @@ pub async fn scan(
     } else {
         profinet::interfaces()
     };
-    let source_mac = if (options.protocols.arp || options.protocols.profinet)
-        && !cancelled.load(Ordering::Relaxed)
-    {
-        scan_source_mac(
-            &options.interface,
-            &options.source_mac,
-            interfaces.as_ref().map_err(Clone::clone)?,
-            logger,
-        )?
-    } else {
-        options.source_mac.clone()
-    };
+    let source_mac =
+        if (options.protocols.arp || options.protocols.profinet || options.protocols.lldp)
+            && !cancelled.load(Ordering::Relaxed)
+        {
+            scan_source_mac(
+                &options.interface,
+                &options.source_mac,
+                interfaces.as_ref().map_err(Clone::clone)?,
+                logger,
+            )?
+        } else {
+            options.source_mac.clone()
+        };
     let interface = scan_interface_ref(
         &options.interface,
         &source_mac,
@@ -793,6 +794,16 @@ pub async fn scan(
     ));
 
     let target_addresses = discovery::expand_targets(&options.targets)?;
+    let lldp_capture = if options.protocols.lldp && !cancelled.load(Ordering::Relaxed) {
+        let interface = options.interface.clone();
+        let mac = source_mac.clone();
+        let cancellation = Arc::clone(cancelled);
+        Some(tokio::task::spawn_blocking(move || {
+            otserver_otter::lldp::scan(&interface, &mac, &cancellation)
+        }))
+    } else {
+        None
+    };
 
     let dcp_first = options.allow_dcp_source && options.protocols.profinet;
     if dcp_first && !cancelled.load(Ordering::Relaxed) {
@@ -952,6 +963,17 @@ pub async fn scan(
         .await;
     }
 
+    if let Some(capture) = lldp_capture {
+        match capture.await {
+            Ok(Ok(result)) => {
+                devices.extend(result.devices);
+                links.extend(result.links);
+                warnings.extend(result.warnings);
+            }
+            Ok(Err(error)) => warnings.push(format!("Passive LLDP: {error}")),
+            Err(error) => warnings.push(format!("Passive LLDP task: {error}")),
+        }
+    }
     let stopped = cancelled.load(Ordering::Relaxed);
     if stopped {
         warnings
@@ -1347,7 +1369,7 @@ async fn probe_protocols(
     selection: protocols::Selection,
     opcua: &otserver_otter::protocols::OpcuaSettings,
     logger: &dyn LogOutput,
-    cancelled: &AtomicBool,
+    cancelled: &Arc<AtomicBool>,
 ) {
     let identities = unique_ip_identities(devices);
     let mut tasks = tokio::task::JoinSet::new();
@@ -1364,8 +1386,16 @@ async fn probe_protocols(
         }
         let mac = identities.get(&ip.to_string()).cloned();
         let opcua = opcua.clone();
+        let cancellation = Arc::clone(cancelled);
         tasks.spawn(async move {
-            let result = protocols::scan(ip, mac.as_deref(), selection, &opcua).await;
+            let result = protocols::scan_with_cancellation(
+                ip,
+                mac.as_deref(),
+                selection,
+                &opcua,
+                &cancellation,
+            )
+            .await;
             (ip, mac, result)
         });
     }
@@ -1406,6 +1436,13 @@ async fn drain_tasks<T: 'static>(
     }
     while let Some(result) = tasks.try_join_next() {
         apply(Some(result));
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    while !tasks.is_empty() {
+        match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+            Ok(Some(result)) => apply(Some(result)),
+            _ => break,
+        }
     }
     tasks.abort_all();
 }

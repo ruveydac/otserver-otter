@@ -30,6 +30,17 @@ NetBIOS, SMB, RPC, OPC UA, SNMP, and LLDP to collect identity and network eviden
 Results retain per-protocol observations and warnings, including partial results when individual
 probes fail.
 
+LLDP includes a concurrent 30-second passive capture on the selected adapter, plus SNMP-reported
+neighbors and optional LLDP-MED inventory. Windows capture requires separately installed Npcap.
+`--no-lldp` disables both paths. Advertised management addresses do not add scan targets.
+EtherNet/IP adds three bounded CIP identity/interface reads after a successful TCP ListIdentity.
+
+Exports keep device firmware, device software revisions, and server/application versions separate.
+OPC UA endpoint security and server BuildInfo remain application evidence under `raw`; they do not
+identify the firmware of devices represented by a gateway. Protocol evidence includes field sources,
+scoped component identities, and collection outcomes where available. These are reported inventory
+values, not proof of patch compliance.
+
 Discovery uses fixed, read-only requests. Otter does not change device configuration, run exploits,
 or perform active vulnerability checks. Only scan networks you own or are authorized to assess.
 Read-only discovery still generates network traffic; assess its suitability for your network.

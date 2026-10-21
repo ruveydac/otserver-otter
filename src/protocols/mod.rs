@@ -3,6 +3,10 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::Ipv4Addr;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 mod bacnet;
 mod dnp3;
@@ -115,25 +119,86 @@ pub async fn scan(
     selection: Selection,
     opcua: &opcua::ProbeSettings,
 ) -> ProbeResult {
+    scan_with_cancellation(target, mac, selection, opcua, &AtomicBool::new(false)).await
+}
+
+pub async fn scan_with_cancellation(
+    target: Ipv4Addr,
+    mac: Option<&str>,
+    selection: Selection,
+    opcua: &opcua::ProbeSettings,
+    cancelled: &AtomicBool,
+) -> ProbeResult {
     if selection.any() {
         crate::traffic::wait().await;
     }
-    let (s7, enip, bacnet, fins, fox, dnp3, iec61850, netbios, smb, rpc, ua) = tokio::join!(
-        probe_if(selection.s7, s7::probe(target)),
-        probe_if(selection.enip, enip::probe(target)),
-        probe_if(selection.bacnet, bacnet::probe(target)),
-        probe_if(selection.fins, fins::probe(target)),
-        probe_if(selection.fox, fox::probe(target)),
-        probe_if(selection.dnp3, dnp3::probe(target)),
-        probe_if(selection.iec61850, iec61850::probe(target, iec61850::PORT)),
-        probe_if(selection.netbios, netbios::probe(target)),
-        probe_if(selection.smb, smb::probe(target)),
-        probe_if(selection.rpc, rpc::probe(target)),
-        probe_if(selection.opcua, opcua::probe(target, opcua)),
+    let completed = Mutex::new(Vec::new());
+    let probes = async {
+        tokio::join!(
+            collect_probe(0, probe_if(selection.s7, s7::probe(target)), &completed),
+            collect_probe(1, probe_if(selection.enip, enip::probe(target)), &completed),
+            collect_probe(
+                2,
+                probe_if(selection.bacnet, bacnet::probe(target)),
+                &completed
+            ),
+            collect_probe(3, probe_if(selection.fins, fins::probe(target)), &completed),
+            collect_probe(4, probe_if(selection.fox, fox::probe(target)), &completed),
+            collect_probe(5, probe_if(selection.dnp3, dnp3::probe(target)), &completed),
+            collect_probe(
+                6,
+                probe_if(selection.iec61850, iec61850::probe(target, iec61850::PORT)),
+                &completed
+            ),
+            collect_probe(
+                7,
+                probe_if(selection.netbios, netbios::probe(target)),
+                &completed
+            ),
+            collect_probe(8, probe_if(selection.smb, smb::probe(target)), &completed),
+            collect_probe(9, probe_if(selection.rpc, rpc::probe(target)), &completed),
+            collect_probe(
+                10,
+                probe_if(selection.opcua, opcua::probe(target, opcua)),
+                &completed
+            ),
+        );
+    };
+    let cancellation = async {
+        while !cancelled.load(Ordering::Relaxed) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    tokio::select! {biased; () = cancellation => {}, () = probes => {}}
+    let mut completed = completed
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut take = |index| {
+        completed
+            .iter()
+            .position(|(key, _)| *key == index)
+            .map(|position| completed.swap_remove(position).1)
+            .unwrap_or(Ok(None))
+    };
+    let (s7, enip, bacnet, fins, fox, dnp3, iec61850, netbios, smb, rpc, ua) = (
+        take(0),
+        take(1),
+        take(2),
+        take(3),
+        take(4),
+        take(5),
+        take(6),
+        take(7),
+        take(8),
+        take(9),
+        take(10),
     );
     let mut observations = Vec::new();
     let mut ports = Vec::new();
     let mut warnings = Vec::new();
+    if cancelled.load(Ordering::Relaxed) {
+        warnings.push("Protocol collection cancelled; completed findings retained.".into());
+    }
     let mut outcomes = Vec::new();
     let mut outcome_protocols = Vec::new();
     let results = [
@@ -174,6 +239,7 @@ pub async fn scan(
                     .entry("status".into())
                     .or_insert_with(|| serde_json::json!("online"));
                 if let Value::Object(raw) = &mut finding.raw {
+                    raw.insert("acquisition".into(), serde_json::json!({"mechanism": "active-query", "messageRole": "response", "transportPeer": target}));
                     raw.insert(
                         "observationId".into(),
                         serde_json::json!(uuid::Uuid::new_v4().to_string()),
@@ -240,6 +306,20 @@ pub async fn scan(
         outcomes,
         outcome_protocols,
     }
+}
+
+type CompletedProbes = Mutex<Vec<(usize, Result<Option<Finding>, String>)>>;
+
+async fn collect_probe(
+    index: usize,
+    probe: impl Future<Output = Result<Option<Finding>, String>>,
+    completed: &CompletedProbes,
+) {
+    let result = probe.await;
+    completed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((index, result));
 }
 
 async fn probe_if(
@@ -340,6 +420,52 @@ mod tests {
         assert!(result.warnings.is_empty());
         assert!(result.outcomes.is_empty());
         assert!(result.outcome_protocols.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_retains_completed_protocols_while_dropping_silent_ones() {
+        let _network = crate::network_test_lock().await;
+        let fins = UdpSocket::bind((Ipv4Addr::LOCALHOST, 9600)).await.unwrap();
+        let _silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 47808)).await.unwrap();
+        let cancelled = AtomicBool::new(false);
+        let responder = async {
+            let mut request = [0; 13];
+            let (_, peer) = fins.recv_from(&mut request).await.unwrap();
+            let mut response = vec![0; 106];
+            response[0] = 0xc0;
+            response[4] = 0x63;
+            response[9..12].copy_from_slice(&[0xef, 5, 1]);
+            response[14..17].copy_from_slice(b"PLC");
+            fins.send_to(&response, peer).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            cancelled.store(true, Ordering::Relaxed);
+        };
+        let selection = Selection {
+            s7: false,
+            enip: false,
+            bacnet: true,
+            fins: true,
+            fox: false,
+            dnp3: false,
+            iec61850: false,
+            netbios: false,
+            smb: false,
+            rpc: false,
+            opcua: false,
+        };
+        let settings = opcua::ProbeSettings::default();
+        let (result, ()) = tokio::join!(
+            scan_with_cancellation(Ipv4Addr::LOCALHOST, None, selection, &settings, &cancelled),
+            responder
+        );
+        assert_eq!(result.observations.len(), 1);
+        assert_eq!(result.observations[0].fields["model"], "PLC");
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("cancelled"))
+        );
     }
 
     #[tokio::test]

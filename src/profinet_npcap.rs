@@ -137,6 +137,7 @@ const ARP_FILTER: [BpfInsn; 4] = [
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CaptureFilter {
+    Passive,
     Dcp,
     Arp,
     All,
@@ -389,6 +390,27 @@ pub fn capture_raw(
     )
 }
 
+pub fn capture_passive(
+    interface: &str,
+    wait: Duration,
+    cancelled: &AtomicBool,
+    mut on_frame: impl FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    let api = Api::load()?;
+    capture_with_api(
+        &api,
+        interface,
+        std::iter::empty::<&[u8]>(),
+        wait,
+        cancelled,
+        CaptureFilter::Passive,
+        |frame| {
+            on_frame(frame)?;
+            Ok(None)
+        },
+    )
+}
+
 pub fn capture_arp(
     interface: &str,
     requests: impl Iterator<Item = [u8; 42]>,
@@ -444,7 +466,9 @@ fn capture_with_api<F: AsRef<[u8]>>(
     mut on_frame: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>, String>,
 ) -> Result<(), String> {
     let mut requests = requests.fuse().peekable();
-    if cancelled.load(Ordering::Relaxed) || requests.peek().is_none() {
+    if cancelled.load(Ordering::Relaxed)
+        || (requests.peek().is_none() && filter != CaptureFilter::Passive)
+    {
         return Ok(());
     }
     let device = CString::new(find_device(api, interface)?)
@@ -510,7 +534,7 @@ fn capture_with_api<F: AsRef<[u8]>>(
         ));
     }
     // Best effort: reject unrelated traffic in the driver as well as at the callback.
-    if filter != CaptureFilter::All
+    if !matches!(filter, CaptureFilter::All | CaptureFilter::Passive)
         && let Some(set_bpf) = api.set_bpf
     {
         let mut dcp = DCP_FILTER;
@@ -624,6 +648,9 @@ fn capture_with_api<F: AsRef<[u8]>>(
                 return Ok(());
             }
             if let Some(response) = on_frame(frame)? {
+                if filter == CaptureFilter::Passive {
+                    return Err("Passive capture cannot transmit responses".into());
+                }
                 let response_length = u32::try_from(response.len())
                     .map_err(|_| "Npcap response frame is too large.".to_string())?;
                 // SAFETY: Packet.dll reads the caller-owned response synchronously.

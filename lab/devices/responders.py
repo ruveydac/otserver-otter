@@ -2,6 +2,7 @@
 """Small read-only responders for protocols without maintained test emulators."""
 
 import asyncio
+import os
 import ssl
 import sys
 
@@ -49,7 +50,13 @@ async def handle_fins(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         request = await read_fins_frame(reader)
         if request[8:12] != b"\0\0\0\x02":
             return
-        writer.write(fins_tcp_frame(2, fins_payload(5)))
+        if os.environ.get("OTTER_FINS_TCP_ERROR") == "1":
+            writer.write(b"NOT-FINS")
+            await writer.drain()
+            return
+        payload = bytearray(fins_payload(5))
+        payload[3:6], payload[6:9] = request[22:25], request[19:22]
+        writer.write(fins_tcp_frame(2, payload))
         await writer.drain()
     except (asyncio.IncompleteReadError, ConnectionError, ValueError):
         pass
@@ -64,7 +71,9 @@ class FinsUdp(asyncio.DatagramProtocol):
 
     def datagram_received(self, data: bytes, address: tuple[str, int]) -> None:
         if len(data) >= 12 and data[10:12] == b"\x05\x01":
-            self.transport.sendto(fins_payload(0xEF), address)
+            payload = bytearray(fins_payload(data[9]))
+            payload[3:6], payload[6:9] = data[6:9], data[3:6]
+            self.transport.sendto(payload, address)
 
 
 FOX_RESPONSE = b"""fox a 0 -1 fox hello
@@ -127,7 +136,7 @@ async def run_fox() -> None:
 
 DNP3_ADDRESS = 1
 DNP3_PORT = 20000
-DNP3_READ_ATTRIBUTES = bytes.fromhex("C0C001000006")
+DNP3_READ_ATTRIBUTES = bytes.fromhex("C0C00100FE06")
 
 
 def dnp3_crc(data: bytes) -> int:
@@ -160,29 +169,28 @@ def dnp3_frame(control: int, destination: int, source: int, data: bytes = b"") -
 
 def dnp3_attribute(variation: int, data_type: int, value: bytes) -> bytes:
     """One Group 0 device attribute: header, 8-bit count of one, data type, length, value."""
-    return bytes([0x00, variation, 0x07, 0x01, data_type, len(value)]) + value
+    return bytes([0x00, variation, 0x00, 0, 0, data_type, len(value)]) + value
 
 
-# Vendors disagree on the string data type code, so the lab reports most attributes as 254 and the
-# hardware version as 1 to prove the scanner decodes both conventions.
+# IEEE 1815 visible strings use datatype 1. Type 254 is an attribute list, not text.
 DNP3_ATTRIBUTES = b"".join(
     [
-        dnp3_attribute(196, 254, b"0A1B2C3D"),
-        dnp3_attribute(197, 254, b"2.0"),
-        dnp3_attribute(202, 254, b"otlab-dnp3-mrid-0001"),
-        dnp3_attribute(208, 254, b"OT Lab SCADA"),
+        dnp3_attribute(196, 1, b"0A1B2C3D"),
+        dnp3_attribute(197, 1, b"2.0"),
+        dnp3_attribute(202, 1, b"otlab-dnp3-mrid-0001"),
+        dnp3_attribute(208, 1, b"OT Lab SCADA"),
         dnp3_attribute(240, 2, (292).to_bytes(2, "little")),
         dnp3_attribute(241, 2, (292).to_bytes(2, "little")),
-        dnp3_attribute(242, 254, b"4.2.1"),
+        dnp3_attribute(242, 1, b"4.2.1"),
         dnp3_attribute(243, 1, b"rev C"),
-        dnp3_attribute(244, 254, b"OT Lab Operations"),
-        dnp3_attribute(245, 254, b"OT Lab / Cell 2"),
-        dnp3_attribute(246, 254, b"OTLAB-DNP3-1"),
-        dnp3_attribute(247, 254, b"dnp3-outstation-1"),
-        dnp3_attribute(248, 254, b"DNPLAB0001"),
+        dnp3_attribute(244, 1, b"OT Lab Operations"),
+        dnp3_attribute(245, 1, b"OT Lab / Cell 2"),
+        dnp3_attribute(246, 1, b"OTLAB-DNP3-1"),
+        dnp3_attribute(247, 1, b"dnp3-outstation-1"),
+        dnp3_attribute(248, 1, b"DNPLAB0001"),
         dnp3_attribute(249, 2, (3).to_bytes(1, "little")),
-        dnp3_attribute(250, 254, b"OT Lab RTU 3000"),
-        dnp3_attribute(252, 254, b"OT Lab Automation"),
+        dnp3_attribute(250, 1, b"OT Lab RTU 3000"),
+        dnp3_attribute(252, 1, b"OT Lab Automation"),
     ]
 )
 
@@ -295,7 +303,7 @@ def self_test() -> None:
     assert dnp3_frame(0xC0, 1, 1024) == bytes.fromhex("056405C001000004E921")
     assert dnp3_frame(0x00, 1024, 1) == bytes.fromhex("056405000004010019A6")
     assert dnp3_frame(0xD3, 1, 1, DNP3_READ_ATTRIBUTES) == bytes.fromhex(
-        "05640BD301000100426DC0C001000006E366"
+        "05640BD301000100426DC0C00100FE065DB9"
     )
     outstation = Dnp3Outstation()
     assert outstation.handle(0xD3, 2, 1, DNP3_READ_ATTRIBUTES) == []

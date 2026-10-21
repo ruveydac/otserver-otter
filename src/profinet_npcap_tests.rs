@@ -239,6 +239,35 @@ fn failed_kernel_buffer_setup_stops_before_sending() {
 }
 
 #[test]
+fn passive_capture_receives_without_transmitting_or_responding() {
+    for respond in [false, true] {
+        let mut adapter = MockAdapter::new(false);
+        OPEN_ADAPTER.set((&mut adapter as *mut MockAdapter).cast());
+        // SAFETY: the mock owns this live event until capture completes.
+        unsafe { SetEvent(adapter.event) };
+        let cancelled = AtomicBool::new(false);
+        let mut received = 0;
+        let result = capture_with_api(
+            &mock_api(),
+            INTERFACE,
+            std::iter::empty::<&[u8]>(),
+            Duration::from_millis(100),
+            &cancelled,
+            CaptureFilter::Passive,
+            |_| {
+                received += 1;
+                cancelled.store(true, Ordering::Relaxed);
+                Ok(respond.then(|| vec![0; 60]))
+            },
+        );
+        assert_eq!(received, 1);
+        assert_eq!(adapter.sends, 0);
+        assert_eq!(adapter.closes, 1);
+        assert_eq!(result.is_err(), respond);
+    }
+}
+
+#[test]
 fn arp_sweep_paces_sends_without_waiting_for_each_missing_reply() {
     let mut adapter = MockAdapter::new(false);
     adapter.response.clear();

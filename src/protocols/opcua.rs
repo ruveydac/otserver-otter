@@ -112,6 +112,17 @@ async fn probe_port(
 
     let mut raw = Map::new();
     let mut warnings = Vec::new();
+    raw.insert(
+        "endpoints".into(),
+        json!(
+            endpoints
+                .iter()
+                .take(64)
+                .map(endpoint_evidence)
+                .collect::<Vec<_>>()
+        ),
+    );
+    raw.insert("endpointCoverage".into(), json!({"returned": endpoints.len(), "retained": endpoints.len().min(64), "outcome": if endpoints.len() > 64 {"limit-reached"} else {"success"}}));
     let server = &endpoints[0].server;
     raw.insert(
         "applicationUri".into(),
@@ -212,6 +223,12 @@ async fn probe_port(
         )));
     };
     let mut fields = base_fields();
+    match collect_build_info(&session).await {
+        Ok(info) => {
+            raw.insert("serverBuildInfo".into(), info);
+        }
+        Err(error) => warnings.push(format!("OPC UA server BuildInfo: {error}")),
+    }
     match collect_assets(&session, &mut warnings).await {
         Ok((asset_fields, assets)) => {
             fields.extend(asset_fields);
@@ -224,6 +241,63 @@ async fn probe_port(
     drop(session);
     let _ = timeout(Duration::from_secs(1), event_loops.join_next()).await;
     Ok(Some(finding(&url, port_number, fields, raw, warnings)))
+}
+
+fn endpoint_evidence(endpoint: &EndpointDescription) -> Value {
+    let certificate = endpoint.server_certificate.as_ref();
+    json!({
+        "endpointUrl": endpoint.endpoint_url.as_ref(),
+        "applicationUri": endpoint.server.application_uri.as_ref(),
+        "productUri": endpoint.server.product_uri.as_ref(),
+        "applicationName": endpoint.server.application_name.text.as_ref(),
+        "applicationType": format!("{:?}", endpoint.server.application_type),
+        "securityMode": format!("{:?}", endpoint.security_mode),
+        "securityPolicyUri": endpoint.security_policy_uri.as_ref(),
+        "transportProfileUri": endpoint.transport_profile_uri.as_ref(),
+        "securityLevel": endpoint.security_level,
+        "userTokenTypes": endpoint.user_identity_tokens.as_deref().unwrap_or_default().iter().take(32).map(|policy| format!("{:?}", policy.token_type)).collect::<Vec<_>>(),
+        "certificate": {"bytes": certificate.len(), "outcome": if certificate.len() > 16_384 {"limit-reached"} else {"success"}, "hex": (certificate.len() <= 16_384).then(|| super::hex(certificate))}
+    })
+}
+
+async fn collect_build_info(session: &Session) -> Result<Value, String> {
+    let names = [
+        "ProductName",
+        "ProductUri",
+        "ManufacturerName",
+        "SoftwareVersion",
+        "BuildNumber",
+        "BuildDate",
+    ];
+    let reads: Vec<ReadValueId> = (2261..=2266)
+        .map(|id| ReadValueId {
+            node_id: NodeId::new(0, id as u32),
+            attribute_id: AttributeId::Value as u32,
+            index_range: NumericRange::None,
+            data_encoding: QualifiedName::null(),
+        })
+        .collect();
+    crate::traffic::wait().await;
+    let values = timeout(
+        SERVICE_TIMEOUT,
+        session.read(&reads, TimestampsToReturn::Source, 0.0),
+    )
+    .await
+    .map_err(|_| "read timed out".to_string())?
+    .map_err(|error| error.to_string())?;
+    if values.len() != reads.len() {
+        return Err("read result count mismatch".into());
+    }
+    let mut fields = Map::new();
+    let mut outcomes = Vec::new();
+    for ((name, read), value) in names.into_iter().zip(reads).zip(values) {
+        let good = value.status.is_none_or(|status| status.is_good());
+        outcomes.push(json!({"field": name, "nodeId": read.node_id.to_string(), "status": value.status.map(|status| status.to_string()), "outcome": if !good {"bad-status"} else if value.value.is_none() {"absent"} else {"success"}}));
+        if good && let Some(value) = value.value {
+            fields.insert(name.into(), variant_to_value(&value));
+        }
+    }
+    Ok(json!({"subject": "server-application", "fields": fields, "readOutcomes": outcomes}))
 }
 
 async fn connect_session(
@@ -430,6 +504,7 @@ struct AssetEntry {
     operation_counters: Map<String, Value>,
     health: Option<u32>,
     health_timestamp: Option<String>,
+    read_outcomes: Vec<Value>,
 }
 
 fn find_reference<'a>(references: &'a [Reference], name: &str) -> Option<&'a Reference> {
@@ -522,6 +597,7 @@ async fn collect_asset(
         operation_counters: Map::new(),
         health: None,
         health_timestamp: None,
+        read_outcomes: Vec::new(),
     };
     if targets.is_empty() {
         return Ok(entry);
@@ -546,7 +622,8 @@ async fn collect_asset(
         return Err("OPC UA read result count mismatch".into());
     }
     for (target, value) in targets.iter().zip(values) {
-        if value.status.is_some_and(|status| status.is_bad()) {
+        entry.read_outcomes.push(json!({"field": target.key, "section": target.section, "nodeId": target.node.to_string(), "status": value.status.map(|status| status.to_string()), "outcome": if value.status.is_some_and(|status| !status.is_good()) {"bad-status"} else if value.value.is_none() {"absent"} else {"success"}}));
+        if value.status.is_some_and(|status| !status.is_good()) {
             continue;
         }
         let Some(variant) = &value.value else {
@@ -726,7 +803,7 @@ fn asset_fields(entries: &[AssetEntry]) -> BTreeMap<String, Value> {
             ("Manufacturer", "vendor"),
             ("Model", "model"),
             ("SerialNumber", "serialNumber"),
-            ("SoftwareRevision", "firmwareVersion"),
+            ("SoftwareRevision", "softwareRevision"),
             ("HardwareRevision", "hardwareVersion"),
             ("DeviceClass", "description"),
         ] {
@@ -765,6 +842,24 @@ fn asset_fields(entries: &[AssetEntry]) -> BTreeMap<String, Value> {
 }
 
 fn asset_raw(entry: &AssetEntry) -> Value {
+    let mut field_sources = Map::new();
+    for (property, field) in [
+        ("Manufacturer", "vendor"),
+        ("Model", "model"),
+        ("SerialNumber", "serialNumber"),
+        ("SoftwareRevision", "softwareRevision"),
+        ("HardwareRevision", "hardwareVersion"),
+        ("AssetId", "name"),
+        ("DeviceClass", "description"),
+    ] {
+        if let Some(read) = entry
+            .read_outcomes
+            .iter()
+            .find(|read| read["field"] == property && read["outcome"] == "success")
+        {
+            field_sources.insert(field.into(), json!({"assetRef":format!("opcua:{}",entry.node_id), "nodeId":read["nodeId"], "property":property, "mutable":property == "AssetId"}));
+        }
+    }
     let health = entry.health.map(|code| {
         json!({
             "code": code,
@@ -794,6 +889,8 @@ fn asset_raw(entry: &AssetEntry) -> Value {
         "deviceHealth": health,
         "documentationLinks": entry.documentation_links,
         "operationCounters": entry.operation_counters,
+        "readOutcomes": entry.read_outcomes,
+        "fieldSources": field_sources,
     })
 }
 
@@ -816,7 +913,9 @@ fn finding(
     {
         let reference = asset["ref"].clone();
         let serial_claim = asset["serialClaim"].clone();
+        let field_sources = asset["fieldSources"].clone();
         raw.insert("normalizedAssetRef".into(), reference);
+        raw.insert("fieldSources".into(), field_sources);
         if !serial_claim.is_null() {
             raw.insert("serialClaim".into(), serial_claim);
         }
@@ -906,6 +1005,7 @@ mod tests {
             operation_counters: Map::new(),
             health: Some(4),
             health_timestamp: None,
+            read_outcomes: vec![],
         };
         let mut identification = Map::new();
         identification.insert("Model".into(), json!("Lab Model 42"));
@@ -920,6 +1020,7 @@ mod tests {
             operation_counters: Map::new(),
             health: None,
             health_timestamp: None,
+            read_outcomes: vec![],
         };
         let secondary = asset_raw(&second);
         let fields = asset_fields(&[first, second]);
@@ -945,6 +1046,7 @@ mod tests {
             operation_counters: Map::from_iter([("OperatingHours".into(), json!(12.5))]),
             health: Some(1),
             health_timestamp: Some("2026-08-16T00:00:00Z".into()),
+            read_outcomes: vec![],
         });
         assert_eq!(raw["deviceHealth"]["label"], "FAILURE");
         assert_eq!(raw["operationCounters"]["OperatingHours"], 12.5);
@@ -960,6 +1062,22 @@ mod tests {
         ));
         assert_eq!(token_labels(&[endpoint]), vec!["anonymous"]);
         assert_eq!(token_labels(&[]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn endpoint_evidence_preserves_security_without_following_advertised_urls() {
+        let mut endpoint = EndpointDescription::from((
+            "opc.tcp://outside-scan:4840",
+            "Basic256Sha256",
+            MessageSecurityMode::SignAndEncrypt,
+            opcua::types::UserTokenPolicy::anonymous(),
+        ));
+        endpoint.server_certificate = opcua::types::ByteString::from(vec![42; 16_385]);
+        let raw = endpoint_evidence(&endpoint);
+        assert_eq!(raw["endpointUrl"], "opc.tcp://outside-scan:4840");
+        assert_eq!(raw["securityMode"], "SignAndEncrypt");
+        assert_eq!(raw["certificate"]["outcome"], "limit-reached");
+        assert!(raw["certificate"]["hex"].is_null());
     }
 
     #[tokio::test]
@@ -1330,7 +1448,8 @@ mod tests {
         assert_eq!(finding.fields["vendor"], "Lab Manufacturer");
         assert_eq!(finding.fields["model"], "Lab Model 42");
         assert_eq!(finding.fields["serialNumber"], "SN12345");
-        assert_eq!(finding.fields["firmwareVersion"], "2.1.0");
+        assert_eq!(finding.fields["softwareRevision"], "2.1.0");
+        assert!(!finding.fields.contains_key("firmwareVersion"));
         assert_eq!(finding.fields["hardwareVersion"], "A1");
         assert_eq!(finding.raw["normalizedAssetRef"], "opcua:ns=2;i=300");
         assert_eq!(finding.raw["serialClaim"]["scope"], "asset");
