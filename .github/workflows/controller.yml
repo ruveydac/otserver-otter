@@ -23,7 +23,8 @@ permissions:
 jobs:
   controller:
     name: Full remote management
-    runs-on: ubuntu-latest
+    # MongoDB 8 cannot start on Linux 6.19+ (SERVER-121912).
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       MANAGEMENT_REF: ${{ inputs.management_ref || vars.OTTER_MANAGEMENT_REF || 'main' }}

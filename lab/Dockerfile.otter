@@ -4,13 +4,16 @@ COPY Cargo.toml Cargo.lock ./
 COPY build.rs ./
 COPY src ./src
 COPY contracts ./contracts
-RUN cargo build --locked --release --no-default-features
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    cargo build --locked --release --no-default-features \
+    && cp target/release/otserver-otter /otserver-otter
 
 FROM python:3.12-slim-bookworm
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libssl3 openssl \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build /src/target/release/otserver-otter /usr/local/bin/
+COPY --from=build /otserver-otter /usr/local/bin/
 COPY lab/verify.py /lab/
 COPY lab/controller_verify.py /lab/
 ENTRYPOINT ["python3", "/lab/verify.py"]

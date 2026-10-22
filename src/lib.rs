@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod contract;
 pub mod discovery;
+pub mod lldp;
 pub mod profinet;
 pub(crate) mod profinet_database;
 pub mod protocols;

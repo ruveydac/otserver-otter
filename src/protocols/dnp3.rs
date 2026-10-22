@@ -49,14 +49,21 @@ const IIN_OBJECTS_UNKNOWN: u8 = 0x02;
 /// drops frames addressed elsewhere, so the matching pair answers and the rest cost only bytes.
 const ADDRESSES: [(u16, u16); 4] = [(1, 1), (1, 1024), (1024, 1), (0, 0)];
 
-/// Read Group 0 Variation 0 (device attributes) with the "all objects" qualifier: transport
+/// Read Group 0 Variation 254 (all attributes) with the "all objects" qualifier: transport
 /// control, application control, function code, group, variation, qualifier.
-const READ_ATTRIBUTES: [u8; 6] = [TL_FIN | TL_FIR, AL_FIR | AL_FIN, READ, 0x00, 0x00, 0x06];
+const READ_ATTRIBUTES: [u8; 6] = [TL_FIN | TL_FIR, AL_FIR | AL_FIN, READ, 0x00, 0xfe, 0x06];
 
 /// Group 0 variations kept as named evidence, per IEEE 1815 device attributes.
-const ATTRIBUTES: [(u8, &str); 9] = [
+const ATTRIBUTES: [(u8, &str); 16] = [
+    (196, "configurationId"),
+    (197, "configurationVersion"),
+    (198, "configurationBuildDate"),
+    (199, "configurationLastChangeDate"),
+    (200, "configurationDigest"),
+    (201, "configurationDigestAlgorithm"),
     (242, "softwareVersion"),
     (243, "hardwareVersion"),
+    (244, "owner"),
     (245, "location"),
     (246, "idCode"),
     (247, "deviceName"),
@@ -152,12 +159,29 @@ async fn exchange(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> Result<
     let mut reply = Reply::default();
     let mut segment = None;
     let mut fragment = None;
+    let mut transport_sequence = None;
+    let mut application_sequence = None;
+    let deadline = tokio::time::Instant::now() + TIMEOUT * 2;
     for _ in 0..MAX_FRAMES {
-        let Some(frame) = read(stream).await? else {
+        let Some(frame) = (match tokio::time::timeout_at(deadline, read(stream)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                reply.warnings.push("DNP3 exchange timed out".into());
+                break;
+            }
+        }) else {
             break;
         };
         if frame.control & (DIR | PRM) != 0 {
             return Err("reply is not a secondary DNP3 frame".into());
+        }
+        if !ADDRESSES.contains(&(frame.source, frame.destination)) {
+            return Err("unrequested DNP3 address pair".into());
+        }
+        if (segment.is_some() || fragment.is_some())
+            && (reply.outstation != Some(frame.source) || reply.master != Some(frame.destination))
+        {
+            return Err("mixed DNP3 address pairs".into());
         }
         if reply.outstation.is_none() {
             reply.outstation = Some(frame.source);
@@ -165,7 +189,32 @@ async fn exchange(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> Result<
         }
         match frame.control & FUNCTION {
             USER_DATA => {
+                reply.outstation = Some(frame.source);
+                reply.master = Some(frame.destination);
                 reply.link = true;
+                let control = *frame.data.first().ok_or("empty DNP3 transport")?;
+                check_sequence(
+                    &mut transport_sequence,
+                    control & 0x3f,
+                    control & TL_FIR != 0,
+                    0x3f,
+                )?;
+                if control & TL_FIR != 0 {
+                    let app = *frame.data.get(1).ok_or("empty DNP3 application")?;
+                    // Unsolicited data is not a reply to our request.
+                    if frame.data.get(2) == Some(&UNSOLICITED) {
+                        continue;
+                    }
+                    check_sequence(
+                        &mut application_sequence,
+                        app & 0x0f,
+                        app & AL_FIR != 0,
+                        0x0f,
+                    )?;
+                    if app & AL_FIR != 0 && app & 0x0f != 0 {
+                        return Err("mismatched DNP3 application sequence".into());
+                    }
+                }
                 let Some(pdu) = reassemble(&mut segment, &mut fragment, &frame.data)? else {
                     continue;
                 };
@@ -201,6 +250,19 @@ async fn exchange(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> Result<
     Ok(reply)
 }
 
+fn check_sequence(
+    previous: &mut Option<u8>,
+    sequence: u8,
+    first: bool,
+    mask: u8,
+) -> Result<(), String> {
+    if !first && previous.is_none_or(|value| sequence != value.wrapping_add(1) & mask) {
+        return Err("out-of-order DNP3 fragment".into());
+    }
+    *previous = Some(sequence);
+    Ok(())
+}
+
 /// Folds one user data frame through transport and application reassembly and returns the
 /// application PDU once its final fragment arrives.
 fn reassemble(
@@ -219,7 +281,22 @@ fn reassemble(
     let Some((&control, payload)) = assembled.split_first() else {
         return Err("empty DNP3 application fragment".into());
     };
-    fold(fragment, control & AL_FIR != 0, payload)?;
+    if control & AL_FIR != 0 {
+        fold(fragment, true, payload)?;
+    } else {
+        let previous = fragment
+            .as_mut()
+            .ok_or("DNP3 continuation without a first frame")?;
+        if payload.len() < 3 || previous.len() < 3 || previous[0] != payload[0] {
+            return Err("mismatched DNP3 application fragment".into());
+        }
+        previous[1] |= payload[1];
+        previous[2] |= payload[2];
+        if previous.len() + payload.len() - 3 > 65_535 {
+            return Err("oversized DNP3 response".into());
+        }
+        previous.extend_from_slice(&payload[3..]);
+    }
     if control & AL_FIN == 0 {
         return Ok(None);
     }
@@ -228,6 +305,12 @@ fn reassemble(
 
 /// Starts a new buffer on a first-frame flag and appends to it otherwise.
 fn fold(buffer: &mut Option<Vec<u8>>, first: bool, payload: &[u8]) -> Result<(), String> {
+    if buffer
+        .as_ref()
+        .is_some_and(|buffer| buffer.len() + payload.len() > 65_535 || first)
+    {
+        return Err("oversized or restarted DNP3 fragment".into());
+    }
     match buffer {
         _ if first => *buffer = Some(payload.to_vec()),
         Some(buffer) => buffer.extend_from_slice(payload),
@@ -361,8 +444,10 @@ fn parse(pdu: &[u8]) -> Result<(Map<String, Value>, Vec<String>), String> {
         warnings.push("DNP3 outstation does not implement Group 0 device attributes.".into());
     }
     let mut attributes = BTreeMap::<u8, Value>::new();
+    let mut records = Vec::new();
+    let mut sources = Map::new();
     let mut cursor = 0;
-    while cursor + 3 <= objects.len() {
+    'objects: while cursor + 3 <= objects.len() {
         let group = objects[cursor];
         let variation = objects[cursor + 1];
         let qualifier = objects[cursor + 2];
@@ -373,13 +458,28 @@ fn parse(pdu: &[u8]) -> Result<(Map<String, Value>, Vec<String>), String> {
             ));
             break;
         };
+        let start = match qualifier & RANGE {
+            0 => usize::from(objects[cursor]),
+            1 => usize::from(u16::from_le_bytes([objects[cursor], objects[cursor + 1]])),
+            _ => 0,
+        };
         cursor += size;
-        for _ in 0..count {
+        for index in 0..count {
             let Some(end) = attribute_end(objects, cursor) else {
                 warnings.push(format!("Truncated DNP3 device attribute 0:{variation}."));
-                break;
+                break 'objects;
             };
-            attributes.insert(variation, attribute(&objects[cursor + 2..end]));
+            let data_type = objects[cursor];
+            let bytes = &objects[cursor + 2..end];
+            let value = typed_attribute(data_type, bytes);
+            let set = matches!(qualifier & RANGE, 0 | 1).then_some(start + index);
+            records.push(json!({"set": set, "variation": variation, "dataType": data_type, "raw": hex(bytes), "value": value}));
+            if set == Some(0)
+                && let Some(value) = value
+            {
+                // Only the standard set contributes to manufacturer identity.
+                attributes.entry(variation).or_insert(value);
+            }
             cursor = end;
         }
     }
@@ -387,13 +487,54 @@ fn parse(pdu: &[u8]) -> Result<(Map<String, Value>, Vec<String>), String> {
         ("iin1".into(), json!(format!("{iin1:02X}"))),
         ("iin2".into(), json!(format!("{iin2:02X}"))),
         ("attributes".into(), json!(attributes)),
+        ("attributeRecords".into(), json!(records)),
+        (
+            "indications".into(),
+            json!({"restart": iin1 & 0x80 != 0, "deviceTrouble": iin1 & 0x40 != 0, "configurationCorrupt": iin2 & 0x20 != 0, "class1Pending": iin1 & 2 != 0, "class2Pending": iin1 & 4 != 0, "class3Pending": iin1 & 8 != 0}),
+        ),
     ]);
     for (variation, name) in ATTRIBUTES {
         if let Some(value) = attributes.get(&variation) {
             values.insert(name.into(), value.clone());
+            sources.insert(name.into(), json!({"group": 0, "variation": variation, "set": 0, "mutable": matches!(variation, 244..=247)}));
         }
     }
+    values.insert("fieldSources".into(), sources.into());
     Ok((values, warnings))
+}
+
+fn typed_attribute(data_type: u8, value: &[u8]) -> Option<Value> {
+    match (data_type, value.len()) {
+        (1, _) => std::str::from_utf8(value)
+            .ok()
+            .filter(|text| {
+                text.bytes()
+                    .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+            })
+            .map(|text| json!(text.trim())),
+        (2, 1 | 2 | 4) => Some(json!(
+            value
+                .iter()
+                .rev()
+                .fold(0_u32, |number, byte| number << 8 | u32::from(*byte))
+        )),
+        (3, 1) => Some(json!(value[0] as i8)),
+        (3, 2) => Some(json!(i16::from_le_bytes(value.try_into().ok()?))),
+        (3, 4) => Some(json!(i32::from_le_bytes(value.try_into().ok()?))),
+        (4, 4) => {
+            let number = f32::from_le_bytes(value.try_into().ok()?);
+            number.is_finite().then(|| json!(number))
+        }
+        (4, 8) => {
+            let number = f64::from_le_bytes(value.try_into().ok()?);
+            number.is_finite().then(|| json!(number))
+        }
+        (5 | 6, _) => Some(json!({"hex": hex(value)})),
+        (7, 6) => Some(
+            json!({"millisecondsSinceEpoch": value.iter().rev().fold(0_u64, |number, byte| number << 8 | u64::from(*byte))}),
+        ),
+        _ => None,
+    }
 }
 
 /// Object count and range-field size for a qualifier. Only unprefixed Group 0 headers are decoded
@@ -427,31 +568,16 @@ fn range(group: u8, qualifier: u8, rest: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
-/// End offset of the device attribute starting at `cursor`, or `None` when it is truncated. The
-/// data type octet is skipped because vendors disagree on its value for the same attribute.
+/// End offset including the extended attribute-list length, or `None` for truncation.
 fn attribute_end(objects: &[u8], cursor: usize) -> Option<usize> {
-    let length = usize::from(*objects.get(cursor + 1)?);
+    let length = usize::from(*objects.get(cursor + 1)?)
+        + if objects.get(cursor) == Some(&255) {
+            256
+        } else {
+            0
+        };
     let end = cursor.checked_add(2 + length)?;
     (end <= objects.len()).then_some(end)
-}
-
-/// Printable values are text; anything else is a little-endian number or hex evidence.
-fn attribute(value: &[u8]) -> Value {
-    if !value.is_empty()
-        && value
-            .iter()
-            .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
-    {
-        return json!(String::from_utf8_lossy(value).trim());
-    }
-    match value.len() {
-        0 => Value::Null,
-        1 => json!(value[0]),
-        2 => json!(u16::from_le_bytes(value[..2].try_into().unwrap())),
-        4 => json!(u32::from_le_bytes(value[..4].try_into().unwrap())),
-        8 => json!(u64::from_le_bytes(value[..8].try_into().unwrap())),
-        _ => json!(hex(value)),
-    }
 }
 
 #[cfg(test)]
@@ -469,25 +595,25 @@ mod tests {
             .collect()
     }
 
-    /// One Group 0 device attribute object: header, 8-bit count of one, data type, length, value.
+    /// One Group 0 device attribute from standard set zero.
     fn attribute_object(variation: u8, data_type: u8, value: &[u8]) -> Vec<u8> {
-        let mut object = vec![0x00, variation, 0x07, 0x01, data_type, value.len() as u8];
+        let mut object = vec![0x00, variation, 0, 0, 0, data_type, value.len() as u8];
         object.extend_from_slice(value);
         object
     }
 
-    /// Identity using both string data type conventions (0xFE and 0x01) plus a numeric attribute.
+    /// Standard visible strings plus a numeric attribute.
     fn identity_pdu() -> Vec<u8> {
         let mut pdu = vec![RESPONSE, 0x00, 0x00];
         for object in [
-            attribute_object(247, 0xFE, b"PUMP-RTU-1"),
+            attribute_object(247, 1, b"PUMP-RTU-1"),
             attribute_object(250, 0x01, b"FB3000"),
-            attribute_object(252, 0xFE, b"Emerson"),
-            attribute_object(248, 0xFE, b"SN-000123"),
-            attribute_object(242, 0xFE, b"5.2.1"),
-            attribute_object(243, 0xFE, b"HW-2"),
-            attribute_object(245, 0xFE, b"Cell 1  "),
-            attribute_object(246, 0xFE, b"ID-42"),
+            attribute_object(252, 1, b"Emerson"),
+            attribute_object(248, 1, b"SN-000123"),
+            attribute_object(242, 1, b"5.2.1"),
+            attribute_object(243, 1, b"HW-2"),
+            attribute_object(245, 1, b"Cell 1  "),
+            attribute_object(246, 1, b"ID-42"),
             attribute_object(249, 0x02, &[3]),
         ] {
             pdu.extend(object);
@@ -507,7 +633,7 @@ mod tests {
         let split = pdu.len() / 2;
         let mut first = vec![TL_FIR, AL_FIR | AL_FIN];
         first.extend_from_slice(&pdu[..split]);
-        let mut last = vec![TL_FIN];
+        let mut last = vec![TL_FIN | 1];
         last.extend_from_slice(&pdu[split..]);
         [first, last]
             .iter()
@@ -520,7 +646,8 @@ mod tests {
         let split = pdu.len() / 2;
         let mut first = vec![TL_FIN | TL_FIR, AL_FIR];
         first.extend_from_slice(&pdu[..split]);
-        let mut last = vec![TL_FIN | TL_FIR, AL_FIN];
+        let mut last = vec![TL_FIN | TL_FIR | 1, AL_FIN | 1];
+        last.extend_from_slice(&pdu[..3]);
         last.extend_from_slice(&pdu[split..]);
         [first, last]
             .iter()
@@ -628,17 +755,17 @@ mod tests {
         assert_eq!(hex(&request[..10]), "056405C001000100DF53");
         assert_eq!(
             hex(&request[10..28]),
-            "05640BD301000100426DC0C001000006E366"
+            "05640BD301000100426DC0C00100FE065DB9"
         );
         assert_eq!(request[13] & 0x20, 0, "first frame count bit after a reset");
         assert_eq!(
             &request[20..26],
-            &[TL_FIN | TL_FIR, AL_FIR | AL_FIN, READ, 0x00, 0x00, 0x06]
+            &[TL_FIN | TL_FIR, AL_FIR | AL_FIN, READ, 0x00, 0xfe, 0x06]
         );
     }
 
     #[test]
-    fn decodes_device_attributes_from_both_vendor_conventions() {
+    fn decodes_typed_device_attributes() {
         let (values, warnings) = parse(&identity_pdu()).unwrap();
         assert!(warnings.is_empty());
         assert_eq!(values["deviceName"], "PUMP-RTU-1");
@@ -656,22 +783,69 @@ mod tests {
     }
 
     #[test]
-    fn decodes_attribute_values_by_content() {
-        assert_eq!(attribute(b"Pump 7"), json!("Pump 7"));
-        assert_eq!(attribute(b""), Value::Null);
-        assert_eq!(attribute(&[3]), json!(3));
-        assert_eq!(attribute(&[1, 0]), json!(1));
-        assert_eq!(attribute(&[1, 0, 0, 0]), json!(1));
-        assert_eq!(attribute(&[1, 0, 0, 0, 0, 0, 0, 0]), json!(1));
-        assert_eq!(attribute(&[0xDE, 0xAD, 0xBE]), json!("DEADBE"));
+    fn decodes_attribute_values_by_type_not_printability() {
+        assert_eq!(typed_attribute(1, b"Pump 7"), Some(json!("Pump 7")));
+        assert_eq!(
+            typed_attribute(5, b"Pump 7"),
+            Some(json!({"hex":"50756D702037"}))
+        );
+        assert_eq!(typed_attribute(2, b"AB"), Some(json!(16961)));
+        assert_eq!(typed_attribute(3, &[0xff]), Some(json!(-1)));
+        assert_eq!(typed_attribute(254, b"Pump 7"), None);
+    }
+
+    #[test]
+    fn private_sets_and_unknown_types_never_override_manufacturer_identity() {
+        let mut pdu = identity_pdu();
+        let mut private = attribute_object(248, 1, b"PRIVATE");
+        private[3..5].copy_from_slice(&[9, 9]);
+        pdu.extend(private);
+        pdu.extend(attribute_object(196, 1, b"CONFIG-1"));
+        pdu.extend(attribute_object(250, 254, b"NOT-A-MODEL"));
+        let (values, _) = parse(&pdu).unwrap();
+        assert_eq!(values["serialNumber"], "SN-000123");
+        assert_eq!(values["productName"], "FB3000");
+        assert_eq!(values["configurationId"], "CONFIG-1");
+        assert!(
+            values["attributeRecords"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|record| record["set"] == 9)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_address_and_reordered_transport_sequences() {
+        assert!(
+            exchanges(&[frame(USER_DATA, 44, 55, &[0xc0, 0xc0, 0x81, 0, 0])])
+                .await
+                .unwrap_err()
+                .contains("address")
+        );
+        let pdu = identity_pdu();
+        let split = pdu.len() / 2;
+        let mut first = vec![0x40, 0xc0];
+        first.extend(&pdu[..split]);
+        let mut last = vec![0x83];
+        last.extend(&pdu[split..]);
+        assert!(
+            exchanges(&[
+                frame(USER_DATA, MASTER, OUTSTATION, &first),
+                frame(USER_DATA, MASTER, OUTSTATION, &last)
+            ])
+            .await
+            .unwrap_err()
+            .contains("out-of-order")
+        );
     }
 
     #[test]
     fn decodes_supported_qualifiers_and_skips_untrusted_objects() {
-        let value = [0xFE, 0x03, b'S', b'N', b'1'];
+        let value = [1, 0x03, b'S', b'N', b'1'];
         for (qualifier, bounds) in [
-            (0x00, &[5, 5][..]),
-            (0x01, &[5, 0, 5, 0][..]),
+            (0x00, &[0, 0][..]),
+            (0x01, &[0, 0, 0, 0][..]),
             (0x06, &[][..]),
             (0x07, &[1][..]),
             (0x08, &[1, 0][..]),
@@ -681,7 +855,12 @@ mod tests {
             pdu.extend_from_slice(&value);
             let (values, warnings) = parse(&pdu).unwrap();
             assert!(warnings.is_empty(), "{qualifier:#04X}: {warnings:?}");
-            assert_eq!(values["serialNumber"], "SN1", "{qualifier:#04X}");
+            if matches!(qualifier, 0 | 1) {
+                assert_eq!(values["serialNumber"], "SN1", "{qualifier:#04X}");
+            } else {
+                assert!(!values.contains_key("serialNumber"));
+                assert!(values["attributeRecords"][0]["set"].is_null());
+            }
         }
         for (header, bounds) in [
             ([0x00, 0xF8, 0x17], &[1][..]), // prefixed objects have no trusted size
@@ -697,7 +876,7 @@ mod tests {
             assert!(!values.contains_key("serialNumber"));
         }
         let mut pdu = vec![RESPONSE, 0, 0];
-        pdu.extend_from_slice(&attribute_object(248, 0xFE, b"SN1"));
+        pdu.extend_from_slice(&attribute_object(248, 1, b"SN1"));
         pdu.truncate(pdu.len() - 1);
         let (values, warnings) = parse(&pdu).unwrap();
         assert!(warnings[0].contains("Truncated"));
@@ -778,13 +957,13 @@ mod tests {
             exchanges(&[frame(USER_DATA, MASTER, OUTSTATION, &[])])
                 .await
                 .unwrap_err()
-                .contains("empty DNP3 user data")
+                .contains("empty DNP3 transport")
         );
         assert!(
             exchanges(&[frame(USER_DATA, MASTER, OUTSTATION, &[TL_FIN | TL_FIR])])
                 .await
                 .unwrap_err()
-                .contains("empty DNP3 application fragment")
+                .contains("empty DNP3 application")
         );
         assert!(
             exchanges(&[frame(
@@ -795,7 +974,7 @@ mod tests {
             )])
             .await
             .unwrap_err()
-            .contains("continuation without a first frame")
+            .contains("out-of-order")
         );
         assert!(
             exchanges(&[reply_frame(&[0x83, 0, 0])])

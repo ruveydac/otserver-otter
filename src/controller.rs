@@ -540,10 +540,15 @@ fn mapped_config(
         "noNetbios",
         "noSmb",
         "noRpc",
+        "noHttp",
+        "noAds",
         "noOpcua",
         "noSnmp",
         "noLldp",
         "opcuaPorts",
+        "adsSourceNetId",
+        "adsTargetNetIds",
+        "adsPorts",
     ];
     if configuration
         .keys()
@@ -575,7 +580,7 @@ fn mapped_config(
         ));
     }
     let mut config: ScannerConfig =
-        serde_json::from_value(assignment.configuration.clone()).map_err(|_| Error::Local("Managed scan configuration has invalid option types. Targets must be text lists, protocol toggles booleans, and OPC UA ports integers."))?;
+        serde_json::from_value(assignment.configuration.clone()).map_err(|_| Error::Local("Managed scan configuration has invalid option types. Targets and AMS NetIDs must be text, protocol toggles booleans, and ports integers."))?;
     if config.interface.as_ref().is_some_and(|value| {
         value.trim().is_empty() || value.len() > 256 || value.chars().any(char::is_control)
     }) || config.name.as_ref().is_some_and(|value| {
@@ -610,6 +615,22 @@ fn mapped_config(
             "Managed OPC UA ports or source MAC are invalid. Ports must be 1–65535 (at most 64); source MAC must contain six colon-separated hexadecimal bytes.",
         ));
     }
+    if config
+        .ads_target_net_ids
+        .as_ref()
+        .is_some_and(|net_ids| net_ids.len() > 1024)
+    {
+        return Err(Error::Local(
+            "Managed ADS target NetID map exceeds the 1,024-entry limit.",
+        ));
+    }
+    let empty_net_ids = std::collections::BTreeMap::new();
+    otserver_otter::protocols::AdsSettings::from_config(
+        config.ads_source_net_id.as_deref(),
+        config.ads_target_net_ids.as_ref().unwrap_or(&empty_net_ids),
+        config.ads_ports.as_deref().unwrap_or_default(),
+    )
+    .map_err(|_| Error::Local("Managed ADS AMS NetID or port settings are invalid."))?;
     let credentials = assignment.credentials.as_object().ok_or(Error::Local(
         "Managed protocol credentials must be an object.",
     ))?;

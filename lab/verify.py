@@ -4,6 +4,8 @@
 import json
 import os
 import subprocess
+import socket
+import threading
 import uuid
 from pathlib import Path
 
@@ -22,8 +24,10 @@ DEVICES = {
     "iec61850": "02:00:00:00:00:17",
     "netbios": "02:00:00:00:00:18",
     "smb1": "02:00:00:00:00:19",
+    "beckhoff_ads": "02:00:00:00:00:21",
+    "lldp": "02:00:00:00:00:FE",
 }
-TARGETS = [f"172.30.0.{number}" for number in range(10, 20)]
+TARGETS = [f"172.30.0.{number}" for number in range(10, 20)] + ["172.30.0.21"]
 
 
 def run(*arguments: str) -> None:
@@ -73,6 +77,25 @@ def assert_full(result: dict) -> None:
     assert result["scan"].get("partial", False) is False
     assert result["errors"] == []
     assert {device["macAddress"] for device in result["devices"]} == set(DEVICES.values())
+    ads_device = by_mac(result, DEVICES["beckhoff_ads"])
+    ads = observation(ads_device, "beckhoff-ads")
+    assert ads["fields"]["protocols"] == ["beckhoff-ads"]
+    assert ads["fields"]["runtimeName"] == "OT-LAB TwinCAT3"
+    assert ads["fields"]["runtimeVersion"] == "3.1.4021"
+    assert ads["raw"]["runtimePrimaryAmsPort"] == 851
+    assert ads["raw"]["amsNetId"] == "172.30.0.21.1.1"
+    assert ads["raw"]["discovery"]["outcome"] == "success"
+    assert ads["raw"]["collectionComplete"] is True
+    assert ads["raw"]["fieldSources"]["runtimeVersion"]["amsPort"] == 851
+    endpoints = {endpoint["amsPort"]: endpoint for endpoint in ads["raw"]["endpoints"]}
+    assert set(endpoints) == {10000, 851, 801}
+    assert all(endpoint["deviceInfo"]["outcome"] == "success" for endpoint in endpoints.values())
+    assert all(endpoint["readState"]["adsState"] == 5 for endpoint in endpoints.values())
+    ads_ports = {port["key"] for port in ads_device["ports"] if port["source"] == "beckhoff-ads"}
+    assert {"tcp:48898", "udp:48899"} <= ads_ports
+    web = [item for item in by_mac(result, DEVICES["fox"])["observations"]
+           if (item.get("raw") or {}).get("protocol") in ("http", "https")]
+    assert_web(web)
 
     smb = next(item for item in by_mac(result, DEVICES["netbios"])["observations"]
                if (item.get("raw") or {}).get("protocol") == "smb")
@@ -314,7 +337,7 @@ def assert_full(result: dict) -> None:
         "vendor": "OT Lab Manufacturing",
         "model": "OPC UA Lab Device",
         "serialNumber": "OPCLAB0001",
-        "firmwareVersion": "2.1.0",
+        "softwareRevision": "2.1.0",
         "hardwareVersion": "A1",
         "patchIdentifiers": ["LAB-PATCH-1"],
         "location": "Plant1/Line3/Cell2",
@@ -322,6 +345,10 @@ def assert_full(result: dict) -> None:
         "status": "online",
     } == opcua["fields"]
     assert "opc-ua" in opcua["fields"].get("protocols", [])
+    assert "firmwareVersion" not in opcua["fields"]
+    assert opcua["raw"]["endpoints"][0]["securityPolicyUri"]
+    assert opcua["raw"]["serverBuildInfo"]["fields"]["SoftwareVersion"]
+    assert opcua["raw"]["serverBuildInfo"]["subject"] == "server-application"
     assets = opcua["raw"]["assets"]
     assert len(assets) == 2
     assert opcua["raw"]["normalizedAssetRef"] == assets[0]["ref"]
@@ -348,6 +375,84 @@ def assert_full(result: dict) -> None:
     assert ("udp:137", "netbios") in {
         (port["key"], port["source"]) for port in netbios_device["ports"]
     }
+
+
+def assert_web(observations: list[dict]) -> None:
+    assert len(observations) == 2
+    for item in observations:
+        raw = item["raw"]
+        tls = raw["protocol"] == "https"
+        assert item["source"] == "unknown" and item["warnings"] == []
+        assert raw["statusCode"] == (503 if tls else 200)
+        assert raw["title"] == "Niagara & Web Panel"
+        assert raw["server"] == "OT-Lab-Web/1.0"
+        assert raw["listeners"][0]["port"] == (443 if tls else 80)
+        assert not {"name", "operatingSystem", "firmwareVersion"} & item["fields"].keys()
+        if tls:
+            assert raw["certificateValidation"] is False
+
+
+def verify_http(run_id: str) -> None:
+    web_flags = tuple(f"--no-{protocol}" for protocol in (
+        "profinet", "s7", "enip", "bacnet", "fins", "fox", "dnp3", "iec61850",
+        "opcua", "snmp", "lldp", "netbios", "smb", "rpc", "ads",
+    ))
+    for mode in ("enabled", "disabled", "unresolved"):
+        path = ARTIFACTS / f"http-{mode}-{run_id}.otserver.json"
+        flags = {"enabled": (), "disabled": ("--no-http",), "unresolved": ("--no-arp",)}[mode]
+        result = scan(path, ["172.30.0.14"], *web_flags, *flags)
+        if mode == "unresolved":
+            assert result["devices"] == []
+            assert_web(result["unresolved"])
+            assert all("macAddress" not in item for item in result["unresolved"])
+        else:
+            device = by_mac(result, DEVICES["fox"])
+            web = [item for item in device["observations"]
+                   if (item.get("raw") or {}).get("protocol") in ("http", "https")]
+            if mode == "disabled":
+                assert web == []
+                assert not {"tcp:80", "tcp:443"} & {port["key"] for port in device["ports"]}
+            else:
+                assert_web(web)
+            os.chmod(path, 0o666)
+    print("HTTP/HTTPS virtual lab passed (headers, title, invalid certificate, disablement, endpoint scope).", flush=True)
+
+
+def verify_ads(run_id: str) -> None:
+    other_protocols = (
+        "--no-profinet", "--no-s7", "--no-enip", "--no-bacnet", "--no-fins",
+        "--no-fox", "--no-dnp3", "--no-iec61850", "--no-netbios", "--no-smb",
+        "--no-rpc", "--no-http", "--no-opcua", "--no-snmp", "--no-lldp",
+    )
+    path = ARTIFACTS / f"beckhoff-ads-explicit-netid-{run_id}.otserver.json"
+    result = scan(
+        path,
+        ["172.30.0.21"],
+        *other_protocols,
+        "--no-arp",
+        "--ads-target-netid",
+        "172.30.0.21=172.30.0.21.1.1",
+        "--ads-port",
+        "851",
+    )
+    assert result["devices"] == [] and len(result["unresolved"]) == 1
+    evidence = observation({"observations": result["unresolved"]}, "beckhoff-ads")
+    assert evidence["raw"]["discovery"]["outcome"] == "configured"
+    assert evidence["fields"]["runtimeName"] == "OT-LAB TwinCAT3"
+    assert evidence["raw"]["runtimePrimaryAmsPort"] == 851
+    assert len(evidence["raw"]["endpoints"]) == 1
+    assert evidence["raw"]["endpoints"][0]["amsPort"] == 851
+    assert all(listener["port"] != 48899 for listener in evidence["raw"].get("listeners", []))
+    assert "macAddress" not in evidence and "macAddress" not in evidence["fields"]
+    os.chmod(path, 0o666)
+
+    disabled_path = ARTIFACTS / f"beckhoff-ads-disabled-{run_id}.otserver.json"
+    disabled = scan(disabled_path, ["172.30.0.21"], *other_protocols, "--no-ads")
+    disabled_device = by_mac(disabled, DEVICES["beckhoff_ads"])
+    assert not any(item["source"] == "beckhoff-ads" for item in disabled_device["observations"])
+    assert not any(port["source"] == "beckhoff-ads" for port in disabled_device["ports"])
+    os.chmod(disabled_path, 0o666)
+    print("Beckhoff ADS virtual lab passed (ServerInfo, AMS reads, explicit NetID, disablement).", flush=True)
 
 
 def assert_v3(result: dict) -> None:
@@ -476,7 +581,53 @@ def main() -> None:
     netbios_disabled_path = ARTIFACTS / f"netbios-disabled-{run_id}.otserver.json"
     netbios_unresolved_path = ARTIFACTS / f"netbios-unresolved-{run_id}.otserver.json"
     set_snmp({"version": "2c", "community": "lab-public"})
-    assert_full(scan(full_path, TARGETS))
+    verify_http(run_id)
+    verify_ads(run_id)
+    # Linux bridges suppress reserved LLDP multicast. Emit the independent fixture in the
+    # scanner's network namespace to exercise AF_PACKET reception without bridge privileges.
+    stopped = threading.Event()
+    def emit_lldp() -> None:
+        def tlv(kind: int, value: bytes) -> bytes:
+            return ((kind << 9) | len(value)).to_bytes(2, "big") + value
+        # A distinct source avoids moving a responder's MAC in the bridge forwarding table.
+        frame = bytes.fromhex("0180C200000E0200000000FE88CC") + b"".join([
+            tlv(1, bytes.fromhex("040200000000FE")), tlv(2, b"\x05eth0"),
+            tlv(3, b"\x00\x78"), tlv(5, b"passive-lab"),
+            tlv(127, bytes.fromhex("0012BB08") + b"LLDP-SERIAL-1"), tlv(0, b""),
+        ])
+        with socket.socket(socket.AF_PACKET, socket.SOCK_RAW) as sender:
+            sender.bind(("eth0", 0))
+            while not stopped.wait(0.5):
+                sender.send(frame)
+    emitter = threading.Thread(target=emit_lldp)
+    emitter.start()
+    try:
+        full = scan(full_path, TARGETS)
+    finally:
+        stopped.set()
+        emitter.join()
+    assert_full(full)
+    passive = observation(by_mac(full, DEVICES["lldp"]), "lldp")
+    assert passive["raw"]["acquisition"]["mechanism"] == "passive-announcement"
+    assert passive["fields"]["serialNumber"] == "LLDP-SERIAL-1"
+    snmp = observation(by_mac(full, DEVICES["siemens"]), "snmp")
+    assert snmp["raw"]["physicalEntities"][0]["uuid"] == "00112233445566778899AABBCCDDEEFF"
+    assert snmp["fields"]["serialNumber"] == "S7LAB0001"
+    assert any(link["raw"].get("remoteInventory", {}).get("serialNumber", {}).get("value") == "NEIGHBOR-SERIAL" for link in full["links"])
+    enip = observation(by_mac(full, DEVICES["ethernet_ip"]), "ethernet-ip")
+    assert len(enip["raw"]["cipReads"]) == 3
+    assert enip["raw"]["cipReads"][0]["outcome"] == "success"
+    assert enip["raw"]["cipReads"][0]["value"]["productCode"] == enip["raw"]["productCode"]
+    dnp3 = observation(by_mac(full, DEVICES["dnp3"]), "dnp3")
+    assert dnp3["raw"]["configurationId"] == "0A1B2C3D"
+    assert dnp3["raw"]["attributeRecords"][0]["dataType"] == 1
+    partial_path = ARTIFACTS / f"fins-partial-{run_id}.otserver.json"
+    partial_flags = [f"--no-{protocol}" for protocol in ("profinet", "s7", "enip", "bacnet", "fox", "dnp3", "iec61850", "opcua", "snmp", "lldp", "netbios", "smb", "rpc", "ads")]
+    partial = scan(partial_path, ["172.30.0.20"], *partial_flags)
+    fins = observation(by_mac(partial, "02:00:00:00:00:20"), "omron-fins")
+    assert fins["fields"]["model"] == "CJ2M-CPU32" and fins["warnings"]
+    assert fins["raw"]["transportResponses"][0]["transport"] == "udp"
+    os.chmod(partial_path, 0o666)
     set_snmp(
         {
             "version": "3",
@@ -500,6 +651,8 @@ def main() -> None:
     native_flags = (
         "--no-profinet", "--no-s7", "--no-enip", "--no-bacnet", "--no-fins",
         "--no-fox", "--no-dnp3", "--no-iec61850", "--no-opcua", "--no-snmp", "--no-lldp",
+        "--no-http",
+        "--no-ads",
     )
     netbios_flags = (*native_flags, "--no-smb", "--no-rpc")
     disabled = scan(netbios_disabled_path, ["172.30.0.18"], *netbios_flags, "--no-netbios")

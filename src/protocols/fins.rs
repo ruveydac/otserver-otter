@@ -16,12 +16,39 @@ const TCP_ADDRESS_REQUEST: [u8; 20] = [
 pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
     let (tcp, udp) = tokio::join!(tcp(target), udp(target));
     let mut ports = Vec::new();
-    let mut parsed = None;
+    let mut parsed: Option<Parsed> = None;
+    let mut responses = Vec::new();
+    let mut warnings = Vec::new();
     for (protocol, offset, result) in [("tcp", 16, tcp), ("udp", 0, udp)] {
         match result {
             Ok(Some(response)) => {
-                let value = parse(&response, offset)?;
-                parsed.get_or_insert(value);
+                let value = match parse(&response, offset) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warnings.push(format!("Omron FINS {target} {protocol}: {error}"));
+                        continue;
+                    }
+                };
+                responses.push(json!({"transport": protocol, "identity": value.1}));
+                if let Some((fields, _, _)) = &parsed {
+                    for key in ["model", "firmwareVersion"] {
+                        if fields
+                            .get(key)
+                            .zip(value.0.get(key))
+                            .is_some_and(|(first, second)| first != second)
+                        {
+                            warnings.push(format!(
+                                "Omron FINS {protocol} differs from the first identity for {key}"
+                            ));
+                        }
+                    }
+                }
+                if parsed
+                    .as_ref()
+                    .is_none_or(|(fields, _, _)| !fields.contains_key("model"))
+                {
+                    parsed = Some(value);
+                }
                 ports.push(port(
                     protocol,
                     9600,
@@ -30,12 +57,17 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
                 ));
             }
             Ok(None) => {}
-            Err(error) => return Err(format!("Omron FINS {target}: {error}")),
+            Err(error) => warnings.push(format!("Omron FINS {target} {protocol}: {error}")),
         }
     }
-    let Some((fields, raw, warnings)) = parsed else {
+    let Some((fields, mut raw, mut parsed_warnings)) = parsed else {
+        if let Some(error) = warnings.into_iter().next() {
+            return Err(error);
+        }
         return Ok(None);
     };
+    warnings.append(&mut parsed_warnings);
+    raw["transportResponses"] = json!(responses);
     Ok(Some(Finding {
         source: Source::OmronFins,
         fields,
@@ -59,22 +91,37 @@ async fn udp(target: Ipv4Addr) -> Result<Option<Vec<u8>>, String> {
         .await
         .map_err(|error| error.to_string())?;
     let mut response = vec![0; 65_535];
-    match timeout(TIMEOUT, socket.recv(&mut response)).await {
-        Ok(Ok(length)) => {
-            response.truncate(length);
-            Ok(Some(response))
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    let mut rejected = false;
+    for _ in 0..32 {
+        match tokio::time::timeout_at(deadline, socket.recv(&mut response)).await {
+            Ok(Ok(length)) => {
+                if validate_route(&response[..length], &UDP_REQUEST).is_ok()
+                    && parse(&response[..length], 0).is_ok()
+                {
+                    return Ok(Some(response[..length].to_vec()));
+                }
+                rejected = true;
+            }
+            Ok(Err(error))
+                if matches!(
+                    error.kind(),
+                    ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset
+                ) =>
+            {
+                return Ok(None);
+            }
+            Ok(Err(error)) => return Err(error.to_string()),
+            Err(_) => {
+                return if rejected {
+                    Err("malformed or uncorrelated FINS response".into())
+                } else {
+                    Ok(None)
+                };
+            }
         }
-        Ok(Err(error))
-            if matches!(
-                error.kind(),
-                ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset
-            ) =>
-        {
-            Ok(None)
-        }
-        Ok(Err(error)) => Err(error.to_string()),
-        Err(_) => Ok(None),
     }
+    Err("too many uncorrelated FINS responses".into())
 }
 
 async fn tcp(target: Ipv4Addr) -> Result<Option<Vec<u8>>, String> {
@@ -96,6 +143,10 @@ async fn tcp(target: Ipv4Addr) -> Result<Option<Vec<u8>>, String> {
         || &address_response[..4] != b"FINS"
         || address_response[8..12] != [0, 0, 0, 1]
         || address_response[12..16] != [0; 4]
+        || address_response[16..19] != [0; 3]
+        || address_response[20..23] != [0; 3]
+        || !matches!(address_response[19], 1..=254)
+        || !matches!(address_response[23], 1..=254)
     {
         return Ok(None);
     }
@@ -103,9 +154,29 @@ async fn tcp(target: Ipv4Addr) -> Result<Option<Vec<u8>>, String> {
     let mut request = vec![
         b'F', b'I', b'N', b'S', 0, 0, 0, 0x15, 0, 0, 0, 2, 0, 0, 0, 0, 0x80, 0, 2, 0,
     ];
-    request.extend([address, 0, 0, 0, 0xef, 5, 5, 1, 0]);
+    request.extend([address, 0, 0, address_response[19], 0, 5, 5, 1, 0]);
     write(&mut stream, &request).await?;
-    read_tcp(&mut stream).await.map(Some)
+    let response = read_tcp(&mut stream).await?;
+    validate_route(
+        response.get(16..).ok_or("truncated FINS/TCP response")?,
+        &request[16..],
+    )?;
+    Ok(Some(response))
+}
+
+fn validate_route(response: &[u8], request: &[u8]) -> Result<(), String> {
+    if response.len() < 14
+        || request.len() < 12
+        || response[1] != 0
+        || response[3..6] != request[6..9]
+        || response[6] != request[3]
+        || response[8] != request[5]
+        || (request[4] != 0 && response[7] != request[4])
+        || response[9..12] != request[9..12]
+    {
+        return Err("mismatched FINS response route/transaction".into());
+    }
+    Ok(())
 }
 
 async fn write(stream: &mut TcpStream, value: &[u8]) -> Result<(), String> {
@@ -152,7 +223,7 @@ fn parse(response: &[u8], offset: usize) -> Result<Parsed, String> {
         return Err("invalid FINS/TCP response".into());
     }
     let expected_sid = if offset == 16 { 5 } else { 0xef };
-    if response.len() < 106 + offset
+    if response.len() < 14 + offset
         || response[offset] & 0x40 == 0
         || response[offset + 9] != expected_sid
         || response[offset + 10..offset + 12] != [5, 1]
@@ -166,6 +237,9 @@ fn parse(response: &[u8], offset: usize) -> Result<Parsed, String> {
     ]);
     let mut warnings = Vec::new();
     let mut raw = if code == 0 {
+        if response.len() < 106 + offset {
+            return Err("truncated FINS controller data".into());
+        }
         let model = text(&response[14 + offset..34 + offset]);
         let version = text(&response[34 + offset..54 + offset]);
         if let Some(model) = &model {
@@ -193,6 +267,8 @@ fn parse(response: &[u8], offset: usize) -> Result<Parsed, String> {
     };
     raw["response"] = json!(hex(response));
     raw["responseCode"] = json!(format!("{code:04X}"));
+    raw["route"] = json!({"destination": &response[offset+3..offset+6], "source": &response[offset+6..offset+9], "sid": response[offset+9]});
+    raw["fieldSources"] = json!({"model": {"command": "0501", "offset": 14}, "firmwareVersion": {"command": "0501", "offset": 34}});
     Ok((fields, raw, warnings))
 }
 
@@ -204,6 +280,7 @@ mod tests {
     fn controller_response() -> Vec<u8> {
         let mut response = vec![0; 106];
         response[0] = 0xc0;
+        response[4] = 0x63;
         response[9] = 0xef;
         response[10..12].copy_from_slice(&[5, 1]);
         response[14..24].copy_from_slice(b"CJ2M-CPU32");
@@ -228,6 +305,8 @@ mod tests {
                 "programAreaSize": 0x1234, "iomSize": 2, "dmWords": 0x5678,
                 "timerCounterSize": 3, "expansionDmSize": 4, "steps": 0x9abc,
                 "memoryCardKind": 5, "memoryCardSize": 0xdef0,
+                "route": {"destination":[0,99,0], "source":[0,0,0], "sid":239},
+                "fieldSources":{"model":{"command":"0501","offset":14},"firmwareVersion":{"command":"0501","offset":34}},
             })
         );
     }
@@ -244,10 +323,47 @@ mod tests {
         assert_eq!(warnings[0], "Controller returned FINS status 0001.");
         assert_eq!(
             raw,
-            json!({"response": hex(&response), "responseCode": "0001"})
+            json!({"response": hex(&response), "responseCode": "0001", "route":{"destination":[0,0,0],"source":[0,0,0],"sid":239}, "fieldSources":{"model":{"command":"0501","offset":14},"firmwareVersion":{"command":"0501","offset":34}}})
         );
         response[10] = 4;
         assert!(parse(&response, 0).is_err());
+    }
+
+    #[test]
+    fn validates_routes_and_accepts_short_error_pdus() {
+        let mut response = controller_response();
+        assert!(validate_route(&response, &UDP_REQUEST).is_ok());
+        response[4] ^= 1;
+        assert!(validate_route(&response, &UDP_REQUEST).is_err());
+        response[4] ^= 1;
+        response[13] = 1;
+        response.truncate(14);
+        assert_eq!(parse(&response, 0).unwrap().1["responseCode"], "0001");
+        response[13] = 0;
+        assert!(parse(&response, 0).is_err());
+    }
+
+    #[tokio::test]
+    async fn keeps_udp_identity_when_tcp_is_malformed() {
+        let _network = crate::network_test_lock().await;
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 9600)).await.unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 9600))
+            .await
+            .unwrap();
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 20];
+            stream.read_exact(&mut request).await.unwrap();
+            stream.write_all(b"NOT-FINS").await.unwrap();
+            let mut request = [0; 13];
+            let (_, peer) = socket.recv_from(&mut request).await.unwrap();
+            socket.send_to(&controller_response(), peer).await.unwrap();
+        });
+        let finding = probe(Ipv4Addr::LOCALHOST).await.unwrap().unwrap();
+        assert_eq!(finding.fields["model"], "CJ2M-CPU32");
+        assert_eq!(finding.raw["transportResponses"][0]["transport"], "udp");
+        assert_eq!(finding.warnings.len(), 1);
+        responder.await.unwrap();
     }
 
     #[tokio::test]
@@ -258,6 +374,9 @@ mod tests {
             let mut request = [0; UDP_REQUEST.len()];
             let (_, peer) = socket.recv_from(&mut request).await.unwrap();
             assert_eq!(request, UDP_REQUEST);
+            let mut unrelated = controller_response();
+            unrelated[9] ^= 1;
+            socket.send_to(&unrelated, peer).await.unwrap();
             socket.send_to(&controller_response(), peer).await.unwrap();
         });
         let finding = probe(Ipv4Addr::LOCALHOST).await.unwrap().unwrap();
@@ -281,6 +400,7 @@ mod tests {
             address[..4].copy_from_slice(b"FINS");
             address[4..8].copy_from_slice(&16_u32.to_be_bytes());
             address[8..12].copy_from_slice(&1_u32.to_be_bytes());
+            address[19] = 10;
             address[23] = 1;
             stream.write_all(&address).await.unwrap();
 
@@ -293,6 +413,8 @@ mod tests {
             response[..4].copy_from_slice(b"FINS");
             response[8..12].copy_from_slice(&2_u32.to_be_bytes());
             let mut controller = controller_response();
+            controller[3..6].copy_from_slice(&body[14..17]);
+            controller[6..9].copy_from_slice(&body[11..14]);
             controller[9] = 5;
             response.extend(controller);
             let length = (response.len() - 8) as u32;

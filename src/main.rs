@@ -103,6 +103,10 @@ pub struct ScanArgs {
     #[arg(long)]
     pub no_rpc: bool,
     #[arg(long)]
+    pub no_http: bool,
+    #[arg(long)]
+    pub no_ads: bool,
+    #[arg(long)]
     pub no_opcua: bool,
     #[arg(long)]
     pub no_snmp: bool,
@@ -121,6 +125,12 @@ pub struct ScanArgs {
     /// Proxy HTTPS requests through URL. HTTP requests remain direct unless --http-proxy is supplied.
     #[arg(long, value_name = "URL")]
     pub https_proxy: Option<String>,
+    #[arg(long, value_name = "NETID")]
+    pub ads_source_net_id: Option<String>,
+    #[arg(long = "ads-target-netid", value_name = "IP=NETID")]
+    pub ads_target_netids: Vec<String>,
+    #[arg(long = "ads-port", value_name = "AMS_PORT")]
+    pub ads_ports: Vec<u16>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -205,6 +215,10 @@ pub struct ScannerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_rpc: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_http: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_ads: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub no_opcua: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_snmp: Option<bool>,
@@ -218,6 +232,12 @@ pub struct ScannerConfig {
     pub opcua_username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opcua_password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ads_source_net_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ads_target_net_ids: Option<BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ads_ports: Option<Vec<u16>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -318,6 +338,7 @@ pub struct ScanOptions {
     pub allow_dcp_source: bool,
     pub snmp: Vec<snmp::Settings>,
     pub opcua: otserver_otter::protocols::OpcuaSettings,
+    pub ads: otserver_otter::protocols::AdsSettings,
     pub upload: Option<UploadOptions>,
 }
 
@@ -348,9 +369,11 @@ pub struct ProtocolOptions {
     pub netbios: bool,
     pub smb: bool,
     pub rpc: bool,
+    pub http: bool,
     pub opcua: bool,
     pub snmp: bool,
     pub lldp: bool,
+    pub ads: bool,
 }
 
 impl Default for ProtocolOptions {
@@ -368,9 +391,11 @@ impl Default for ProtocolOptions {
             netbios: true,
             smb: true,
             rpc: true,
+            http: true,
             opcua: true,
             snmp: true,
             lldp: true,
+            ads: true,
         }
     }
 }
@@ -558,6 +583,7 @@ pub fn resolve_scan(
     config: ScannerConfig,
     environment_api_key: Option<String>,
 ) -> Result<ScanOptions, String> {
+    let ads = ads_probe_settings(&args, &config)?;
     let http = HttpOptions {
         ignore_self_signed: args.ignore_self_signed,
         http_proxy: args.http_proxy,
@@ -578,6 +604,8 @@ pub fn resolve_scan(
         netbios: !(no_native_protocols || args.no_netbios || config.no_netbios.unwrap_or(false)),
         smb: !(no_native_protocols || args.no_smb || config.no_smb.unwrap_or(false)),
         rpc: !(no_native_protocols || args.no_rpc || config.no_rpc.unwrap_or(false)),
+        http: !(no_native_protocols || args.no_http || config.no_http.unwrap_or(false)),
+        ads: !(no_native_protocols || args.no_ads || config.no_ads.unwrap_or(false)),
         opcua: !(no_native_protocols || args.no_opcua || config.no_opcua.unwrap_or(false)),
         snmp: !(args.no_snmp || config.no_snmp.unwrap_or(false)),
         lldp: !(args.no_lldp || config.no_lldp.unwrap_or(false)),
@@ -629,8 +657,43 @@ pub fn resolve_scan(
             .filter(|settings| !settings.is_empty())
             .unwrap_or_else(|| vec![snmp::Settings::default()]),
         opcua,
+        ads,
         upload,
     })
+}
+
+fn ads_probe_settings(
+    args: &ScanArgs,
+    config: &ScannerConfig,
+) -> Result<otserver_otter::protocols::AdsSettings, String> {
+    let mut target_net_ids = config.ads_target_net_ids.clone().unwrap_or_default();
+    let mut cli_targets = BTreeSet::new();
+    for mapping in &args.ads_target_netids {
+        let (target, net_id) = mapping
+            .split_once('=')
+            .ok_or("--ads-target-netid must use IP=NETID.")?;
+        if target.is_empty() || net_id.is_empty() {
+            return Err("--ads-target-netid must use IP=NETID.".into());
+        }
+        if !cli_targets.insert(target.to_owned()) {
+            return Err(format!(
+                "ADS target NetID for {target} was specified more than once."
+            ));
+        }
+        target_net_ids.insert(target.to_owned(), net_id.to_owned());
+    }
+    let ports = if args.ads_ports.is_empty() {
+        config.ads_ports.as_deref().unwrap_or_default()
+    } else {
+        args.ads_ports.as_slice()
+    };
+    otserver_otter::protocols::AdsSettings::from_config(
+        args.ads_source_net_id
+            .as_deref()
+            .or(config.ads_source_net_id.as_deref()),
+        &target_net_ids,
+        ports,
+    )
 }
 
 fn opcua_probe_settings(config: &ScannerConfig) -> otserver_otter::protocols::OpcuaSettings {
@@ -760,18 +823,19 @@ pub async fn scan(
     } else {
         profinet::interfaces()
     };
-    let source_mac = if (options.protocols.arp || options.protocols.profinet)
-        && !cancelled.load(Ordering::Relaxed)
-    {
-        scan_source_mac(
-            &options.interface,
-            &options.source_mac,
-            interfaces.as_ref().map_err(Clone::clone)?,
-            logger,
-        )?
-    } else {
-        options.source_mac.clone()
-    };
+    let source_mac =
+        if (options.protocols.arp || options.protocols.profinet || options.protocols.lldp)
+            && !cancelled.load(Ordering::Relaxed)
+        {
+            scan_source_mac(
+                &options.interface,
+                &options.source_mac,
+                interfaces.as_ref().map_err(Clone::clone)?,
+                logger,
+            )?
+        } else {
+            options.source_mac.clone()
+        };
     let interface = scan_interface_ref(
         &options.interface,
         &source_mac,
@@ -793,6 +857,16 @@ pub async fn scan(
     ));
 
     let target_addresses = discovery::expand_targets(&options.targets)?;
+    let lldp_capture = if options.protocols.lldp && !cancelled.load(Ordering::Relaxed) {
+        let interface = options.interface.clone();
+        let mac = source_mac.clone();
+        let cancellation = Arc::clone(cancelled);
+        Some(tokio::task::spawn_blocking(move || {
+            otserver_otter::lldp::scan(&interface, &mac, &cancellation)
+        }))
+    } else {
+        None
+    };
 
     let dcp_first = options.allow_dcp_source && options.protocols.profinet;
     if dcp_first && !cancelled.load(Ordering::Relaxed) {
@@ -895,7 +969,9 @@ pub async fn scan(
         netbios: options.protocols.netbios,
         smb: options.protocols.smb,
         rpc: options.protocols.rpc,
+        http: options.protocols.http,
         opcua: options.protocols.opcua,
+        ads: options.protocols.ads,
     };
     if native_selection.any() && !cancelled.load(Ordering::Relaxed) {
         logger.log(format!(
@@ -910,6 +986,7 @@ pub async fn scan(
             &mut warnings,
             native_selection,
             &options.opcua,
+            &options.ads,
             logger,
             cancelled,
         )
@@ -952,6 +1029,17 @@ pub async fn scan(
         .await;
     }
 
+    if let Some(capture) = lldp_capture {
+        match capture.await {
+            Ok(Ok(result)) => {
+                devices.extend(result.devices);
+                links.extend(result.links);
+                warnings.extend(result.warnings);
+            }
+            Ok(Err(error)) => warnings.push(format!("Passive LLDP: {error}")),
+            Err(error) => warnings.push(format!("Passive LLDP task: {error}")),
+        }
+    }
     let stopped = cancelled.load(Ordering::Relaxed);
     if stopped {
         warnings
@@ -1346,8 +1434,9 @@ async fn probe_protocols(
     warnings: &mut Vec<String>,
     selection: protocols::Selection,
     opcua: &otserver_otter::protocols::OpcuaSettings,
+    ads: &otserver_otter::protocols::AdsSettings,
     logger: &dyn LogOutput,
-    cancelled: &AtomicBool,
+    cancelled: &Arc<AtomicBool>,
 ) {
     let identities = unique_ip_identities(devices);
     let mut tasks = tokio::task::JoinSet::new();
@@ -1364,8 +1453,18 @@ async fn probe_protocols(
         }
         let mac = identities.get(&ip.to_string()).cloned();
         let opcua = opcua.clone();
+        let ads = ads.clone();
+        let cancellation = Arc::clone(cancelled);
         tasks.spawn(async move {
-            let result = protocols::scan(ip, mac.as_deref(), selection, &opcua).await;
+            let result = protocols::scan_with_cancellation(
+                ip,
+                mac.as_deref(),
+                selection,
+                &opcua,
+                &ads,
+                &cancellation,
+            )
+            .await;
             (ip, mac, result)
         });
     }
@@ -1406,6 +1505,13 @@ async fn drain_tasks<T: 'static>(
     }
     while let Some(result) = tasks.try_join_next() {
         apply(Some(result));
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    while !tasks.is_empty() {
+        match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+            Ok(Some(result)) => apply(Some(result)),
+            _ => break,
+        }
     }
     tasks.abort_all();
 }
@@ -1759,6 +1865,8 @@ mod tests {
             no_netbios: Some(true),
             no_smb: Some(true),
             no_rpc: Some(true),
+            no_http: Some(true),
+            no_ads: Some(true),
             no_opcua: Some(true),
             no_snmp: Some(true),
             no_lldp: Some(true),
@@ -1766,6 +1874,12 @@ mod tests {
             opcua_credentials: None,
             opcua_username: Some("opc-user".into()),
             opcua_password: Some("opc-password".into()),
+            ads_source_net_id: Some("10.0.0.1.1.1".into()),
+            ads_target_net_ids: Some(BTreeMap::from([(
+                "192.168.1.10".into(),
+                "10.0.0.10.1.1".into(),
+            )])),
+            ads_ports: Some(vec![851, 801]),
             server_url: Some("https://otserver.example".into()),
             site: Some("site-1".into()),
             api_key: Some("key-123".into()),
@@ -1965,6 +2079,8 @@ mod tests {
             "--no-dnp3",
             "--no-iec61850",
             "--no-netbios",
+            "--no-http",
+            "--no-ads",
             "--no-opcua",
             "--no-snmp",
             "--no-lldp",
@@ -1989,6 +2105,8 @@ mod tests {
         assert!(args.no_dnp3);
         assert!(args.no_iec61850);
         assert!(args.no_netbios);
+        assert!(args.no_http);
+        assert!(args.no_ads);
         assert!(args.no_opcua);
         assert!(args.no_snmp);
         assert!(args.no_lldp);
@@ -2023,6 +2141,82 @@ mod tests {
             );
             assert!(options.protocols.s7);
         }
+    }
+
+    #[test]
+    fn http_honors_cli_config_and_legacy_disable() {
+        for (cli_disabled, config_disabled, legacy) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let mut cli = args();
+            cli.no_http = cli_disabled;
+            let mut config = complete_config("Test", "192.0.2.1", "test.json");
+            config.no_http = Some(config_disabled);
+            config.no_protocols = Some(legacy);
+            let options = resolve_scan(cli, config, None).unwrap();
+            assert_eq!(
+                options.protocols.http,
+                !(cli_disabled || config_disabled || legacy)
+            );
+        }
+    }
+
+    #[test]
+    fn ads_honors_cli_config_and_legacy_disable() {
+        for (cli_disabled, config_disabled, legacy) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let mut cli = args();
+            cli.no_ads = cli_disabled;
+            let mut config = complete_config("Test", "192.0.2.1", "test.json");
+            config.no_ads = Some(config_disabled);
+            config.no_protocols = Some(legacy);
+            let options = resolve_scan(cli, config, None).unwrap();
+            assert_eq!(
+                options.protocols.ads,
+                !(cli_disabled || config_disabled || legacy)
+            );
+        }
+    }
+
+    #[test]
+    fn ads_cli_settings_override_config_and_validate_netids_and_ports() {
+        let mut cli = args();
+        cli.ads_source_net_id = Some("192.0.2.2.1.1".into());
+        cli.ads_target_netids
+            .push("192.0.2.10=10.0.0.10.1.1".into());
+        cli.ads_ports = vec![851];
+        let config = ScannerConfig {
+            ads_source_net_id: Some("192.0.2.1.1.1".into()),
+            ads_target_net_ids: Some(BTreeMap::from([(
+                "192.0.2.10".into(),
+                "10.0.0.11.1.1".into(),
+            )])),
+            ads_ports: Some(vec![801]),
+            ..complete_config("Test", "192.0.2.10", "test.json")
+        };
+        let settings = ads_probe_settings(&cli, &config).unwrap();
+        assert_eq!(settings.source_net_id, Some([192, 0, 2, 2, 1, 1]));
+        assert_eq!(
+            settings.target_net_ids[&Ipv4Addr::new(192, 0, 2, 10)],
+            [10, 0, 0, 10, 1, 1]
+        );
+        assert_eq!(settings.ams_ports, [851]);
+
+        cli.ads_target_netids = vec!["not-an-ip=10.0.0.10.1.1".into()];
+        assert!(ads_probe_settings(&cli, &config).is_err());
+        cli.ads_target_netids.clear();
+        cli.ads_source_net_id = Some("192.0.2.1".into());
+        assert!(ads_probe_settings(&cli, &config).is_err());
+        cli.ads_source_net_id = None;
+        cli.ads_ports = vec![851, 851];
+        assert!(ads_probe_settings(&cli, &config).is_err());
     }
 
     #[test]
@@ -2346,6 +2540,7 @@ mod tests {
             allow_dcp_source: false,
             snmp: vec![snmp::Settings::default()],
             opcua: protocols::OpcuaSettings::default(),
+            ads: protocols::AdsSettings::default(),
             upload: None,
         };
         let cancelled = Arc::new(AtomicBool::new(true));
@@ -2412,6 +2607,7 @@ mod tests {
             allow_dcp_source: false,
             snmp: vec![snmp::Settings::default()],
             opcua: protocols::OpcuaSettings::default(),
+            ads: protocols::AdsSettings::default(),
             upload: None,
         };
         let cancelled = Arc::new(AtomicBool::new(true));

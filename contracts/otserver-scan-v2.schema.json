@@ -100,6 +100,7 @@
           "enum": [
             "arp",
             "bacnet",
+            "beckhoff-ads",
             "dnp3",
             "ethernet-ip",
             "iec61850",

@@ -8,8 +8,10 @@ contract, or safety boundary.
 OTserver Otter is a read-only Rust discovery CLI and GUI for Windows and Linux. It discovers OT
 assets with native ARP, PROFINET DCP Identify and PNIO I&M record reads (EPM endpoint mapping,
 bounded read requests, and DCE/RPC fragmentation/FACK handling), S7 identity, EtherNet/IP List
-Identity, BACnet ReadProperty, Omron FINS identity, Niagara Fox hello, DNP3 Group 0 device
-attributes, NetBIOS Node Status, SMB1/2/3 and RPC NTLM challenge identity, OPC UA asset discovery,
+Identity, BACnet ReadProperty, Omron FINS identity, Beckhoff ADS/AMS ServerInfo and bounded
+ReadDeviceInfo/ReadState requests, Niagara Fox hello, DNP3 Group 0 device attributes, NetBIOS Node
+Status, SMB1/2/3 and RPC NTLM challenge identity, OPC UA asset discovery,
+HTTP/HTTPS status/title/Server-header collection,
 SNMP GET/WALK, and LLDP. It exports
 `otserver-scan` schema-version-2 JSON for OTserver.
 
@@ -32,6 +34,17 @@ instructions are in `README.md`; detailed operator and development guidance foll
   Modbus requests without an explicit product decision and safety review.
 - Keep protocol framing and parsing in `src/protocols/` or the existing dedicated modules. Reject
   truncated, oversized, mismatched, or unsolicited responses.
+- Beckhoff ADS sends one unicast ServerInfo request to UDP 48899 and only `ReadDeviceInfo` and
+  `ReadState` ADS commands over TCP 48898 to selected AMS ports. Validate the ServerInfo cookie,
+  service, tags and response size, and each AMS response's reversed NetIDs/ports, command, flags,
+  invoke ID, and declared lengths. Never send ADS commands other than `ReadDeviceInfo` and
+  `ReadState`; no writes, symbol/process-image reads, notifications, or system-service operations.
+  Never create routes or infer a target NetID from its
+  IPv4 address. An explicitly configured target NetID is an operator assertion; otherwise skip ADS
+  TCP reads if UDP discovery fails. Targets may require a pre-existing authorized AMS route. Keep
+  ADS runtime identity/state separate from hardware model, serial, firmware, and online status.
+  Do not negotiate Secure ADS, downgrade security, or try alternate secure ports. `--no-ads`,
+  `noAds`, the GUI toggle and legacy `noProtocols` disable this probe.
 - PNIO record replies may use the advertised endpoint port or EPM port 34964 as their UDP source.
   In either case, require the target MAC/IP, client UDP port, and matching RPC object, interface,
   activity, sequence, and operation before accepting or acknowledging fragments.
@@ -50,6 +63,13 @@ instructions are in `README.md`; detailed operator and development guidance foll
 - NetBIOS uses one unicast wildcard NBSTAT query to UDP 137. Keep the reported UNIT_ID as raw
   evidence, never as an override for ARP/DCP identity or a way to resolve MAC-less targets.
   It is enabled by default; `--no-netbios`, `noNetbios`, and the GUI toggle disable it.
+- HTTP/HTTPS discovery sends one paced `GET /` to TCP 80 and 443 respectively, without proxies,
+  redirects, authentication, cookies, or retries. HTTPS discovery always disables certificate and
+  hostname validation. Bound each request to two seconds and body collection to 64 KiB; retain
+  status and Server-header evidence on body failure. Export listener-scoped `raw.protocol`,
+  `raw.statusCode`, `raw.title`, and `raw.server` under the existing `unknown` source. Never promote
+  a title or server banner to device identity, OS, or firmware. `--no-http`, `noHttp`, the GUI toggle,
+  and legacy `noProtocols` disable both listeners. Upload/controller TLS settings remain independent.
 - SMB uses TCP 445, SMB2/3 negotiation and only the first NTLM SESSION_SETUP; RPC uses TCP 135
   and one EPM bind carrying NTLM Type 1. Never send NTLM Type 3/AUTH3, authenticate, enumerate
   shares/endpoints, activate DCOM, or execute WMI/WinRM commands in these probes. Both are enabled
@@ -183,8 +203,16 @@ and never persist the token or managed protocol credentials.
 
 All discovery protocols are enabled by default. CLI `--no-<protocol>` switches and JSON `noArp`,
 `noProfinet`, `noS7`, `noEnip`, `noBacnet`, `noFins`, `noFox`, `noDnp3`, `noIec61850`, `noNetbios`,
-`noSmb`, `noRpc`, `noOpcua`, `noSnmp`, and `noLldp` disable them individually. SNMP inventory and LLDP
-topology share credentials but have independent switches. The GUI exposes matching toggles.
+`noSmb`, `noRpc`, `noHttp`, `noAds`, `noOpcua`, `noSnmp`, and `noLldp` disable them individually.
+SNMP inventory and LLDP topology share credentials but have independent switches. The GUI exposes
+matching toggles.
+
+ADS discovery uses `adsTargetNetIds` to map target IPv4 strings to their six-octet AMS NetIDs when
+UDP ServerInfo is unavailable, `adsSourceNetId` to override the scanner NetID derived from the local
+connection address, and `adsPorts` to select up to eight logical AMS endpoints. Empty or omitted
+`adsPorts` queries the system service and the first TwinCAT 3/TwinCAT 2 PLC runtimes. AMS ports are
+not TCP ports. CLI options `--ads-target-netid IP=NETID`, `--ads-source-net-id NETID`, and repeated
+`--ads-port PORT` override their respective config values.
 
 ### SNMP and OPC UA credentials
 
@@ -323,13 +351,32 @@ to HTTP. Other hosts require explicit HTTPS. No scanner-side listener is opened.
   access and both identity SZLs.
   PNIO component references use `pnio:<api>:<slot>[:<subslot>]` and retain original records,
   containment, identification numbers, I&M revisions, and scoped serial claims.
-- DNP3 uses TCP 20000: link reset followed by Group 0 Variation 0 device-attribute Read with the
+- DNP3 uses TCP 20000: link reset followed by Group 0 Variation 254 device-attribute Read with the
   all-objects qualifier, pipelined for four common outstation/master pairs. Keep hardware revisions
   separate from firmware. Do not probe DNP3/UDP, TLS-wrapped DNP3, or Secure Authentication.
 - IEC 61850 uses MMS/TCP 102 for advertised identity, health, breaker-position, blocking, and
   operation-count attributes. Do not access control, report, setting-group, file, or write services.
 - OPC UA preserves hardware revisions and patch identifiers as inventory evidence, not compliance
   verdicts. Fox retains listener responses in `raw.transportResponses` even on partial failure.
+- EtherNet/IP uses correlated ListIdentity sender contexts. After a valid TCP identity, it opens
+  one bounded explicit-message session for Identity Object GetAttributesAll (class 1, instance 1),
+  TCP/IP Interface configuration and hostname GetAttributeSingle (class 0xF5, instance 1, attributes
+  5 and 6). These are the only additional CIP services; never add ForwardOpen, writes, routing,
+  or rack enumeration here. Retain disagreements as evidence, not identity overrides.
+- LLDP combines SNMP-reported neighbors with a concurrent 30-second passive selected-link capture
+  (Linux AF_PACKET or Windows Npcap). The passive path sends no frames, observes at most 512
+  neighbors, expires TTLs and honors withdrawal/cancellation. Management addresses never expand IP
+  probe scope. Preserve chassis/port subtypes and LLDP-MED inventory; remote inventory must not
+  become the reporting SNMP agent's identity. Missing Npcap does not disable SNMP LLDP collection.
+- SNMP software revisions and OPC UA SoftwareRevision remain `softwareRevision`, never a fallback
+  for firmware. OPC UA endpoint security/certificate evidence and standard server BuildInfo remain
+  application-scoped under `raw`, separate from represented assets. Certificate retention is bounded
+  to 16 KiB per endpoint and endpoint retention to 64 entries. Advertised URLs are never followed.
+- Preserve successful S7 SZLs, BACnet properties, FINS transports and partial SNMP walk rows after
+  later failures. Export collection outcomes and field sources with protocol evidence. Incomplete
+  ENTITY-MIB parent/class walks cannot establish unique root identity. DNP3 attributes retain set,
+  variation, datatype and bytes; only explicit standard-set attributes supply normalized identity.
+  Datatype 254 is an attribute list, not a vendor string convention.
 - NetBIOS retains name tables, suffixes, flags, workgroup, unit ID, and raw replies. Prefer workstation
   over server names. No broadcast, registration, credentials, or SMB session is needed. OTserver must
   recognize the `netbios` source in schema version 2.
@@ -365,6 +412,15 @@ asyncua, and bounded FINS/Fox/DNP3 implementations. NetBIOS uses Samba `nmbd`; S
 fallback, names, native strings, disablement, and MAC-less unresolved output. Classic security and
 old short NTLM challenges use Rust fixtures, not live legacy-Windows interoperability tests.
 Validate actual Windows releases separately with their firewall and NTLM policies.
+
+The lab checks three allowlisted CIP reads against OpENer, typed DNP3/configuration evidence,
+SNMP ENTITY-MIB UUID/URI and remote LLDP-MED scoping, OPC UA application/device version separation,
+and retention of UDP FINS identity after a malformed TCP response. The Fox lab device also serves
+HTTP/HTTPS, checking status/title/Server-header evidence, invalid certificate acceptance,
+disablement, and MAC-less endpoint scoping. Passive LLDP frames are injected in the scanner's
+isolated network namespace because Linux bridges suppress reserved LLDP multicast;
+this exercises AF_PACKET reception/decoding, not physical switch forwarding or Windows capture.
+The scanner lab Docker build uses BuildKit registry/target caches for repeatable incremental builds.
 
 ### Remote-management gate setup
 
@@ -426,3 +482,8 @@ require this exact-pair gate.
 On Windows, the Fox TLS retry test requires a process context that can acquire Schannel outbound
 credentials. A restricted sandbox may return `SEC_E_NO_CREDENTIALS` before sending ClientHello;
 verify that failure in a normal user context rather than weakening or skipping the test.
+
+The HTTPS loopback test uses the public, test-only PKCS#12 identity in `src/protocols/fixtures/`;
+regeneration instructions are alongside it. Windows GNU test binaries can also run under Wine on
+Linux, but Wine 11 does not preserve protected file DACLs. Validate the controller ACL test on
+native Windows; do not relax its security assertions to make Wine pass.
