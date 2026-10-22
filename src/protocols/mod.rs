@@ -490,27 +490,37 @@ mod tests {
     #[tokio::test]
     async fn cancellation_retains_completed_protocols_while_dropping_silent_ones() {
         let _network = crate::network_test_lock().await;
-        let fins = UdpSocket::bind((Ipv4Addr::LOCALHOST, 9600)).await.unwrap();
+        let fox = TcpListener::bind((Ipv4Addr::LOCALHOST, 1911))
+            .await
+            .unwrap();
+        let fox_alt = TcpListener::bind((Ipv4Addr::LOCALHOST, 4911))
+            .await
+            .unwrap();
         let _silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 47808)).await.unwrap();
         let cancelled = AtomicBool::new(false);
         let responder = async {
-            let mut request = [0; 13];
-            let (_, peer) = fins.recv_from(&mut request).await.unwrap();
-            let mut response = vec![0; 106];
-            response[0] = 0xc0;
-            response[4] = 0x63;
-            response[9..12].copy_from_slice(&[0xef, 5, 1]);
-            response[14..17].copy_from_slice(b"PLC");
-            fins.send_to(&response, peer).await.unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            for listener in [&fox, &fox_alt] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let hello = b"fox a 1 -1 fox hello\n{\nfox.version=s:1.0\nid=i:1\n};;\n";
+                let mut request = vec![0; hello.len()];
+                stream.read_exact(&mut request).await.unwrap();
+                assert_eq!(request, hello);
+                stream
+                    .write_all(b"fox a 0\n{\nhostName=s:PLC\n};;\n")
+                    .await
+                    .unwrap();
+                // Both client connections must close before cancelling: a sent reply
+                // or a short sleep does not establish that the whole probe completed.
+                assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+            }
             cancelled.store(true, Ordering::Relaxed);
         };
         let selection = Selection {
             s7: false,
             enip: false,
             bacnet: true,
-            fins: true,
-            fox: false,
+            fins: false,
+            fox: true,
             dnp3: false,
             iec61850: false,
             netbios: false,
@@ -522,19 +532,29 @@ mod tests {
         };
         let settings = opcua::ProbeSettings::default();
         let ads_settings = AdsSettings::default();
-        let (result, ()) = tokio::join!(
-            scan_with_cancellation(
-                Ipv4Addr::LOCALHOST,
-                None,
-                selection,
-                &settings,
-                &ads_settings,
-                &cancelled,
-            ),
-            responder
-        );
+        let (result, ()) = tokio::time::timeout(TIMEOUT, async {
+            tokio::join!(
+                scan_with_cancellation(
+                    Ipv4Addr::LOCALHOST,
+                    None,
+                    selection,
+                    &settings,
+                    &ads_settings,
+                    &cancelled,
+                ),
+                responder
+            )
+        })
+        .await
+        .expect("scan did not cancel before the silent probe timeout");
         assert_eq!(result.observations.len(), 1);
-        assert_eq!(result.observations[0].fields["model"], "PLC");
+        assert_eq!(result.observations[0].source, Source::NiagaraFox);
+        assert_eq!(result.observations[0].fields["name"], "PLC");
+        assert_eq!(result.ports.len(), 2);
+        assert_eq!(
+            result.outcomes,
+            vec![(Source::Bacnet, false), (Source::NiagaraFox, true)]
+        );
         assert!(
             result
                 .warnings
