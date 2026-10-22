@@ -4,7 +4,7 @@
 
 ### Read-only OT discovery for the [OTserver inventory](https://github.com/ruveydac/OTserver)
 
-Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Fox · DNP3 · IEC 61850 · NetBIOS · SMB · RPC · OPC UA · SNMP · LLDP
+Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Beckhoff ADS · Fox · DNP3 · IEC 61850 · NetBIOS · SMB · RPC · HTTP/HTTPS · OPC UA · SNMP · LLDP
 
 [![Website](https://img.shields.io/badge/otserver.org-111111?logo=firefoxbrowser&logoColor=white)](https://otserver.org)
 [![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
@@ -25,10 +25,30 @@ managed scanner.
 
 ## What it discovers
 
-Otter uses ARP, PROFINET, S7, EtherNet/IP, BACnet, Omron FINS, Niagara Fox, DNP3, IEC 61850,
-NetBIOS, SMB, RPC, OPC UA, SNMP, and LLDP to collect identity and network evidence.
+Otter uses ARP, PROFINET, S7, EtherNet/IP, BACnet, Omron FINS, Beckhoff ADS, Niagara Fox, DNP3,
+IEC 61850, NetBIOS, SMB, RPC, HTTP/HTTPS, OPC UA, SNMP, and LLDP to collect identity and network
+evidence.
+
+HTTP discovery sends one `GET /` to TCP 80 and HTTPS to TCP 443, collecting the response
+status code, HTML page title, and `Server` header when present. HTTPS discovery accepts invalid
+certificates, including untrusted, expired, and hostname-mismatched certificates. Each request has
+a two-second deadline and reads at most 64 KiB of body data; redirects are not followed. Disable
+both with `--no-http`, `"noHttp": true`, or the GUI's **HTTP/HTTPS** toggle. Results use the existing
+schema-v2 `unknown` observation source, with `raw.protocol` (`http` or `https`), `raw.statusCode`,
+`raw.title`, and `raw.server`. Titles and server banners remain listener evidence rather than device
+names, operating systems, or firmware versions.
 Results retain per-protocol observations and warnings, including partial results when individual
 probes fail.
+
+Beckhoff ADS discovery sends one unicast ServerInfo request to UDP 48899, then uses TCP 48898 to
+read device information and state from AMS ports 10000, 851, and 801. It records ADS runtime names,
+version tuples, states, and the logical AMS NetID; those values are not promoted to hardware model,
+serial number, or firmware. ADS access may require an AMS route already configured on the target.
+Otter does not create routes or change target settings. Disable it with `--no-ads`, `"noAds": true`,
+or the GUI's **Beckhoff ADS** toggle; legacy `noProtocols` disables it too. If UDP discovery is
+unavailable, configure a known target NetID as described below. Secure ADS is not implemented; the
+probe does not downgrade security or try an alternate secure port, so targets that disable plaintext
+ADS may not return identity data.
 
 LLDP includes a concurrent 30-second passive capture on the selected adapter, plus SNMP-reported
 neighbors and optional LLDP-MED inventory. Windows capture requires separately installed Npcap.
@@ -103,6 +123,20 @@ Every scan requires `--ack-authorized`. Run `scan --help` for protocol switches 
 An optional `otter.json` beside the executable stores scan settings and multiple configurations.
 The GUI can edit these settings and run one or all configurations. Local credentials are stored
 in plaintext in that file; restrict its permissions and keep it out of source control.
+
+For Beckhoff ADS, the optional `adsTargetNetIds` mapping supplies the logical NetID for targets
+whose UDP ServerInfo discovery is filtered. `adsSourceNetId` overrides the client NetID derived from
+the selected TCP connection's local IPv4 address. `adsPorts` selects at most eight logical AMS ports
+to query; these are not TCP ports.
+
+```json
+{
+  "targets": ["192.168.1.10"],
+  "adsTargetNetIds": {"192.168.1.10": "192.168.1.10.1.1"},
+  "adsSourceNetId": "192.168.1.20.1.1",
+  "adsPorts": [851, 801]
+}
+```
 
 For central management, enroll the scanner using a token from OTserver:
 

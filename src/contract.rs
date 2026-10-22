@@ -88,6 +88,7 @@ pub struct Observation {
 pub enum Source {
     Arp,
     Bacnet,
+    BeckhoffAds,
     Dnp3,
     EthernetIp,
     Iec61850,
@@ -108,6 +109,7 @@ impl Source {
         match self {
             Self::Arp => "arp",
             Self::Bacnet => "bacnet",
+            Self::BeckhoffAds => "beckhoff-ads",
             Self::Dnp3 => "dnp3",
             Self::EthernetIp => "ethernet-ip",
             Self::Iec61850 => "iec61850",

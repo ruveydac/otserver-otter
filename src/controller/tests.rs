@@ -376,6 +376,8 @@ fn configuration_maps_profile_options_and_separate_credentials() {
         "noNetbios",
         "noSmb",
         "noRpc",
+        "noHttp",
+        "noAds",
         "noOpcua",
         "noSnmp",
         "noLldp",
@@ -383,6 +385,9 @@ fn configuration_maps_profile_options_and_separate_credentials() {
         job.configuration[option] = json!(true);
     }
     job.configuration["opcuaPorts"] = json!([4841]);
+    job.configuration["adsSourceNetId"] = json!("192.0.2.2.1.1");
+    job.configuration["adsTargetNetIds"] = json!({"192.0.2.10": "10.0.0.10.1.1"});
+    job.configuration["adsPorts"] = json!([851, 801]);
     job.credentials = json!({"snmp":[{"version":"3","username":"inventory"}],"opcuaCredentials":[{"username":"reader","password":"secret"}]});
     let config = mapped_config(&job, &api, &scanner()).unwrap();
     let options = resolve_scan(ScanArgs::default(), config, None).unwrap();
@@ -392,11 +397,19 @@ fn configuration_maps_profile_options_and_separate_credentials() {
             && !options.protocols.netbios
             && !options.protocols.smb
             && !options.protocols.rpc
+            && !options.protocols.http
+            && !options.protocols.ads
             && !options.protocols.snmp
     );
     assert!(options.allow_dcp_source);
     assert!(options.upload.is_none());
     assert_eq!(options.opcua.ports, vec![4841]);
+    assert_eq!(options.ads.source_net_id, Some([192, 0, 2, 2, 1, 1]));
+    assert_eq!(
+        options.ads.target_net_ids[&"192.0.2.10".parse().unwrap()],
+        [10, 0, 0, 10, 1, 1]
+    );
+    assert_eq!(options.ads.ams_ports, [851, 801]);
     assert_eq!(options.snmp[0].username.as_deref(), Some("inventory"));
 }
 
@@ -416,6 +429,9 @@ fn managed_configuration_rejects_unsafe_overrides_and_invalid_targets() {
         ("targets", json!(["::1"])),
         ("targets", json!(["192.0.2.0/8"])),
         ("opcuaPorts", json!([0])),
+        ("adsSourceNetId", json!("192.0.2.1")),
+        ("adsTargetNetIds", json!({"not-an-ip": "10.0.0.1.1.1"})),
+        ("adsPorts", json!([851, 851])),
         ("noArp", json!("yes")),
     ] {
         let mut job = assignment(&api);

@@ -265,6 +265,8 @@ pub struct GuiApp {
     netbios_enabled: bool,
     smb_enabled: bool,
     rpc_enabled: bool,
+    http_enabled: bool,
+    ads_enabled: bool,
     opcua_enabled: bool,
     snmp_enabled: bool,
     lldp_enabled: bool,
@@ -337,6 +339,8 @@ impl GuiApp {
             netbios_enabled: true,
             smb_enabled: true,
             rpc_enabled: true,
+            http_enabled: true,
+            ads_enabled: true,
             opcua_enabled: true,
             snmp_enabled: true,
             lldp_enabled: true,
@@ -421,6 +425,8 @@ impl GuiApp {
         self.netbios_enabled = !(legacy_native_disabled || config.no_netbios.unwrap_or(false));
         self.smb_enabled = !(legacy_native_disabled || config.no_smb.unwrap_or(false));
         self.rpc_enabled = !(legacy_native_disabled || config.no_rpc.unwrap_or(false));
+        self.http_enabled = !(legacy_native_disabled || config.no_http.unwrap_or(false));
+        self.ads_enabled = !(legacy_native_disabled || config.no_ads.unwrap_or(false));
         self.opcua_enabled = !(legacy_native_disabled || config.no_opcua.unwrap_or(false));
         self.snmp_enabled = !config.no_snmp.unwrap_or(false);
         self.lldp_enabled = !config.no_lldp.unwrap_or(false);
@@ -558,6 +564,8 @@ impl GuiApp {
         config.no_netbios = (!self.netbios_enabled).then_some(true);
         config.no_smb = (!self.smb_enabled).then_some(true);
         config.no_rpc = (!self.rpc_enabled).then_some(true);
+        config.no_http = (!self.http_enabled).then_some(true);
+        config.no_ads = (!self.ads_enabled).then_some(true);
         config.no_opcua = (!self.opcua_enabled).then_some(true);
         config.no_snmp = (!self.snmp_enabled).then_some(true);
         config.no_lldp = (!self.lldp_enabled).then_some(true);
@@ -1125,6 +1133,8 @@ impl eframe::App for GuiApp {
                                 ("NetBIOS", &mut self.netbios_enabled),
                                 ("SMB", &mut self.smb_enabled),
                                 ("RPC", &mut self.rpc_enabled),
+                                ("HTTP/HTTPS", &mut self.http_enabled),
+                                ("Beckhoff ADS", &mut self.ads_enabled),
                                 ("OPC UA", &mut self.opcua_enabled),
                                 ("SNMP", &mut self.snmp_enabled),
                                 ("LLDP", &mut self.lldp_enabled),
@@ -1962,6 +1972,41 @@ mod tests {
             assert_eq!(saved.no_smb, (!app.smb_enabled).then_some(true));
             assert_eq!(saved.no_rpc, (!app.rpc_enabled).then_some(true));
             assert_eq!(saved.no_protocols, None);
+        }
+    }
+
+    #[test]
+    fn http_toggle_roundtrips_and_honors_legacy_disable() {
+        for (disabled, legacy) in [(false, false), (true, false), (false, true)] {
+            let config = ScannerConfig {
+                no_http: Some(disabled),
+                no_protocols: Some(legacy),
+                ..ScannerConfig::default()
+            };
+            let mut app = GuiApp::new(ScannerConfigs::Single(Box::new(config)));
+            assert_eq!(app.http_enabled, !(disabled || legacy));
+            assert_eq!(
+                app.to_config().no_http,
+                (disabled || legacy).then_some(true)
+            );
+            app.http_enabled = !app.http_enabled;
+            assert_eq!(app.to_config().no_http, (!app.http_enabled).then_some(true));
+        }
+    }
+
+    #[test]
+    fn ads_toggle_roundtrips_and_honors_legacy_disable() {
+        for (disabled, legacy) in [(false, false), (true, false), (false, true)] {
+            let config = ScannerConfig {
+                no_ads: Some(disabled),
+                no_protocols: Some(legacy),
+                ..ScannerConfig::default()
+            };
+            let mut app = GuiApp::new(ScannerConfigs::Single(Box::new(config)));
+            assert_eq!(app.ads_enabled, !(disabled || legacy));
+            assert_eq!(app.to_config().no_ads, (disabled || legacy).then_some(true));
+            app.ads_enabled = !app.ads_enabled;
+            assert_eq!(app.to_config().no_ads, (!app.ads_enabled).then_some(true));
         }
     }
 

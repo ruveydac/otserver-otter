@@ -8,11 +8,13 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+mod ads;
 mod bacnet;
 mod dnp3;
 mod enip;
 mod fins;
 mod fox;
+mod http;
 mod iec61850;
 mod netbios;
 mod ntlm;
@@ -22,6 +24,7 @@ mod s7;
 mod smb;
 mod smb1;
 
+pub use ads::ProbeSettings as AdsSettings;
 pub use opcua::{
     Credential as OpcuaCredential, Credentials as OpcuaCredentials, ProbeSettings as OpcuaSettings,
 };
@@ -49,7 +52,9 @@ pub struct Selection {
     pub netbios: bool,
     pub smb: bool,
     pub rpc: bool,
+    pub http: bool,
     pub opcua: bool,
+    pub ads: bool,
 }
 
 impl Selection {
@@ -64,7 +69,9 @@ impl Selection {
             || self.netbios
             || self.smb
             || self.rpc
+            || self.http
             || self.opcua
+            || self.ads
     }
 
     pub fn labels(self) -> Vec<&'static str> {
@@ -79,7 +86,10 @@ impl Selection {
             (self.netbios, "NetBIOS"),
             (self.smb, "SMB"),
             (self.rpc, "RPC"),
+            (self.http, "HTTP"),
+            (self.http, "HTTPS"),
             (self.opcua, "OPC UA"),
+            (self.ads, "Beckhoff ADS"),
         ]
         .into_iter()
         .filter_map(|(enabled, label)| enabled.then_some(label))
@@ -100,11 +110,14 @@ impl Default for Selection {
             netbios: true,
             smb: true,
             rpc: true,
+            http: true,
             opcua: true,
+            ads: true,
         }
     }
 }
 
+#[derive(Clone)]
 struct Finding {
     source: Source,
     fields: BTreeMap<String, Value>,
@@ -119,7 +132,15 @@ pub async fn scan(
     selection: Selection,
     opcua: &opcua::ProbeSettings,
 ) -> ProbeResult {
-    scan_with_cancellation(target, mac, selection, opcua, &AtomicBool::new(false)).await
+    scan_with_cancellation(
+        target,
+        mac,
+        selection,
+        opcua,
+        &AdsSettings::default(),
+        &AtomicBool::new(false),
+    )
+    .await
 }
 
 pub async fn scan_with_cancellation(
@@ -127,6 +148,7 @@ pub async fn scan_with_cancellation(
     mac: Option<&str>,
     selection: Selection,
     opcua: &opcua::ProbeSettings,
+    ads_settings: &AdsSettings,
     cancelled: &AtomicBool,
 ) -> ProbeResult {
     if selection.any() {
@@ -161,6 +183,28 @@ pub async fn scan_with_cancellation(
                 10,
                 probe_if(selection.opcua, opcua::probe(target, opcua)),
                 &completed
+            ),
+            collect_probe(
+                11,
+                probe_if(selection.http, http::probe(target, 80, false)),
+                &completed
+            ),
+            collect_probe(
+                12,
+                probe_if(selection.http, http::probe(target, 443, true)),
+                &completed
+            ),
+            collect_probe(
+                13,
+                async {
+                    let checkpoint = |finding| store_probe_result(13, Ok(finding), &completed);
+                    probe_if(
+                        selection.ads,
+                        ads::probe(target, ads_settings, cancelled, checkpoint),
+                    )
+                    .await
+                },
+                &completed,
             ),
         );
     };
@@ -213,6 +257,9 @@ pub async fn scan_with_cancellation(
         (selection.smb, Source::OsFingerprint, "smb", smb),
         (selection.rpc, Source::OsFingerprint, "rpc", rpc),
         (selection.opcua, Source::OpcUa, "opc-ua", ua),
+        (selection.http, Source::Unknown, "http", take(11)),
+        (selection.http, Source::Unknown, "https", take(12)),
+        (selection.ads, Source::BeckhoffAds, "beckhoff-ads", take(13)),
     ];
     for (enabled, source, protocol, result) in results {
         if !enabled {
@@ -222,6 +269,9 @@ pub async fn scan_with_cancellation(
         outcome_protocols.push(protocol);
         match result {
             Ok(Some(mut finding)) => {
+                if cancelled.load(Ordering::Relaxed) && finding.source == Source::BeckhoffAds {
+                    ads::mark_cancelled(&mut finding);
+                }
                 let observed_at = crate::now();
                 finding
                     .fields
@@ -315,11 +365,22 @@ async fn collect_probe(
     probe: impl Future<Output = Result<Option<Finding>, String>>,
     completed: &CompletedProbes,
 ) {
-    let result = probe.await;
-    completed
+    store_probe_result(index, probe.await, completed);
+}
+
+fn store_probe_result(
+    index: usize,
+    result: Result<Option<Finding>, String>,
+    completed: &CompletedProbes,
+) {
+    let mut completed = completed
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push((index, result));
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, current)) = completed.iter_mut().find(|(key, _)| *key == index) {
+        *current = result;
+    } else {
+        completed.push((index, result));
+    }
 }
 
 async fn probe_if(
@@ -364,6 +425,8 @@ mod tests {
             netbios: !cfg!(windows),
             smb: !cfg!(windows),
             rpc: !cfg!(windows),
+            http: false,
+            ads: false,
             ..Selection::default()
         }
     }
@@ -404,7 +467,9 @@ mod tests {
             netbios: false,
             smb: false,
             rpc: false,
+            http: false,
             opcua: false,
+            ads: false,
         };
         assert!(!selection.any());
         assert!(selection.labels().is_empty());
@@ -451,11 +516,21 @@ mod tests {
             netbios: false,
             smb: false,
             rpc: false,
+            http: false,
             opcua: false,
+            ads: false,
         };
         let settings = opcua::ProbeSettings::default();
+        let ads_settings = AdsSettings::default();
         let (result, ()) = tokio::join!(
-            scan_with_cancellation(Ipv4Addr::LOCALHOST, None, selection, &settings, &cancelled),
+            scan_with_cancellation(
+                Ipv4Addr::LOCALHOST,
+                None,
+                selection,
+                &settings,
+                &ads_settings,
+                &cancelled,
+            ),
             responder
         );
         assert_eq!(result.observations.len(), 1);
@@ -466,6 +541,117 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("cancelled"))
         );
+    }
+
+    #[tokio::test]
+    async fn ads_cancellation_retains_completed_device_info_before_state_reply() {
+        let _network = crate::network_test_lock().await;
+        const TCP_PORT: u16 = 48_898;
+        const UDP_PORT: u16 = 48_899;
+        const COOKIE: u32 = 0x7114_6603;
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, UDP_PORT))
+            .await
+            .unwrap();
+        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, TCP_PORT))
+            .await
+            .unwrap();
+        let cancelled = AtomicBool::new(false);
+        let responder_cancelled = &cancelled;
+        let responder = async {
+            let mut request = [0; 24];
+            let (length, peer) = udp.recv_from(&mut request).await.unwrap();
+            assert_eq!(length, request.len());
+            let mut discovery = Vec::from(COOKIE.to_le_bytes());
+            discovery.extend(0_u32.to_le_bytes());
+            discovery.extend(0x8000_0001_u32.to_le_bytes());
+            discovery.extend([127, 0, 0, 1, 1, 1]);
+            discovery.extend(0_u16.to_le_bytes());
+            discovery.extend(0_u32.to_le_bytes());
+            udp.send_to(&discovery, peer).await.unwrap();
+
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            let mut prefix = [0; 6];
+            stream.read_exact(&mut prefix).await.unwrap();
+            let frame_length = u32::from_le_bytes(prefix[2..6].try_into().unwrap()) as usize;
+            let mut request = vec![0; frame_length];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(u16::from_le_bytes(request[16..18].try_into().unwrap()), 1);
+
+            let mut data = Vec::from(0_u32.to_le_bytes());
+            data.extend([3, 1]);
+            data.extend(4021_u16.to_le_bytes());
+            data.extend(b"Test PLC".iter().copied());
+            data.resize(24, 0);
+            let mut frame = prefix.to_vec();
+            frame.extend_from_slice(&request);
+            let response = ads_test_response(&frame, &data);
+            stream.write_all(&response).await.unwrap();
+
+            stream.read_exact(&mut prefix).await.unwrap();
+            let frame_length = u32::from_le_bytes(prefix[2..6].try_into().unwrap()) as usize;
+            let mut request = vec![0; frame_length];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(u16::from_le_bytes(request[16..18].try_into().unwrap()), 4);
+            responder_cancelled.store(true, Ordering::Relaxed);
+        };
+        let selection = Selection {
+            s7: false,
+            enip: false,
+            bacnet: false,
+            fins: false,
+            fox: false,
+            dnp3: false,
+            iec61850: false,
+            netbios: false,
+            smb: false,
+            rpc: false,
+            http: false,
+            opcua: false,
+            ads: true,
+        };
+        let settings = opcua::ProbeSettings::default();
+        let ads_settings = AdsSettings::from_config(None, &BTreeMap::new(), &[851]).unwrap();
+        let (result, ()) = tokio::join!(
+            scan_with_cancellation(
+                Ipv4Addr::LOCALHOST,
+                Some("00:11:22:33:44:55"),
+                selection,
+                &settings,
+                &ads_settings,
+                &cancelled,
+            ),
+            responder,
+        );
+        assert_eq!(result.observations.len(), 1);
+        let observation = &result.observations[0];
+        assert_eq!(observation.source, Source::BeckhoffAds);
+        assert_eq!(observation.fields["runtimeName"], "Test PLC");
+        assert_eq!(observation.fields["runtimeVersion"], "3.1.4021");
+        assert_eq!(observation.raw["runtimePrimaryAmsPort"], 851);
+        assert_eq!(observation.raw["collectionStatus"], "cancelled");
+        assert_eq!(
+            observation.raw["endpoints"][0]["readState"]["outcome"],
+            "cancelled"
+        );
+    }
+
+    fn ads_test_response(request: &[u8], data: &[u8]) -> Vec<u8> {
+        let request_header = &request[6..38];
+        let mut header = Vec::from(&request_header[8..14]);
+        header.extend_from_slice(&request_header[14..16]);
+        header.extend_from_slice(&request_header[..6]);
+        header.extend_from_slice(&request_header[6..8]);
+        header.extend_from_slice(&request_header[16..18]);
+        header.extend(5_u16.to_le_bytes());
+        header.extend((data.len() as u32).to_le_bytes());
+        header.extend(0_u32.to_le_bytes());
+        header.extend_from_slice(&request_header[28..32]);
+        let body_length = header.len() + data.len();
+        let mut frame = vec![0, 0];
+        frame.extend((body_length as u32).to_le_bytes());
+        frame.extend(header);
+        frame.extend_from_slice(data);
+        frame
     }
 
     #[tokio::test]

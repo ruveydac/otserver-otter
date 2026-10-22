@@ -4,6 +4,7 @@
 import asyncio
 import os
 import ssl
+import struct
 import sys
 
 
@@ -28,6 +29,113 @@ def fins_payload(sid: int) -> bytes:
 def fins_tcp_frame(command: int, payload: bytes) -> bytes:
     body = command.to_bytes(4, "big") + b"\0\0\0\0" + payload
     return b"FINS" + len(body).to_bytes(4, "big") + body
+
+
+ADS_TCP_PORT = 48898
+ADS_UDP_PORT = 48899
+ADS_COOKIE = 0x71146603
+ADS_NET_ID = bytes([172, 30, 0, 21, 1, 1])
+
+
+def ads_server_info_response(request: bytes) -> bytes:
+    if (
+        len(request) != 24
+        or int.from_bytes(request[:4], "little") != ADS_COOKIE
+        or int.from_bytes(request[4:8], "little") != 0
+        or int.from_bytes(request[8:12], "little") != 1
+        or request[12:24] != bytes(12)
+    ):
+        raise ValueError("invalid ADS ServerInfo request")
+    return (
+        struct.pack("<III", ADS_COOKIE, 0, 0x80000001)
+        + ADS_NET_ID
+        + struct.pack("<HI", 0, 0)
+    )
+
+
+class AdsUdp(asyncio.DatagramProtocol):
+    def connection_made(self, transport: asyncio.DatagramTransport) -> None:
+        self.transport = transport
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        try:
+            response = ads_server_info_response(data)
+        except ValueError:
+            return
+        self.transport.sendto(response, addr)
+
+
+async def read_ams_frame(reader: asyncio.StreamReader) -> bytes:
+    prefix = await reader.readexactly(6)
+    if prefix[:2] != b"\0\0":
+        raise ValueError("invalid AMS/TCP prefix")
+    length = int.from_bytes(prefix[2:6], "little")
+    if length < 32 or length > 4096:
+        raise ValueError("invalid AMS frame length")
+    return prefix + await reader.readexactly(length)
+
+
+def ads_response(request: bytes) -> bytes:
+    if len(request) < 38:
+        raise ValueError("truncated AMS request")
+    header = request[6:38]
+    target_net_id = header[:6]
+    target_port = int.from_bytes(header[6:8], "little")
+    source_net_id = header[8:14]
+    source_port = int.from_bytes(header[14:16], "little")
+    command = int.from_bytes(header[16:18], "little")
+    flags = int.from_bytes(header[18:20], "little")
+    data_length = int.from_bytes(header[20:24], "little")
+    invoke_id = int.from_bytes(header[28:32], "little")
+    assert target_net_id == ADS_NET_ID and target_port in (10000, 851, 801)
+    assert source_net_id[4:] == b"\x01\x01" and source_port == 32768
+    assert flags == 4 and data_length == 0 and len(request) == 38
+    if command == 1:
+        name = b"OT-LAB TwinCAT3".ljust(16, b"\0")
+        data = struct.pack("<I", 0) + bytes([3, 1]) + struct.pack("<H", 4021) + name
+    elif command == 4:
+        data = struct.pack("<IHH", 0, 5, 0)
+    else:
+        raise ValueError(f"unexpected ADS command {command}")
+    response_header = (
+        source_net_id
+        + source_port.to_bytes(2, "little")
+        + target_net_id
+        + target_port.to_bytes(2, "little")
+        + command.to_bytes(2, "little")
+        + (5).to_bytes(2, "little")
+        + len(data).to_bytes(4, "little")
+        + (0).to_bytes(4, "little")
+        + invoke_id.to_bytes(4, "little")
+    )
+    body = response_header + data
+    return b"\0\0" + len(body).to_bytes(4, "little") + body
+
+
+async def handle_ads(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        while True:
+            request = await read_ams_frame(reader)
+            writer.write(ads_response(request))
+            await writer.drain()
+    except (asyncio.IncompleteReadError, ConnectionError, ValueError, AssertionError):
+        pass
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def run_ads() -> None:
+    loop = asyncio.get_running_loop()
+    udp, _ = await loop.create_datagram_endpoint(
+        AdsUdp, local_addr=("0.0.0.0", ADS_UDP_PORT)
+    )
+    tcp = await asyncio.start_server(handle_ads, "0.0.0.0", ADS_TCP_PORT)
+    try:
+        async with tcp:
+            await tcp.serve_forever()
+    finally:
+        udp.close()
 
 
 async def read_fins_frame(reader: asyncio.StreamReader) -> bytes:
@@ -130,8 +238,29 @@ async def run_fox() -> None:
     context.load_cert_chain("/lab.crt", "/lab.key")
     plain = await asyncio.start_server(handle_fox, "0.0.0.0", 1911)
     tls = await asyncio.start_server(handle_fox, "0.0.0.0", 4911, ssl=context)
-    async with plain, tls:
-        await asyncio.gather(plain.serve_forever(), tls.serve_forever())
+    http = await asyncio.start_server(handle_http, "0.0.0.0", 80)
+    https = await asyncio.start_server(handle_http, "0.0.0.0", 443, ssl=context)
+    async with plain, tls, http, https:
+        await asyncio.gather(*(server.serve_forever() for server in (plain, tls, http, https)))
+
+
+async def handle_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        request = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 2)
+        assert request.startswith(b"GET / HTTP/1.1\r\n"), request
+        assert b"authorization:" not in request.lower(), request
+        tls = writer.get_extra_info("ssl_object") is not None
+        status = b"503 Service Unavailable" if tls else b"200 OK"
+        body = b"<html><head><TITLE>Niagara &amp; Web Panel</TITLE></head></html>"
+        writer.write(b"HTTP/1.1 " + status + b"\r\nServer: OT-Lab-Web/1.0\r\n"
+                     b"Content-Type: text/html\r\nConnection: close\r\nContent-Length: "
+                     + str(len(body)).encode() + b"\r\n\r\n" + body)
+        await writer.drain()
+    except (asyncio.IncompleteReadError, ConnectionError, TimeoutError):
+        pass
+    finally:
+        writer.close()
+        await writer.wait_closed()
 
 
 DNP3_ADDRESS = 1
@@ -298,6 +427,22 @@ def self_test() -> None:
     assert len(tcp) == 122 and tcp[:4] == b"FINS"
     assert tcp[16] == 0xC0 and tcp[25:30] == b"\x05\x05\x01\0\0"
     assert FOX_RESPONSE.startswith(b"fox a 0") and FOX_RESPONSE.endswith(b"};;\n")
+    server_info = struct.pack("<III", ADS_COOKIE, 0, 1) + bytes(12)
+    assert ads_server_info_response(server_info)[12:18] == ADS_NET_ID
+    request_header = (
+        ADS_NET_ID
+        + (851).to_bytes(2, "little")
+        + bytes([172, 30, 0, 2, 1, 1])
+        + (32768).to_bytes(2, "little")
+        + (1).to_bytes(2, "little")
+        + (4).to_bytes(2, "little")
+        + bytes(8)
+        + (9).to_bytes(4, "little")
+    )
+    ads_reply = ads_response(b"\0\0" + (32).to_bytes(4, "little") + request_header)
+    assert int.from_bytes(ads_reply[22:24], "little") == 1
+    assert ads_reply[38:42] == bytes(4)
+    assert ads_reply[42:46] == bytes([3, 1, 0xB5, 0x0F])
 
     # Published opendnp3 link vectors, then the scanner's pipelined cold start.
     assert dnp3_frame(0xC0, 1, 1024) == bytes.fromhex("056405C001000004E921")
@@ -328,5 +473,7 @@ if __name__ == "__main__":
         asyncio.run(run_fox())
     elif mode == "dnp3":
         asyncio.run(run_dnp3())
+    elif mode == "ads":
+        asyncio.run(run_ads())
     else:
-        raise SystemExit("usage: responders.py {fins|fox|dnp3|self-test}")
+        raise SystemExit("usage: responders.py {fins|fox|dnp3|ads|self-test}")

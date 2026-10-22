@@ -8,8 +8,10 @@ contract, or safety boundary.
 OTserver Otter is a read-only Rust discovery CLI and GUI for Windows and Linux. It discovers OT
 assets with native ARP, PROFINET DCP Identify and PNIO I&M record reads (EPM endpoint mapping,
 bounded read requests, and DCE/RPC fragmentation/FACK handling), S7 identity, EtherNet/IP List
-Identity, BACnet ReadProperty, Omron FINS identity, Niagara Fox hello, DNP3 Group 0 device
-attributes, NetBIOS Node Status, SMB1/2/3 and RPC NTLM challenge identity, OPC UA asset discovery,
+Identity, BACnet ReadProperty, Omron FINS identity, Beckhoff ADS/AMS ServerInfo and bounded
+ReadDeviceInfo/ReadState requests, Niagara Fox hello, DNP3 Group 0 device attributes, NetBIOS Node
+Status, SMB1/2/3 and RPC NTLM challenge identity, OPC UA asset discovery,
+HTTP/HTTPS status/title/Server-header collection,
 SNMP GET/WALK, and LLDP. It exports
 `otserver-scan` schema-version-2 JSON for OTserver.
 
@@ -32,6 +34,17 @@ instructions are in `README.md`; detailed operator and development guidance foll
   Modbus requests without an explicit product decision and safety review.
 - Keep protocol framing and parsing in `src/protocols/` or the existing dedicated modules. Reject
   truncated, oversized, mismatched, or unsolicited responses.
+- Beckhoff ADS sends one unicast ServerInfo request to UDP 48899 and only `ReadDeviceInfo` and
+  `ReadState` ADS commands over TCP 48898 to selected AMS ports. Validate the ServerInfo cookie,
+  service, tags and response size, and each AMS response's reversed NetIDs/ports, command, flags,
+  invoke ID, and declared lengths. Never send ADS commands other than `ReadDeviceInfo` and
+  `ReadState`; no writes, symbol/process-image reads, notifications, or system-service operations.
+  Never create routes or infer a target NetID from its
+  IPv4 address. An explicitly configured target NetID is an operator assertion; otherwise skip ADS
+  TCP reads if UDP discovery fails. Targets may require a pre-existing authorized AMS route. Keep
+  ADS runtime identity/state separate from hardware model, serial, firmware, and online status.
+  Do not negotiate Secure ADS, downgrade security, or try alternate secure ports. `--no-ads`,
+  `noAds`, the GUI toggle and legacy `noProtocols` disable this probe.
 - PNIO record replies may use the advertised endpoint port or EPM port 34964 as their UDP source.
   In either case, require the target MAC/IP, client UDP port, and matching RPC object, interface,
   activity, sequence, and operation before accepting or acknowledging fragments.
@@ -50,6 +63,13 @@ instructions are in `README.md`; detailed operator and development guidance foll
 - NetBIOS uses one unicast wildcard NBSTAT query to UDP 137. Keep the reported UNIT_ID as raw
   evidence, never as an override for ARP/DCP identity or a way to resolve MAC-less targets.
   It is enabled by default; `--no-netbios`, `noNetbios`, and the GUI toggle disable it.
+- HTTP/HTTPS discovery sends one paced `GET /` to TCP 80 and 443 respectively, without proxies,
+  redirects, authentication, cookies, or retries. HTTPS discovery always disables certificate and
+  hostname validation. Bound each request to two seconds and body collection to 64 KiB; retain
+  status and Server-header evidence on body failure. Export listener-scoped `raw.protocol`,
+  `raw.statusCode`, `raw.title`, and `raw.server` under the existing `unknown` source. Never promote
+  a title or server banner to device identity, OS, or firmware. `--no-http`, `noHttp`, the GUI toggle,
+  and legacy `noProtocols` disable both listeners. Upload/controller TLS settings remain independent.
 - SMB uses TCP 445, SMB2/3 negotiation and only the first NTLM SESSION_SETUP; RPC uses TCP 135
   and one EPM bind carrying NTLM Type 1. Never send NTLM Type 3/AUTH3, authenticate, enumerate
   shares/endpoints, activate DCOM, or execute WMI/WinRM commands in these probes. Both are enabled
@@ -183,8 +203,16 @@ and never persist the token or managed protocol credentials.
 
 All discovery protocols are enabled by default. CLI `--no-<protocol>` switches and JSON `noArp`,
 `noProfinet`, `noS7`, `noEnip`, `noBacnet`, `noFins`, `noFox`, `noDnp3`, `noIec61850`, `noNetbios`,
-`noSmb`, `noRpc`, `noOpcua`, `noSnmp`, and `noLldp` disable them individually. SNMP inventory and LLDP
-topology share credentials but have independent switches. The GUI exposes matching toggles.
+`noSmb`, `noRpc`, `noHttp`, `noAds`, `noOpcua`, `noSnmp`, and `noLldp` disable them individually.
+SNMP inventory and LLDP topology share credentials but have independent switches. The GUI exposes
+matching toggles.
+
+ADS discovery uses `adsTargetNetIds` to map target IPv4 strings to their six-octet AMS NetIDs when
+UDP ServerInfo is unavailable, `adsSourceNetId` to override the scanner NetID derived from the local
+connection address, and `adsPorts` to select up to eight logical AMS endpoints. Empty or omitted
+`adsPorts` queries the system service and the first TwinCAT 3/TwinCAT 2 PLC runtimes. AMS ports are
+not TCP ports. CLI options `--ads-target-netid IP=NETID`, `--ads-source-net-id NETID`, and repeated
+`--ads-port PORT` override their respective config values.
 
 ### SNMP and OPC UA credentials
 
@@ -387,8 +415,10 @@ Validate actual Windows releases separately with their firewall and NTLM policie
 
 The lab checks three allowlisted CIP reads against OpENer, typed DNP3/configuration evidence,
 SNMP ENTITY-MIB UUID/URI and remote LLDP-MED scoping, OPC UA application/device version separation,
-and retention of UDP FINS identity after a malformed TCP response. Passive LLDP frames are injected
-in the scanner's isolated network namespace because Linux bridges suppress reserved LLDP multicast;
+and retention of UDP FINS identity after a malformed TCP response. The Fox lab device also serves
+HTTP/HTTPS, checking status/title/Server-header evidence, invalid certificate acceptance,
+disablement, and MAC-less endpoint scoping. Passive LLDP frames are injected in the scanner's
+isolated network namespace because Linux bridges suppress reserved LLDP multicast;
 this exercises AF_PACKET reception/decoding, not physical switch forwarding or Windows capture.
 The scanner lab Docker build uses BuildKit registry/target caches for repeatable incremental builds.
 
