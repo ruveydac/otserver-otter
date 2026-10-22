@@ -482,3 +482,8 @@ require this exact-pair gate.
 On Windows, the Fox TLS retry test requires a process context that can acquire Schannel outbound
 credentials. A restricted sandbox may return `SEC_E_NO_CREDENTIALS` before sending ClientHello;
 verify that failure in a normal user context rather than weakening or skipping the test.
+
+The HTTPS loopback test uses the public, test-only PKCS#12 identity in `src/protocols/fixtures/`;
+regeneration instructions are alongside it. Windows GNU test binaries can also run under Wine on
+Linux, but Wine 11 does not preserve protected file DACLs. Validate the controller ACL test on
+native Windows; do not relax its security assertions to make Wine pass.

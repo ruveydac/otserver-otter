@@ -178,56 +178,9 @@ mod tests {
 
     #[tokio::test]
     async fn https_accepts_untrusted_certificate_with_wrong_hostname() {
-        let identity = native_tls::Identity::from_pkcs8(
-            b"-----BEGIN CERTIFICATE-----
-MIIDETCCAfmgAwIBAgIUaI45fMisED+mWzXzJpmQgpUDltcwDQYJKoZIhvcNAQEL
-BQAwGDEWMBQGA1UEAwwNd3JvbmcuZXhhbXBsZTAeFw0yNjEwMjEyMDM0MzFaFw0y
-NjEwMjIyMDM0MzFaMBgxFjAUBgNVBAMMDXdyb25nLmV4YW1wbGUwggEiMA0GCSqG
-SIb3DQEBAQUAA4IBDwAwggEKAoIBAQDBjnfA0yfAONcj04tRa2PpWyJEQWLDnFuZ
-jZajCRVXVqTJfytYwh0betIMJEX7IDXbjELkQs5eKP5FygNh2pO+c9KGF69v1HlA
-UNJBlEGgbsxp4Clwfso9OOvtHD8sDJ63KSP1+2jQ6QvbSM3d3NNpPPPG+uzo0oMd
-ez+mdjMh1tezbeXkBaqJ1NXpqFn8ItRtWRSyTuimqZf1dpVproWq/OWPxyi2ML55
-ZhzXUd0t5hwgsGJ3nqeuNiuQ6r6agz2/tB/y2QA0lNe7CXawSaU7SiEidtJeClnL
-XVEgv1PIFcJPGHW2asnYeW5AR/thR/nZZMK8tprdYc0q51RKFc2vAgMBAAGjUzBR
-MB0GA1UdDgQWBBTXRf1TPbEOfXtuvmuYynwMzOxkojAfBgNVHSMEGDAWgBTXRf1T
-PbEOfXtuvmuYynwMzOxkojAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUA
-A4IBAQASSg6Qg6Z2x0GyYb/xA9UWi9u4M8CWaogqZIsgxZK9z56oOdpT7BZQlPwl
-BT47K9t8c9vTLvscJnUa2N08pqwOAXR3MwcdfqwqXl7qTovqSdKQ6RCEDlbn1zz7
-ZiTPQ4QAa+d2At9GXzdYlMWfpQUiye5DQKoI8sPFccLol/uhWFdUbZES1SWUb4ei
-abicFkYCa98dGKaW1riYbn8xtx+YUJhcvhWaCbLwkeJkNeg0cAIMyPVtpIez8zHx
-+G5SRurnR1WXSWLQncr/StcslD8lQOVqnCRkzJchasK1Hn5tXEQDKhj5RUYFdvzM
-Rn6qZEtPslPCwCbQxFU2RvHgSyev
------END CERTIFICATE-----",
-            b"-----BEGIN PRIVATE KEY-----
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDBjnfA0yfAONcj
-04tRa2PpWyJEQWLDnFuZjZajCRVXVqTJfytYwh0betIMJEX7IDXbjELkQs5eKP5F
-ygNh2pO+c9KGF69v1HlAUNJBlEGgbsxp4Clwfso9OOvtHD8sDJ63KSP1+2jQ6Qvb
-SM3d3NNpPPPG+uzo0oMdez+mdjMh1tezbeXkBaqJ1NXpqFn8ItRtWRSyTuimqZf1
-dpVproWq/OWPxyi2ML55ZhzXUd0t5hwgsGJ3nqeuNiuQ6r6agz2/tB/y2QA0lNe7
-CXawSaU7SiEidtJeClnLXVEgv1PIFcJPGHW2asnYeW5AR/thR/nZZMK8tprdYc0q
-51RKFc2vAgMBAAECggEAAanrLER5t6nwFNDBW9Ej1LesfbsKJvWgcUYe9gZ39n46
-Kw6QHX0y/tokFWf3v1wxhPzu/kNMvtEfY74uypffDpNe9eQc5UXa8ks/jhdre6ji
-0kN+V7HfTyi+w7+rE1fbGBFJy9gouH2oVRmKcM5wdXEer1Es2Xt7Fl/JgPF3KGKf
-4tdrriDInP/sfkEnL9yybn/JAbt44O/y25kADfFxZjpWmcFM50JAhB18hBmgN7YK
-6ePJx0tD5AMqpfP32yk8uMzt+LLG9lXBaXB9q+QW1xXDML1IdFwLc6E62IrUWbqI
-Een/TeOtJ9dK/kcSJ2osSlJqouWwR+vJcdjrJk2CEQKBgQDi+ppIPlDvTKd+FrDM
-YjsRl/VAxjAmcaq/Lsu4xU80snW+zkRn4UZUGh7RVJhWlXCGz25634flbqJo5o/A
-qSU61feZF9lzkDdUohzuI2rQWWMqUorMdUQLjp61zMWTlruL469mTFtRgJEVwCyU
-v81zJB0dDmnVe6bVmsSIFKS66wKBgQDaTeTzSWVSg4W8BbjKo/SnoS67TIvZWUcL
-Rfl8en1OFz75RQot8hShCnLv5vCFFEBIF/t3T4Kt+bgeQY35y020bfwZqBBdyLJ0
-nkUZMOE51wZYviKedbn4WE6ZT5QoKCpvx3qvH/7wOznD8WJmaPrPzJbjy9eYuKYM
-VJdJYa1/TQKBgGdPEsvQ+TuB0zZTk5LjHumKFYmu6xmEYOf1n6nwvHVKyMbY0U/K
-vBzpap9ydofqKrZhUXLBrPPjYC6IymMxWY2m97QJo+KygEyYILzPB/3ewYDw4tXe
-heMQvfIXStI7KA+qyRmxpVq6Ps78kg3+Ir/Gby3bcpZFWpEciVk6tCOTAoGBAI12
-7setJ0iqTC6EsrQ2PSOnsqXTO8j0LrKifMLqiWria3+S+r69Yhrdr4/A4toKPoG5
-cM5nKvLcoTCSIJPf6BHlN/nUTA7KMMKbkYF6iGk36zf0tnBjL8k8SGrXA9Zl+OII
-rXrwy/8XEh7kvHRK0UV5ecpSXPrtpUTWSFdYQdr9AoGBAJ1idvo4vQ68kvNu/S6z
-I4AuOvPRgb+pZb0iXjzCSmvpBIGu/BDArq8YIVTwtmNfI3aJtfiWbng0+VQGtBE+
-8THUTv7uQKRnjfygWX6iaIXCqVdvvm+FWLovdpm7hefCNWcUJtXHnTM0O1H9laK/
-pDon0C2DRskV0xL08aDWMDQi
------END PRIVATE KEY-----",
-        )
-        .unwrap();
+        let identity =
+            native_tls::Identity::from_pkcs12(include_bytes!("fixtures/https-identity.p12"), "")
+                .unwrap();
         let acceptor =
             tokio_native_tls::TlsAcceptor::from(native_tls::TlsAcceptor::new(identity).unwrap());
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();

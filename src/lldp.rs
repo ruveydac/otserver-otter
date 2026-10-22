@@ -478,7 +478,7 @@ mod tests {
                 .unwrap()
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("not found"))
+                .any(|warning| warning.starts_with("Passive LLDP capture:"))
         );
     }
 
