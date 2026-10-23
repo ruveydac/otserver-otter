@@ -227,11 +227,23 @@ mod tests {
         let number = listener.local_addr().unwrap().port();
         drop(listener);
 
-        assert!(
-            probe(Ipv4Addr::LOCALHOST, number, false)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        // Windows may reach the request deadline before reporting connection refusal.
+        match probe(Ipv4Addr::LOCALHOST, number, false).await {
+            Ok(finding) => assert!(finding.is_none()),
+            Err(error) => assert!(super::super::timed_out(&error), "{error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn silent_listener_retains_timeout_diagnostic() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let number = listener.local_addr().unwrap().port();
+
+        let result = probe(Ipv4Addr::LOCALHOST, number, false).await;
+        drop(listener);
+
+        let error = result.err().expect("silent listener must time out");
+        assert!(super::super::timed_out(&error), "{error}");
+        assert!(error.contains(&format!("TCP port {number}")), "{error}");
     }
 }
