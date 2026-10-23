@@ -61,6 +61,28 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
         {
             match cip_reads(target).await {
                 Ok(records) => {
+                    for record in &records {
+                        let outcome = record["outcome"].as_str().unwrap_or("unknown");
+                        if outcome != "success" {
+                            let service = record["service"].as_u64().unwrap_or_default();
+                            let class = record["class"].as_u64().unwrap_or_default();
+                            let attribute = record["attribute"]
+                                .as_u64()
+                                .map(|value| format!(", attribute {value}"))
+                                .unwrap_or_default();
+                            let status = record["status"]
+                                .as_u64()
+                                .map(|value| format!(", status 0x{value:02X}"))
+                                .unwrap_or_default();
+                            let detail = record["detail"]
+                                .as_str()
+                                .map(|value| format!(": {value}"))
+                                .unwrap_or_default();
+                            warnings.push(format!(
+                                "EtherNet/IP CIP service 0x{service:02X} class 0x{class:02X}{attribute} returned {outcome}{status}{detail}."
+                            ));
+                        }
+                    }
                     if let Some(identity) = records.first().and_then(|record| record.get("value")) {
                         for key in [
                             "vendorId",
@@ -132,7 +154,9 @@ async fn tcp(target: Ipv4Addr, request: &[u8]) -> Result<Option<Vec<u8>>, String
     crate::traffic::wait().await;
     let mut stream = match timeout(TIMEOUT, TcpStream::connect(address)).await {
         Ok(Ok(stream)) => stream,
-        Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => return Ok(None),
+        Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => {
+            return Err("TCP connection refused on port 44818".into());
+        }
         Ok(Err(error)) => return Err(error.to_string()),
         Err(_) => return Ok(None),
     };
@@ -183,7 +207,9 @@ async fn udp(target: Ipv4Addr, request: &[u8]) -> Result<Option<Vec<u8>>, String
                 }
                 rejected = true;
             }
-            Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => return Ok(None),
+            Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => {
+                return Err("UDP port 44818 returned connection refused".into());
+            }
             Ok(Err(error)) => return Err(error.to_string()),
             Err(_) => {
                 return if rejected {

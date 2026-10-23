@@ -23,7 +23,8 @@ static CLIENT: LazyLock<Result<Client, reqwest::Error>> = LazyLock::new(|| {
 });
 
 pub async fn probe(target: Ipv4Addr, number: u16, tls: bool) -> Result<Option<Finding>, String> {
-    let protocol = if tls { "https" } else { "http" };
+    let source = if tls { Source::Https } else { Source::Http };
+    let protocol = source.label();
     let client = CLIENT
         .as_ref()
         .map_err(|_| "HTTP discovery client initialization failed".to_string())?;
@@ -36,10 +37,15 @@ pub async fn probe(target: Ipv4Addr, number: u16, tls: bool) -> Result<Option<Fi
         .await
     {
         Ok(response) => response,
-        Err(error) if error.is_connect() || error.is_timeout() => return Ok(None),
-        Err(_) => {
+        Err(error) if error.is_timeout() => {
             return Err(format!(
-                "HTTP discovery {target}:{number}: invalid response"
+                "{protocol} request to TCP port {number} timed out: {error}"
+            ));
+        }
+        Err(error) if error.is_connect() => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "{protocol} request to {target}:{number} failed before an HTTP response: {error}"
             ));
         }
     };
@@ -79,10 +85,10 @@ pub async fn probe(target: Ipv4Addr, number: u16, tls: bool) -> Result<Option<Fi
         "server": server,
     });
     Ok(Some(Finding {
-        source: Source::Unknown,
+        source,
         fields: BTreeMap::from([("protocols".into(), json!([protocol]))]),
         raw: raw.clone(),
-        ports: vec![port("tcp", number, Source::Unknown, raw)],
+        ports: vec![port("tcp", number, source, raw)],
         warnings,
     }))
 }
@@ -147,6 +153,11 @@ mod tests {
             );
             assert_eq!(finding.raw["title"], "Device & UI");
             assert_eq!(finding.raw["server"], "Embedded/1.2");
+            assert_eq!(finding.source, Source::Http);
+            assert_eq!(serde_json::to_value(finding.source).unwrap(), "http");
+            assert_eq!(finding.fields["protocols"], json!(["http"]));
+            assert_eq!(finding.raw["protocol"], "http");
+            assert_eq!(finding.ports[0].source, "http");
             assert_eq!(finding.ports[0].key, format!("tcp:{number}"));
             assert!(finding.warnings.is_empty());
             task.await.unwrap();
@@ -198,11 +209,41 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(finding.raw["protocol"], "https");
+        assert_eq!(finding.source, Source::Https);
+        assert_eq!(serde_json::to_value(finding.source).unwrap(), "https");
+        assert_eq!(finding.fields["protocols"], json!(["https"]));
+        assert_eq!(finding.ports[0].source, "https");
         assert_eq!(finding.raw["statusCode"], 503);
         assert_eq!(finding.raw["title"], "TLS Panel");
         assert_eq!(finding.raw["server"], "TLS Device");
         assert_eq!(finding.raw["certificateValidation"], false);
         assert!(finding.warnings.is_empty());
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_tcp_port_is_no_response() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let number = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        // Windows may reach the request deadline before reporting connection refusal.
+        match probe(Ipv4Addr::LOCALHOST, number, false).await {
+            Ok(finding) => assert!(finding.is_none()),
+            Err(error) => assert!(super::super::timed_out(&error), "{error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn silent_listener_retains_timeout_diagnostic() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let number = listener.local_addr().unwrap().port();
+
+        let result = probe(Ipv4Addr::LOCALHOST, number, false).await;
+        drop(listener);
+
+        let error = result.err().expect("silent listener must time out");
+        assert!(super::super::timed_out(&error), "{error}");
+        assert!(error.contains(&format!("TCP port {number}")), "{error}");
     }
 }

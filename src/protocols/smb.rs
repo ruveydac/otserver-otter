@@ -220,7 +220,6 @@ fn session_identity(
 }
 
 enum Negotiation {
-    Absent,
     Closed,
     Response(TcpStream, Vec<u8>),
 }
@@ -228,31 +227,38 @@ enum Negotiation {
 pub(super) async fn exchange(target: Ipv4Addr, number: u16) -> Result<Option<Finding>, String> {
     let negotiated = tokio::time::timeout(TIMEOUT, async {
         crate::traffic::wait().await;
-        let Ok(mut stream) = TcpStream::connect((target, number)).await else {
-            return Ok::<_, String>(Negotiation::Absent);
-        };
+        let mut stream = TcpStream::connect((target, number))
+            .await
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::ConnectionRefused => {
+                    format!("connection refused on TCP port {number}")
+                }
+                _ => format!("TCP connection to port {number} failed: {error}"),
+            })?;
         send(&mut stream, &negotiate()).await?;
         let Some(response) = read_frame(&mut stream).await? else {
-            return Ok(Negotiation::Closed);
+            return Ok::<_, String>(Negotiation::Closed);
         };
         validate_header(&response, 0, 0)?;
-        Ok(Negotiation::Response(stream, response))
+        Ok::<_, String>(Negotiation::Response(stream, response))
     })
     .await;
     let (mut stream, response) = match negotiated {
         Ok(result) => match result? {
             Negotiation::Response(stream, response) => (stream, response),
             Negotiation::Closed => return super::smb1::exchange(target, number).await,
-            Negotiation::Absent => return Ok(None),
         },
-        Err(_) => return Ok(None),
+        Err(_) => return Err(format!("SMB negotiation on TCP port {number} timed out")),
     };
     if ntlm::u32le(&response, 8)? == 0xc000_00bb {
         drop(stream);
         return super::smb1::exchange(target, number).await;
     }
     if ntlm::u32le(&response, 8)? != 0 {
-        return Ok(None);
+        return Err(format!(
+            "SMB2 negotiate was rejected with NTSTATUS 0x{:08X}.",
+            ntlm::u32le(&response, 8)?
+        ));
     }
     if response.len() < 128 || ntlm::u16le(&response, 64)? != 65 {
         return Err("invalid SMB negotiate response".into());
@@ -574,8 +580,9 @@ mod tests {
         assert!(
             exchange(Ipv4Addr::LOCALHOST, number)
                 .await
+                .err()
                 .unwrap()
-                .is_none()
+                .contains("SMB negotiation on TCP port")
         );
         server.await.unwrap();
     }

@@ -67,7 +67,8 @@ instructions are in `README.md`; detailed operator and development guidance foll
   redirects, authentication, cookies, or retries. HTTPS discovery always disables certificate and
   hostname validation. Bound each request to two seconds and body collection to 64 KiB; retain
   status and Server-header evidence on body failure. Export listener-scoped `raw.protocol`,
-  `raw.statusCode`, `raw.title`, and `raw.server` under the existing `unknown` source. Never promote
+  `raw.statusCode`, `raw.title`, and `raw.server` under the matching `http` or `https` observation
+  and port source, with the same value in `fields.protocols`. Never promote
   a title or server banner to device identity, OS, or firmware. `--no-http`, `noHttp`, the GUI toggle,
   and legacy `noProtocols` disable both listeners. Upload/controller TLS settings remain independent.
 - SMB uses TCP 445, SMB2/3 negotiation and only the first NTLM SESSION_SETUP; RPC uses TCP 135
@@ -96,6 +97,15 @@ instructions are in `README.md`; detailed operator and development guidance foll
 - Credentials belong in executable-adjacent `otter.json`. Load legacy `otscanner.json` only when
   `otter.json` is absent. These local CLI/GUI flows must continue to work independently of managed
   `controller` mode. Never write credentials to logs or scan exports.
+- Format target-specific CLI/GUI probe diagnostics as one line beginning with `[ip=...]`, `[mac=...]`,
+  or both, followed by `[protocol] [time] OUTCOME code=... endpoint=... stage=...: detail`. Use
+  `SUCCESS`, `PARTIAL`, `NO_RESPONSE`, `FAIL`, and `CANCELLED`; use `INFO` for advisory details.
+  Include the actual configured endpoint and operation timeout. Layer-2 capture diagnostics identify
+  their broadcast/multicast destination MAC. A timeout or missing response is not evidence of bad
+  credentials, a wrong TSAP, or an offline device; report authentication failure only for an explicit
+  protocol/library result.
+  Preserve partial-read details, bound and escape diagnostic text, and never log credentials or raw
+  protocol payloads. Expected no-response outcomes alone do not make an export partial.
 - Controller v1 uses outbound HTTPS only (HTTP loopback for development), sensitive machine headers,
   and no redirects. Bare loopback addresses normalize to HTTP; other hosts require explicit HTTPS.
   Require local `--ack-authorized`; apply snapshots through the shared scan path.
@@ -348,7 +358,9 @@ to HTTP. Other hosts require explicit HTTPS. No scanner-side listener is opened.
 - DCP exports numeric `vendorId`/`deviceId` alongside full parsed blocks, plus `fields.vendor`
   resolved from the bundled manufacturer table (42 → `SIEMENS AG`). Unknown IDs omit `vendor`.
   EtherNet/IP preserves every valid List Identity transport response; S7 preserves accepted TSAP
-  access and both identity SZLs.
+  access and both identity SZLs. COTP acceptance alone must not end the bounded S7 TSAP search:
+  continue after failed S7 setup. Include the `0100` → `0200` source/destination pairing used by
+  `s7-info.nse`; source and destination connection-type bytes need not match.
   PNIO component references use `pnio:<api>:<slot>[:<subslot>]` and retain original records,
   containment, identification numbers, I&M revisions, and scoped serial claims.
 - DNP3 uses TCP 20000: link reset followed by Group 0 Variation 254 device-attribute Read with the

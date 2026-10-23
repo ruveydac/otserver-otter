@@ -115,8 +115,11 @@ fn string(bytes: &[u8], cursor: &mut usize, unicode: bool) -> Result<Option<Stri
 
 fn parse_negotiation(bytes: &[u8], number: u16) -> Result<Option<Finding>, String> {
     validate_header(bytes, 0x72, 0)?;
-    if ntlm::u32le(bytes, 5)? != 0 {
-        return Ok(None);
+    let status = ntlm::u32le(bytes, 5)?;
+    if status != 0 {
+        return Err(format!(
+            "SMB1 negotiate was rejected with NTSTATUS 0x{status:08X}."
+        ));
     }
     if bytes[32] == 1 && ntlm::u16le(bytes, 33)? == 0xffff {
         data(bytes, 1)?;

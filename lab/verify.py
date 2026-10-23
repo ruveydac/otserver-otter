@@ -30,17 +30,19 @@ DEVICES = {
 TARGETS = [f"172.30.0.{number}" for number in range(10, 20)] + ["172.30.0.21"]
 
 
-def run(*arguments: str) -> None:
+def run(*arguments: str, expected_status: int = 0) -> None:
     command = [SCANNER, *arguments]
     print("+", " ".join(command), flush=True)
-    subprocess.run(command, check=True)
+    result = subprocess.run(command)
+    if result.returncode != expected_status:
+        raise subprocess.CalledProcessError(result.returncode, command)
 
 
 def set_snmp(settings: dict) -> None:
     SCANNER_CONFIG.write_text(json.dumps({"snmp": settings}), encoding="utf-8")
 
 
-def scan(output: Path, targets: list[str], *flags: str) -> dict:
+def scan(output: Path, targets: list[str], *flags: str, expect_partial: bool = False) -> dict:
     arguments = ["scan"]
     for target in targets:
         arguments.extend(("--target", target))
@@ -56,7 +58,7 @@ def scan(output: Path, targets: list[str], *flags: str) -> dict:
             *flags,
         )
     )
-    run(*arguments)
+    run(*arguments, expected_status=2 if expect_partial else 0)
     run("validate", str(output))
     with output.open(encoding="utf-8") as source:
         result = json.load(source)
@@ -150,7 +152,9 @@ def assert_full(result: dict) -> None:
 
     s7 = observation(siemens, "s7")
     assert s7["fields"]["vendor"] == "Siemens"
-    assert s7["fields"]["model"] and s7["fields"]["firmwareVersion"]
+    assert s7["fields"]["model"]
+    assert s7["fields"]["firmwareVersion"] == "3.2.6"
+    assert s7["raw"]["fieldSources"]["firmwareVersion"]["record"] == 7
     assert s7["raw"]["accessPath"]["destinationTsap"]
 
     snmp = observation(siemens, "snmp")
@@ -382,7 +386,7 @@ def assert_web(observations: list[dict]) -> None:
     for item in observations:
         raw = item["raw"]
         tls = raw["protocol"] == "https"
-        assert item["source"] == "unknown" and item["warnings"] == []
+        assert item["source"] == raw["protocol"] and item["warnings"] == []
         assert raw["statusCode"] == (503 if tls else 200)
         assert raw["title"] == "Niagara & Web Panel"
         assert raw["server"] == "OT-Lab-Web/1.0"
@@ -623,7 +627,8 @@ def main() -> None:
     assert dnp3["raw"]["attributeRecords"][0]["dataType"] == 1
     partial_path = ARTIFACTS / f"fins-partial-{run_id}.otserver.json"
     partial_flags = [f"--no-{protocol}" for protocol in ("profinet", "s7", "enip", "bacnet", "fox", "dnp3", "iec61850", "opcua", "snmp", "lldp", "netbios", "smb", "rpc", "ads")]
-    partial = scan(partial_path, ["172.30.0.20"], *partial_flags)
+    partial = scan(partial_path, ["172.30.0.20"], *partial_flags, expect_partial=True)
+    assert partial["scan"]["partial"] is True
     fins = observation(by_mac(partial, "02:00:00:00:00:20"), "omron-fins")
     assert fins["fields"]["model"] == "CJ2M-CPU32" and fins["warnings"]
     assert fins["raw"]["transportResponses"][0]["transport"] == "udp"
