@@ -198,7 +198,14 @@
           "ipAddress": "192.0.2.2",
           "macAddress": "02:10:00:00:00:02",
           "fields": { "protocols": ["http"] },
-          "raw": { "protocol": "http", "port": 80, "tls": false, "statusCode": 200, "title": "Control panel", "server": "Embedded" },
+          "raw": {
+            "protocol": "http",
+            "port": 80,
+            "tls": false,
+            "statusCode": 200,
+            "title": "Control panel",
+            "server": "Embedded"
+          },
           "warnings": []
         },
         {
@@ -207,7 +214,15 @@
           "ipAddress": "192.0.2.2",
           "macAddress": "02:10:00:00:00:02",
           "fields": { "protocols": ["https"] },
-          "raw": { "protocol": "https", "port": 443, "tls": true, "certificateValidation": false, "statusCode": 200, "title": "Control panel", "server": "Embedded" },
+          "raw": {
+            "protocol": "https",
+            "port": 443,
+            "tls": true,
+            "certificateValidation": false,
+            "statusCode": 200,
+            "title": "Control panel",
+            "server": "Embedded"
+          },
           "warnings": []
         }
       ],

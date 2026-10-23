@@ -142,7 +142,7 @@ to query; these are not TCP ports.
 ```json
 {
   "targets": ["192.168.1.10"],
-  "adsTargetNetIds": {"192.168.1.10": "192.168.1.10.1.1"},
+  "adsTargetNetIds": { "192.168.1.10": "192.168.1.10.1.1" },
   "adsSourceNetId": "192.168.1.20.1.1",
   "adsPorts": [851, 801]
 }
