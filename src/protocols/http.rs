@@ -42,11 +42,7 @@ pub async fn probe(target: Ipv4Addr, number: u16, tls: bool) -> Result<Option<Fi
                 "{protocol} request to TCP port {number} timed out: {error}"
             ));
         }
-        Err(error) if error.is_connect() => {
-            return Err(format!(
-                "{protocol} connection to TCP port {number} failed: {error}"
-            ));
-        }
+        Err(error) if error.is_connect() => return Ok(None),
         Err(error) => {
             return Err(format!(
                 "{protocol} request to {target}:{number} failed before an HTTP response: {error}"
@@ -223,5 +219,19 @@ mod tests {
         assert_eq!(finding.raw["certificateValidation"], false);
         assert!(finding.warnings.is_empty());
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_tcp_port_is_no_response() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let number = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        assert!(
+            probe(Ipv4Addr::LOCALHOST, number, false)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -947,6 +947,23 @@ fn diagnostic_code(message: &str, status: protocols::ProbeStatus) -> &'static st
     }
 }
 
+fn pnio_no_response(message: &str) -> bool {
+    if !message.starts_with("PROFINET PNIO record scan failed for ") {
+        return false;
+    }
+    let message = message.to_ascii_lowercase();
+    [
+        "timed out",
+        "timeout",
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "peer closed",
+    ]
+    .iter()
+    .any(|needle| message.contains(*needle))
+}
+
 fn pnio_warning_target(message: &str) -> Option<String> {
     let candidate = message
         .strip_prefix("PROFINET PNIO skipped for ")
@@ -1189,16 +1206,21 @@ pub async fn scan(
         devices = enriched;
         let diagnostics =
             result.unwrap_or_else(|error| vec![format!("PROFINET PNIO scan skipped: {error}")]);
-        let mut formatted_diagnostics = Vec::with_capacity(diagnostics.len());
+        let mut incomplete = false;
         for warning in &diagnostics {
+            let status = if pnio_no_response(warning) {
+                protocols::ProbeStatus::NoResponse
+            } else {
+                protocols::ProbeStatus::Partial
+            };
             let formatted = if let Some(target) = pnio_warning_target(warning) {
                 if let Ok(ip) = target.parse::<Ipv4Addr>() {
                     format_diagnostic(
                         &ip.to_string(),
                         None,
                         "profinet-pnio",
-                        "PARTIAL",
-                        diagnostic_code(warning, protocols::ProbeStatus::Partial),
+                        status.label(),
+                        diagnostic_code(warning, status),
                         "udp/34964 or advertised PNIO endpoint; timeout 2s per RPC exchange",
                         "record-read",
                         warning,
@@ -1207,8 +1229,8 @@ pub async fn scan(
                     format_mac_diagnostic(
                         &target,
                         "profinet-pnio",
-                        "PARTIAL",
-                        diagnostic_code(warning, protocols::ProbeStatus::Partial),
+                        status.label(),
+                        diagnostic_code(warning, status),
                         "udp/34964 or advertised PNIO endpoint; timeout 2s per RPC exchange",
                         "record-read",
                         warning,
@@ -1226,10 +1248,13 @@ pub async fn scan(
                 )
             };
             logger.log(formatted.clone());
-            formatted_diagnostics.push(formatted);
+            if status == protocols::ProbeStatus::NoResponse {
+                continue;
+            }
+            incomplete = true;
+            warnings.push(formatted);
         }
-        protocol_failed |= !formatted_diagnostics.is_empty();
-        warnings.extend(formatted_diagnostics);
+        protocol_failed |= incomplete;
         logger.devices(configuration, &devices);
     }
     logger.log(format!(
@@ -3117,6 +3142,20 @@ mod tests {
             diagnostic_code("Authentication failed", protocols::ProbeStatus::Failure),
             "authentication-failed"
         );
+    }
+
+    #[test]
+    fn pnio_endpoint_timeout_is_expected_no_response() {
+        assert!(pnio_no_response(
+            "PROFINET PNIO record scan failed for 192.0.2.10: RPC response timed out"
+        ));
+    }
+
+    #[test]
+    fn pnio_record_timeout_remains_partial() {
+        assert!(!pnio_no_response(
+            "192.0.2.10: PNIO record 0xAFF0 (API 0, slot 0, subslot 1) failed: response timed out"
+        ));
     }
 
     #[test]

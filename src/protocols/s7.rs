@@ -217,10 +217,21 @@ async fn write(stream: &mut TcpStream, value: &[u8]) -> Result<(), String> {
 
 async fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
     let mut header = [0; 4];
-    timeout(TIMEOUT, stream.read_exact(&mut header))
-        .await
-        .map_err(|_| "response timed out".to_string())?
-        .map_err(|error| error.to_string())?;
+    let received = timeout(TIMEOUT, async {
+        let count = stream.read(&mut header).await?;
+        if count == 0 {
+            Ok::<_, std::io::Error>(false)
+        } else {
+            stream.read_exact(&mut header[count..]).await?;
+            Ok(true)
+        }
+    })
+    .await
+    .map_err(|_| "response timed out".to_string())?
+    .map_err(|error| error.to_string())?;
+    if !received {
+        return Err("connection closed without a TPKT response".into());
+    }
     let length = u16::from_be_bytes([header[2], header[3]]) as usize;
     if header[0] != 3 || !(4..=65_535).contains(&length) {
         return Err("invalid TPKT header".into());
@@ -941,6 +952,7 @@ mod tests {
         .err()
         .unwrap();
         assert!(error.contains("S7 Setup Communication response failed"));
+        assert!(crate::protocols::peer_closed(&error));
         timeout(TIMEOUT, responder).await.unwrap().unwrap();
     }
 
