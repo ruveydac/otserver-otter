@@ -9,11 +9,12 @@ use tokio::time::timeout;
 
 // (source, destination) TSAP pairings: connection type PG 0x01xx, OP 0x02xx, S7 basic
 // 0x03xx, with destination slot 0/1 for S7-1200/1500, 2 for S7-300, and 3 for S7-400.
-const TSAP_PAIRS: [(u16, u16); 12] = [
+const TSAP_PAIRS: [(u16, u16); 13] = [
     (0x0100, 0x0100),
     (0x0100, 0x0101),
     (0x0100, 0x0102),
     (0x0100, 0x0103),
+    (0x0100, 0x0200), // s7-info.nse's alternate uses a PG source with an OP destination.
     (0x0200, 0x0200),
     (0x0200, 0x0201),
     (0x0200, 0x0202),
@@ -63,8 +64,10 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
             Ok(Err(error)) => return Err(format!("S7 {target}: {error}")),
             Err(_) => return Ok(None),
         };
-        if negotiate(&mut stream, &request).await.unwrap_or(false) {
-            return read_identity(stream, target, src_tsap, dst_tsap).await;
+        if negotiate(&mut stream, &request).await.unwrap_or(false)
+            && let Some(finding) = read_identity(stream, target, src_tsap, dst_tsap).await?
+        {
+            return Ok(Some(finding));
         }
     }
     Ok(None)
@@ -92,9 +95,8 @@ async fn read_identity(
     src_tsap: u16,
     dst_tsap: u16,
 ) -> Result<Option<Finding>, String> {
-    // S7 and IEC 61850 MMS share port 102 and both speak COTP, so a peer that
-    // accepts the COTP connect but then drops or answers the S7 exchange with
-    // junk is simply not an S7 endpoint, not an error worth a warning.
+    // COTP acceptance alone does not identify a usable S7 TSAP. A CPU can reject
+    // S7 setup on this slot, and an MMS endpoint on port 102 can also accept COTP.
     if write(&mut stream, SETUP).await.is_err() {
         return Ok(None);
     }
@@ -445,6 +447,39 @@ mod tests {
         (hardware, identity)
     }
 
+    fn s7_300_identities() -> (Vec<u8>, Vec<u8>) {
+        // Synthetic records for the reported CPU model/firmware, with a test-only serial.
+        let mut hardware = vec![0, 0x11, 0, 0, 0, 28, 0, 4];
+        for (index, value) in [
+            (1_u16, "6ES7 315-2EH14-0AB0"),
+            (6, "6ES7 315-2EH14-0AB0"),
+            (7, ""),
+            (0x81, "Boot Loader"),
+        ] {
+            let mut record = [0; 28];
+            record[..2].copy_from_slice(&index.to_be_bytes());
+            record[2..2 + value.len()].copy_from_slice(value.as_bytes());
+            if index == 7 {
+                record[24..28].copy_from_slice(&[b'V', 3, 2, 14]);
+            } else if index == 0x81 {
+                record[24..28].copy_from_slice(&[b'A', 1, 0, 0]);
+            }
+            hardware.extend(record);
+        }
+        let mut identity = vec![0, 0x1c, 0, 0, 0, 34, 0, 3];
+        for (index, value) in [
+            (1_u16, "S7-300 LAB"),
+            (2, "CPU 315-2 PN/DP"),
+            (5, "TEST-S7-300"),
+        ] {
+            let mut record = [0; 34];
+            record[..2].copy_from_slice(&index.to_be_bytes());
+            record[2..2 + value.len()].copy_from_slice(value.as_bytes());
+            identity.extend(record);
+        }
+        (hardware, identity)
+    }
+
     async fn read_tpkt(stream: &mut TcpStream) -> Vec<u8> {
         let mut header = [0; 4];
         stream.read_exact(&mut header).await.unwrap();
@@ -504,6 +539,30 @@ mod tests {
     }
 
     #[test]
+    fn selects_firmware_by_record_id_in_reordered_s7_300_records() {
+        let (mut hardware, identity) = s7_300_identities();
+        hardware[8..].rotate_left(2 * 28);
+        let finding = parse(&hardware, &identity).unwrap();
+        assert_eq!(finding.fields["firmwareVersion"], "3.2.14");
+        assert_eq!(finding.raw["version"], "3.2.14");
+        assert_eq!(finding.raw["fieldSources"]["firmwareVersion"]["record"], 7);
+        assert_eq!(finding.raw["response"], hex(&hardware));
+        assert!(finding.warnings.is_empty());
+    }
+
+    #[test]
+    fn rejects_truncated_firmware_records_without_losing_component_identity() {
+        let (hardware, identity) = s7_300_identities();
+        for length in [8 + 2 * 28 + 27, hardware.len() - 1] {
+            let finding = parse(&hardware[..length], &identity).unwrap();
+            assert!(!finding.fields.contains_key("firmwareVersion"));
+            assert_eq!(finding.fields["serialNumber"], "TEST-S7-300");
+            assert_eq!(finding.raw["collectionOutcomes"][0]["outcome"], "malformed");
+            assert_eq!(finding.warnings, ["S7 SZL 0011: invalid S7 SZL records"]);
+        }
+    }
+
+    #[test]
     fn retains_independent_szls_without_firmware_or_component_list() {
         let (mut hardware, identity) = identities();
         assert_eq!(
@@ -541,11 +600,18 @@ mod tests {
     }
 
     #[test]
-    fn tsap_pairs_match_connection_type() {
-        assert_eq!(TSAP_PAIRS.len(), 12);
+    fn tsap_pairs_cover_existing_slots_and_nse_alternate_without_duplicates() {
+        assert_eq!(TSAP_PAIRS.len(), 13);
+        assert!(TSAP_PAIRS.contains(&(0x0100, 0x0200)));
+        for connection_type in [0x0100, 0x0200, 0x0300] {
+            for slot in 0..=3 {
+                assert!(TSAP_PAIRS.contains(&(connection_type, connection_type | slot)));
+            }
+        }
+        let mut unique = std::collections::BTreeSet::new();
         for (src, dst) in TSAP_PAIRS {
-            assert_eq!(src >> 8, dst >> 8, "source and destination type differ");
             assert_eq!(src & 0xff, 0, "source TSAP must be rack/slot zero");
+            assert!(unique.insert((src, dst)), "duplicate TSAP pairing");
         }
     }
 
@@ -644,6 +710,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retains_firmware_when_component_szl_is_rejected() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, CONNECT_PORT))
+            .await
+            .unwrap();
+        let (hardware, _) = s7_300_identities();
+        let expected_response = hex(&hardware);
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_tpkt(&mut stream).await;
+            stream.write_all(&[3, 0, 0, 7, 2, 0xd0, 0]).await.unwrap();
+            assert_eq!(read_tpkt(&mut stream).await, SETUP);
+            stream.write_all(&setup_frame()).await.unwrap();
+            assert_eq!(read_tpkt(&mut stream).await, SZL_11);
+            stream.write_all(&userdata_frame(&hardware)).await.unwrap();
+            assert_eq!(read_tpkt(&mut stream).await, SZL_1C);
+            let mut rejection = userdata_frame(&[]);
+            rejection[27..29].copy_from_slice(&[0xd4, 0x02]);
+            stream.write_all(&rejection).await.unwrap();
+        });
+        let finding = probe(Ipv4Addr::LOCALHOST).await.unwrap().unwrap();
+        responder.await.unwrap();
+        assert_eq!(finding.fields["firmwareVersion"], "3.2.14");
+        assert_eq!(finding.fields["model"], "6ES7 315-2EH14-0AB0");
+        assert!(!finding.fields.contains_key("serialNumber"));
+        assert_eq!(finding.raw["response"], expected_response);
+        assert_eq!(finding.raw["collectionOutcomes"][0]["outcome"], "success");
+        assert!(
+            finding
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("001C"))
+        );
+    }
+
+    #[tokio::test]
+    async fn reaches_s7_300_slot_after_cotp_succeeds_but_s7_setup_fails() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, CONNECT_PORT))
+            .await
+            .unwrap();
+        let (hardware, identity) = s7_300_identities();
+        let responder = tokio::spawn(async move {
+            for slot in [0, 1] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                assert_eq!(
+                    read_tpkt(&mut stream).await,
+                    connect_request(0x0100, 0x0100 | slot)
+                );
+                stream.write_all(&[3, 0, 0, 7, 2, 0xd0, 0]).await.unwrap();
+                assert_eq!(read_tpkt(&mut stream).await, SETUP);
+                if slot == 1 {
+                    let mut rejection = setup_frame();
+                    rejection[17..19].copy_from_slice(&[0x81, 0x04]);
+                    stream.write_all(&rejection).await.unwrap();
+                }
+            }
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_tpkt(&mut stream).await,
+                connect_request(0x0100, 0x0102)
+            );
+            stream.write_all(&[3, 0, 0, 7, 2, 0xd0, 0]).await.unwrap();
+            assert_eq!(read_tpkt(&mut stream).await, SETUP);
+            stream.write_all(&setup_frame()).await.unwrap();
+            assert_eq!(read_tpkt(&mut stream).await, SZL_11);
+            stream.write_all(&userdata_frame(&hardware)).await.unwrap();
+            assert_eq!(read_tpkt(&mut stream).await, SZL_1C);
+            stream.write_all(&userdata_frame(&identity)).await.unwrap();
+        });
+        let finding = probe(Ipv4Addr::LOCALHOST).await.unwrap().unwrap();
+        responder.await.unwrap();
+        assert_eq!(finding.fields["firmwareVersion"], "3.2.14");
+        assert_eq!(finding.fields["model"], "CPU 315-2 PN/DP");
+        assert_eq!(finding.fields["serialNumber"], "TEST-S7-300");
+        assert_eq!(
+            finding.raw["accessPath"],
+            json!({
+                "sourceTsap": "0100", "destinationTsap": "0102", "rack": 0, "slot": 2
+            })
+        );
+        assert!(finding.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn probes_nse_alternate_tsap_pair() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, CONNECT_PORT))
+            .await
+            .unwrap();
+        let (hardware, identity) = s7_300_identities();
+        let responder = tokio::spawn(async move {
+            for slot in 0..=3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                assert_eq!(
+                    read_tpkt(&mut stream).await,
+                    connect_request(0x0100, 0x0100 | slot)
+                );
+            }
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_tpkt(&mut stream).await,
+                connect_request(0x0100, 0x0200)
+            );
+            stream.write_all(&[3, 0, 0, 7, 2, 0xd0, 0]).await.unwrap();
+            assert_eq!(read_tpkt(&mut stream).await, SETUP);
+            stream.write_all(&setup_frame()).await.unwrap();
+            assert_eq!(read_tpkt(&mut stream).await, SZL_11);
+            stream.write_all(&userdata_frame(&hardware)).await.unwrap();
+            assert_eq!(read_tpkt(&mut stream).await, SZL_1C);
+            stream.write_all(&userdata_frame(&identity)).await.unwrap();
+        });
+        let finding = probe(Ipv4Addr::LOCALHOST).await.unwrap().unwrap();
+        responder.await.unwrap();
+        assert_eq!(finding.fields["firmwareVersion"], "3.2.14");
+        assert_eq!(
+            finding.raw["accessPath"],
+            json!({
+                "sourceTsap": "0100", "destinationTsap": "0200", "rack": 0, "slot": 0
+            })
+        );
+        assert!(finding.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_mismatched_and_malformed_szl_responses() {
+        let (hardware, _) = s7_300_identities();
+        for (offset, value, error) in [
+            (12, 1, "mismatched S7 PDU reference"),
+            (34, 0x1c, "mismatched S7 SZL ID/index"),
+            (36, 1, "mismatched S7 SZL ID/index"),
+            (32, 0, "invalid S7 SZL data length"),
+        ] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut frame = userdata_frame(&hardware);
+            frame[offset] = value;
+            let responder = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                assert_eq!(read_tpkt(&mut stream).await, SZL_11);
+                stream.write_all(&frame).await.unwrap();
+            });
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            assert_eq!(read_szl(&mut stream, SZL_11).await.unwrap_err(), error);
+            responder.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn retries_next_tsap_when_connect_request_is_rejected() {
         let _network = crate::network_test_lock().await;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, CONNECT_PORT))
@@ -678,14 +893,28 @@ mod tests {
             .await
             .unwrap();
         let responder = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            read_tpkt(&mut stream).await;
-            stream.write_all(&[3, 0, 0, 7, 2, 0xd0, 0]).await.unwrap();
-            stream.flush().await.unwrap();
-            // An MMS server accepts the COTP connect and then drops the S7 setup.
+            for (source, destination) in TSAP_PAIRS {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                assert_eq!(
+                    read_tpkt(&mut stream).await,
+                    connect_request(source, destination)
+                );
+                stream.write_all(&[3, 0, 0, 7, 2, 0xd0, 0]).await.unwrap();
+                assert_eq!(read_tpkt(&mut stream).await, SETUP);
+                // An MMS server accepts COTP but drops the S7 setup on every TSAP.
+            }
         });
-        assert!(probe(Ipv4Addr::LOCALHOST).await.unwrap().is_none());
-        responder.await.unwrap();
+        assert!(
+            timeout(
+                std::time::Duration::from_secs(5),
+                probe(Ipv4Addr::LOCALHOST)
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+        );
+        timeout(TIMEOUT, responder).await.unwrap().unwrap();
     }
 
     #[tokio::test]

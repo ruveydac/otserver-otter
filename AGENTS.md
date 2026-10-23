@@ -348,7 +348,9 @@ to HTTP. Other hosts require explicit HTTPS. No scanner-side listener is opened.
 - DCP exports numeric `vendorId`/`deviceId` alongside full parsed blocks, plus `fields.vendor`
   resolved from the bundled manufacturer table (42 → `SIEMENS AG`). Unknown IDs omit `vendor`.
   EtherNet/IP preserves every valid List Identity transport response; S7 preserves accepted TSAP
-  access and both identity SZLs.
+  access and both identity SZLs. COTP acceptance alone must not end the bounded S7 TSAP search:
+  continue after failed S7 setup. Include the `0100` → `0200` source/destination pairing used by
+  `s7-info.nse`; source and destination connection-type bytes need not match.
   PNIO component references use `pnio:<api>:<slot>[:<subslot>]` and retain original records,
   containment, identification numbers, I&M revisions, and scoped serial claims.
 - DNP3 uses TCP 20000: link reset followed by Group 0 Variation 254 device-attribute Read with the

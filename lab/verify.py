@@ -150,7 +150,9 @@ def assert_full(result: dict) -> None:
 
     s7 = observation(siemens, "s7")
     assert s7["fields"]["vendor"] == "Siemens"
-    assert s7["fields"]["model"] and s7["fields"]["firmwareVersion"]
+    assert s7["fields"]["model"]
+    assert s7["fields"]["firmwareVersion"] == "3.2.6"
+    assert s7["raw"]["fieldSources"]["firmwareVersion"]["record"] == 7
     assert s7["raw"]["accessPath"]["destinationTsap"]
 
     snmp = observation(siemens, "snmp")
