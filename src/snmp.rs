@@ -89,6 +89,7 @@ pub struct QuerySelection {
 pub struct QueryAttempt {
     pub description: String,
     pub success: bool,
+    pub failure: Option<String>,
 }
 
 pub fn resolved_version(settings: &Settings) -> &str {
@@ -313,6 +314,7 @@ pub async fn query_with_attempts(
             attempts.push(QueryAttempt {
                 description,
                 success: false,
+                failure: None,
             });
             match tokio::time::timeout(
                 attempt_timeout,
@@ -333,12 +335,21 @@ pub async fn query_with_attempts(
                     }
                     return Ok(result);
                 }
-                Ok(Err(error)) => last_error = Some(error),
+                Ok(Err(error)) => {
+                    if let Some(attempt) = attempts.last_mut() {
+                        attempt.failure = Some(error.clone());
+                    }
+                    last_error = Some(error);
+                }
                 Err(_) => {
-                    last_error = Some(format!(
+                    let error = format!(
                         "SNMP {target}: query exceeded its {} second version budget.",
                         attempt_timeout.as_secs()
-                    ));
+                    );
+                    if let Some(attempt) = attempts.last_mut() {
+                        attempt.failure = Some(error.clone());
+                    }
+                    last_error = Some(error);
                 }
             }
         }
@@ -2660,6 +2671,7 @@ mod tests {
                 description: "version=2c security=community authentication=none encryption=none"
                     .into(),
                 success: true,
+                failure: None,
             }]
         );
 

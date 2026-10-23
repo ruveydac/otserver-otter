@@ -67,7 +67,8 @@ instructions are in `README.md`; detailed operator and development guidance foll
   redirects, authentication, cookies, or retries. HTTPS discovery always disables certificate and
   hostname validation. Bound each request to two seconds and body collection to 64 KiB; retain
   status and Server-header evidence on body failure. Export listener-scoped `raw.protocol`,
-  `raw.statusCode`, `raw.title`, and `raw.server` under the existing `unknown` source. Never promote
+  `raw.statusCode`, `raw.title`, and `raw.server` under the matching `http` or `https` observation
+  and port source, with the same value in `fields.protocols`. Never promote
   a title or server banner to device identity, OS, or firmware. `--no-http`, `noHttp`, the GUI toggle,
   and legacy `noProtocols` disable both listeners. Upload/controller TLS settings remain independent.
 - SMB uses TCP 445, SMB2/3 negotiation and only the first NTLM SESSION_SETUP; RPC uses TCP 135
@@ -96,6 +97,15 @@ instructions are in `README.md`; detailed operator and development guidance foll
 - Credentials belong in executable-adjacent `otter.json`. Load legacy `otscanner.json` only when
   `otter.json` is absent. These local CLI/GUI flows must continue to work independently of managed
   `controller` mode. Never write credentials to logs or scan exports.
+- Format target-specific CLI/GUI probe diagnostics as one line beginning with `[ip=...]`, `[mac=...]`,
+  or both, followed by `[protocol] [time] OUTCOME code=... endpoint=... stage=...: detail`. Use
+  `SUCCESS`, `PARTIAL`, `NO_RESPONSE`, `FAIL`, and `CANCELLED`; use `INFO` for advisory details.
+  Include the actual configured endpoint and operation timeout. Layer-2 capture diagnostics identify
+  their broadcast/multicast destination MAC. A timeout or missing response is not evidence of bad
+  credentials, a wrong TSAP, or an offline device; report authentication failure only for an explicit
+  protocol/library result.
+  Preserve partial-read details, bound and escape diagnostic text, and never log credentials or raw
+  protocol payloads. Expected no-response outcomes alone do not make an export partial.
 - Controller v1 uses outbound HTTPS only (HTTP loopback for development), sensitive machine headers,
   and no redirects. Bare loopback addresses normalize to HTTP; other hosts require explicit HTTPS.
   Require local `--ack-authorized`; apply snapshots through the shared scan path.

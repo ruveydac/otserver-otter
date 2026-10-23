@@ -109,7 +109,7 @@ async fn udp(target: Ipv4Addr) -> Result<Option<Vec<u8>>, String> {
                     ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset
                 ) =>
             {
-                return Ok(None);
+                return Err(format!("FINS UDP port 9600 returned {}", error));
             }
             Ok(Err(error)) => return Err(error.to_string()),
             Err(_) => {
@@ -133,7 +133,9 @@ async fn tcp(target: Ipv4Addr) -> Result<Option<Vec<u8>>, String> {
     .await
     {
         Ok(Ok(stream)) => stream,
-        Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => return Ok(None),
+        Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => {
+            return Err("FINS TCP connection refused on port 9600".into());
+        }
         Ok(Err(error)) => return Err(error.to_string()),
         Err(_) => return Ok(None),
     };
@@ -148,7 +150,7 @@ async fn tcp(target: Ipv4Addr) -> Result<Option<Vec<u8>>, String> {
         || !matches!(address_response[19], 1..=254)
         || !matches!(address_response[23], 1..=254)
     {
-        return Ok(None);
+        return Err("FINS/TCP node-address negotiation returned an invalid signature, status, or node address.".into());
     }
     let address = address_response[23];
     let mut request = vec![

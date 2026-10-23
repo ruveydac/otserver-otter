@@ -103,6 +103,8 @@
             "beckhoff-ads",
             "dnp3",
             "ethernet-ip",
+            "http",
+            "https",
             "iec61850",
             "lldp",
             "netbios",

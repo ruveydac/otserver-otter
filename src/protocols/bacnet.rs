@@ -47,16 +47,17 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
             Ok(Some(response)) => {
                 let value = decode_for(&response, property, invoke, instance);
                 let outcome = if value.is_some() {
-                    "success"
+                    "success".to_owned()
                 } else {
-                    error_outcome(&response, invoke).unwrap_or("malformed")
+                    error_outcome(&response, invoke)
+                        .unwrap_or_else(|| "malformed or unsupported BACnet property value".into())
                 };
                 responses.push(json!({"property": property, "invokeId": invoke, "response": hex(&response), "outcome": outcome}));
                 if let Some(value) = value {
                     values.insert(name.into(), value);
                 } else {
                     warnings.push(format!(
-                        "BACnet property {property}: error/reject/abort response"
+                        "BACnet property {property} (invoke ID {invoke}) returned {outcome}; correlated response retained."
                     ));
                 }
             }
@@ -140,7 +141,9 @@ async fn exchange(
                 }
                 rejected = true;
             }
-            Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => return Ok(None),
+            Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => {
+                return Err("BACnet UDP port 47808 returned connection refused".into());
+            }
             Ok(Err(error)) => return Err(error.to_string()),
             Err(_) => {
                 return if rejected {
@@ -176,15 +179,34 @@ fn apdu(response: &[u8]) -> Option<&[u8]> {
     response.get(offset..).filter(|pdu| !pdu.is_empty())
 }
 
-fn error_outcome(response: &[u8], invoke: u8) -> Option<&'static str> {
+fn error_outcome(response: &[u8], invoke: u8) -> Option<String> {
     let pdu = apdu(response)?;
     if pdu.get(1) != Some(&invoke) {
         return None;
     }
     match pdu[0] {
-        0x50 if pdu.len() >= 5 && pdu[2] == 0x0c => Some("protocol-error"),
-        0x60 if pdu.len() == 3 => Some("rejected"),
-        0x71 if pdu.len() == 3 => Some("aborted"),
+        0x50 if pdu.len() >= 5 && pdu[2] == 0x0c => {
+            let mut offset = 3;
+            let error_class = tag(pdu, &mut offset)?;
+            let error_code = tag(pdu, &mut offset)?;
+            match (
+                error_class.context,
+                error_class.number,
+                error_code.context,
+                error_code.number,
+                number(error_class.bytes),
+                number(error_code.bytes),
+            ) {
+                (false, 9, false, 9, Some(class), Some(code)) => {
+                    Some(format!("BACnet Error class {class} code {code}"))
+                }
+                _ => Some(
+                    "BACnet Error response with an unrecognized error-class/code encoding".into(),
+                ),
+            }
+        }
+        0x60 if pdu.len() == 3 => Some(format!("BACnet Reject reason 0x{:02X}", pdu[2])),
+        0x71 if pdu.len() == 3 => Some(format!("BACnet Abort reason 0x{:02X}", pdu[2])),
         _ => None,
     }
 }
@@ -431,6 +453,31 @@ mod tests {
         assert_eq!(decode(&object, 0x4b, 1), Some(json!(42)));
         object[10] |= 8;
         assert_eq!(decode(&object, 0x4b, 1), None);
+    }
+
+    #[test]
+    fn preserves_bacnet_error_reject_and_abort_reasons() {
+        let mut error = vec![0x81, 0x0a, 0, 13, 1, 4, 0x50, 7, 0x0c, 0x91, 2, 0x91, 5];
+        assert_eq!(
+            error_outcome(&error, 7).as_deref(),
+            Some("BACnet Error class 2 code 5")
+        );
+
+        error.truncate(9);
+        error[2..4].copy_from_slice(&9_u16.to_be_bytes());
+        error[6] = 0x60;
+        error[8] = 0x11;
+        assert_eq!(
+            error_outcome(&error, 7).as_deref(),
+            Some("BACnet Reject reason 0x11")
+        );
+
+        error[6] = 0x71;
+        error[8] = 0x22;
+        assert_eq!(
+            error_outcome(&error, 7).as_deref(),
+            Some("BACnet Abort reason 0x22")
+        );
     }
 
     #[tokio::test]

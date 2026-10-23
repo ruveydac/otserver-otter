@@ -35,16 +35,20 @@ fn finding(
                 continue;
             }
         };
-        if let Some((response, tls)) = result
-            && let Some(values) = parse(&response)
-        {
-            findings.push((port_number, values, tls, response));
-            ports.push(port(
-                "tcp",
-                port_number,
-                Source::NiagaraFox,
-                json!({ "state": "open", "tls": tls }),
-            ));
+        if let Some((response, tls)) = result {
+            if let Some(values) = parse(&response) {
+                findings.push((port_number, values, tls, response));
+                ports.push(port(
+                    "tcp",
+                    port_number,
+                    Source::NiagaraFox,
+                    json!({ "state": "open", "tls": tls }),
+                ));
+            } else {
+                warnings.push(format!(
+                    "Niagara Fox {target}:{port_number}: response did not match a valid Fox hello reply."
+                ));
+            }
         }
     }
     let Some((_, values, tls, response)) = findings.first() else {

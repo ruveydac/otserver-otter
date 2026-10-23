@@ -729,14 +729,238 @@ fn timestamp() -> String {
 }
 
 pub fn format_log_line(message: &str) -> String {
-    format!("{} {message}", timestamp())
+    if let Some((target, remainder)) = message.split_once("] [")
+        && (target.starts_with("[ip=") || target.starts_with("[mac="))
+        && let Some((protocol, detail)) = remainder.split_once("] ")
+    {
+        format!("{target}] [{protocol}] {} {detail}", timestamp())
+    } else {
+        format!("{} {message}", timestamp())
+    }
 }
 
-pub fn log_probe(logger: &dyn LogOutput, ip: &str, protocol: &str, success: bool) {
-    logger.log(format!(
-        "{ip} Protocol {protocol} {}",
-        if success { "Success" } else { "Fail" }
-    ));
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps target and all standard diagnostic fields explicit at the formatting boundary"
+)]
+fn format_diagnostic(
+    ip: &str,
+    mac: Option<&str>,
+    protocol: &str,
+    status: &str,
+    code: &str,
+    endpoint: &str,
+    stage: &str,
+    message: &str,
+) -> String {
+    let target = match mac {
+        Some(mac) => format!("[ip={ip} mac={mac}]"),
+        None => format!("[ip={ip}]"),
+    };
+    format_target_diagnostic(&target, protocol, status, code, endpoint, stage, message)
+}
+
+fn format_mac_diagnostic(
+    mac: &str,
+    protocol: &str,
+    status: &str,
+    code: &str,
+    endpoint: &str,
+    stage: &str,
+    message: &str,
+) -> String {
+    format_target_diagnostic(
+        &format!("[mac={mac}]"),
+        protocol,
+        status,
+        code,
+        endpoint,
+        stage,
+        message,
+    )
+}
+
+fn format_target_diagnostic(
+    target: &str,
+    protocol: &str,
+    status: &str,
+    code: &str,
+    endpoint: &str,
+    stage: &str,
+    message: &str,
+) -> String {
+    let mut line = format!(
+        "{target} [{protocol}] {status} code={code} endpoint={endpoint} stage={stage}: {}",
+        safe_diagnostic_text(message)
+    );
+    if let Some(hint) = diagnostic_hint(code) {
+        line.push_str(" Hint: ");
+        line.push_str(hint);
+    }
+    line
+}
+
+fn diagnostic_hint(code: &str) -> Option<&'static str> {
+    match code {
+        "no-response" | "response-timeout" => Some(
+            "Check reachability, VLAN/routing, filtering, and service availability; silence is inconclusive.",
+        ),
+        "connect-timeout" | "network-unreachable" => {
+            Some("Check the operating-system route, link/VLAN, and filtering.")
+        }
+        "connection-refused" => Some("Confirm the reported service is enabled on this port."),
+        "authentication-failed" => {
+            Some("Verify the configured credentials and protocol security level.")
+        }
+        "authentication-required" => {
+            Some("Configure a supported credential mode for this read-only probe.")
+        }
+        "authentication-mode-unsupported" | "security-policy-unsupported" => {
+            Some("Compare the reported device modes with the configured probe capabilities.")
+        }
+        "access-denied" => Some("Check device authorization for this read operation."),
+        "unsupported-operation" => Some(
+            "The device does not support this read operation; other collected results are retained.",
+        ),
+        "response-mismatch" => Some(
+            "Verify that replies come from the expected target and match the outstanding request.",
+        ),
+        "malformed-response" => {
+            Some("Check device protocol/firmware compatibility; malformed data was rejected.")
+        }
+        "permission-denied" => Some(
+            "Check scanner permissions and capture-driver availability for the selected interface.",
+        ),
+        "request-rejected" | "request-aborted" => {
+            Some("Review the reported protocol status and whether the device permits this read.")
+        }
+        "device-status-error" => {
+            Some("Use the reported device status/code to check support and access for this read.")
+        }
+        _ => None,
+    }
+}
+
+fn safe_diagnostic_text(message: &str) -> String {
+    const MAX_CHARS: usize = 512;
+    let mut result = String::new();
+    for (index, character) in message.chars().enumerate() {
+        if index == MAX_CHARS {
+            result.push_str("… (truncated)");
+            break;
+        }
+        result.push(if character.is_control() {
+            ' '
+        } else {
+            character
+        });
+    }
+    result
+}
+
+fn diagnostic_code(message: &str, status: protocols::ProbeStatus) -> &'static str {
+    let message = message.to_ascii_lowercase();
+    if status == protocols::ProbeStatus::NoResponse {
+        if message.contains("connection refused") {
+            "connection-refused"
+        } else if message.contains("connection reset")
+            || message.contains("connection closed")
+            || message.contains("peer closed")
+        {
+            "connection-closed"
+        } else if message.contains("connect timed out") || message.contains("connection timed out")
+        {
+            "connect-timeout"
+        } else if message.contains("timed out") || message.contains("timeout") {
+            "response-timeout"
+        } else {
+            "no-response"
+        }
+    } else if status == protocols::ProbeStatus::Cancelled || message.contains("cancelled") {
+        "cancelled"
+    } else if message.contains("unencrypted channel") {
+        "security-mode"
+    } else if message.contains("differs from") {
+        "identity-disagreement"
+    } else if message.contains("no endpoint with securitypolicy") {
+        "security-policy-unsupported"
+    } else if message.contains("requires username authentication") {
+        "authentication-required"
+    } else if message.contains("no authentication mode supported")
+        || message.contains("no usable authentication")
+    {
+        "authentication-mode-unsupported"
+    } else if message.contains("need a username") || message.contains("configure opcuacredentials")
+    {
+        "authentication-required"
+    } else if message.contains("unsupported snmp authentication")
+        || message.contains("unsupported snmp privacy")
+    {
+        "authentication-mode-unsupported"
+    } else if message.contains("connection refused") {
+        "connection-refused"
+    } else if message.contains("connection reset")
+        || message.contains("connection closed")
+        || message.contains("broken pipe")
+    {
+        "connection-closed"
+    } else if message.contains("network is unreachable")
+        || message.contains("host is unreachable")
+        || message.contains("no route to host")
+    {
+        "network-unreachable"
+    } else if message.contains("permission denied") || message.contains("operation not permitted") {
+        "permission-denied"
+    } else if message.contains("connect timed out") || message.contains("connection timed out") {
+        "connect-timeout"
+    } else if message.contains("timed out") || message.contains("timeout") {
+        "response-timeout"
+    } else if message.contains("authentication failed") || message.contains("credentials rejected")
+    {
+        "authentication-failed"
+    } else if message.contains("access denied") || message.contains("access-denied") {
+        "access-denied"
+    } else if message.contains("bacnet error class")
+        || message.contains("fins status")
+        || message.contains("status 0x")
+        || message.contains("returned 0x")
+    {
+        "device-status-error"
+    } else if message.contains("rejected") {
+        "request-rejected"
+    } else if message.contains("aborted") {
+        "request-aborted"
+    } else if message.contains("unsupported") || message.contains("not implemented") {
+        "unsupported-operation"
+    } else if message.contains("mismatch") || message.contains("uncorrelated") {
+        "response-mismatch"
+    } else if message.contains("invalid")
+        || message.contains("malformed")
+        || message.contains("truncated")
+        || message.contains("oversized")
+    {
+        "malformed-response"
+    } else if status == protocols::ProbeStatus::Partial {
+        "partial-collection"
+    } else {
+        "protocol-error"
+    }
+}
+
+fn pnio_warning_target(message: &str) -> Option<String> {
+    let candidate = message
+        .strip_prefix("PROFINET PNIO skipped for ")
+        .or_else(|| message.strip_prefix("PROFINET PNIO record scan failed for "))
+        .or_else(|| message.split_once(": ").map(|(target, _)| target))?;
+    let target = candidate
+        .split_once(": ")
+        .map_or(candidate, |(target, _)| target)
+        .trim();
+    if target.parse::<Ipv4Addr>().is_ok() {
+        Some(target.to_owned())
+    } else {
+        otserver_otter::contract::normalize_mac(target)
+    }
 }
 
 pub fn nonempty(value: Option<String>, name: &str) -> Result<String, String> {
@@ -894,14 +1118,36 @@ pub async fn scan(
                 logger.log(format!("ARP discovery found {} device(s).", found.len()));
                 for device in &found {
                     for ip in &device.ip_addresses {
-                        log_probe(logger, ip, Source::Arp.label(), true);
+                        logger.log(format_diagnostic(
+                            ip,
+                            Some(&device.mac_address),
+                            "arp",
+                            "SUCCESS",
+                            "reply-correlated",
+                            "ethernet broadcast (ff:ff:ff:ff:ff:ff)",
+                            "arp-reply",
+                            "Received and validated a reply matching the requested IPv4 target.",
+                        ));
                     }
                 }
                 devices.extend(found);
             }
             Err(error) => {
-                logger.log(format!("ARP discovery error: {error}"));
-                errors.push(error);
+                let message = format!(
+                    "ARP sweep for {} IPv4 target(s) failed: {error}",
+                    arp_targets.len()
+                );
+                let diagnostic = format_mac_diagnostic(
+                    "ff:ff:ff:ff:ff:ff",
+                    "arp",
+                    "FAIL",
+                    diagnostic_code(&message, protocols::ProbeStatus::Failure),
+                    "ethernet broadcast; ARP response window 3s",
+                    "sweep",
+                    &message,
+                );
+                logger.log(diagnostic.clone());
+                errors.push(diagnostic);
             }
         }
     } else if !options.protocols.arp {
@@ -943,10 +1189,47 @@ pub async fn scan(
         devices = enriched;
         let diagnostics =
             result.unwrap_or_else(|error| vec![format!("PROFINET PNIO scan skipped: {error}")]);
+        let mut formatted_diagnostics = Vec::with_capacity(diagnostics.len());
         for warning in &diagnostics {
-            logger.log(warning.clone());
+            let formatted = if let Some(target) = pnio_warning_target(warning) {
+                if let Ok(ip) = target.parse::<Ipv4Addr>() {
+                    format_diagnostic(
+                        &ip.to_string(),
+                        None,
+                        "profinet-pnio",
+                        "PARTIAL",
+                        diagnostic_code(warning, protocols::ProbeStatus::Partial),
+                        "udp/34964 or advertised PNIO endpoint; timeout 2s per RPC exchange",
+                        "record-read",
+                        warning,
+                    )
+                } else {
+                    format_mac_diagnostic(
+                        &target,
+                        "profinet-pnio",
+                        "PARTIAL",
+                        diagnostic_code(warning, protocols::ProbeStatus::Partial),
+                        "udp/34964 or advertised PNIO endpoint; timeout 2s per RPC exchange",
+                        "record-read",
+                        warning,
+                    )
+                }
+            } else {
+                format_mac_diagnostic(
+                    &source_mac,
+                    "profinet-pnio",
+                    "FAIL",
+                    diagnostic_code(warning, protocols::ProbeStatus::Failure),
+                    "selected interface; RPC timeout 2s",
+                    "prepare",
+                    &format!("Interface-scoped PNIO diagnostic: {warning}"),
+                )
+            };
+            logger.log(formatted.clone());
+            formatted_diagnostics.push(formatted);
         }
-        warnings.extend(diagnostics);
+        protocol_failed |= !formatted_diagnostics.is_empty();
+        warnings.extend(formatted_diagnostics);
         logger.devices(configuration, &devices);
     }
     logger.log(format!(
@@ -978,7 +1261,7 @@ pub async fn scan(
             "Probing native protocols ({})...",
             native_selection.labels().join(", ")
         ));
-        probe_protocols(
+        protocol_failed |= probe_protocols(
             configuration,
             &probe_targets,
             &mut devices,
@@ -1034,10 +1317,64 @@ pub async fn scan(
             Ok(Ok(result)) => {
                 devices.extend(result.devices);
                 links.extend(result.links);
-                warnings.extend(result.warnings);
+                for warning in result.warnings {
+                    let informational =
+                        warning.starts_with("Passive LLDP observed the selected link");
+                    protocol_failed |= !informational;
+                    let status = if informational { "INFO" } else { "PARTIAL" };
+                    let code = if informational {
+                        "capture-window-complete"
+                    } else {
+                        diagnostic_code(&warning, protocols::ProbeStatus::Partial)
+                    };
+                    let diagnostic = format_mac_diagnostic(
+                        "01:80:c2:00:00:0e",
+                        "lldp-passive",
+                        status,
+                        code,
+                        &format!(
+                            "selected interface {}; capture window 30s",
+                            options.interface
+                        ),
+                        "capture",
+                        &warning,
+                    );
+                    logger.log(diagnostic.clone());
+                    warnings.push(diagnostic);
+                }
             }
-            Ok(Err(error)) => warnings.push(format!("Passive LLDP: {error}")),
-            Err(error) => warnings.push(format!("Passive LLDP task: {error}")),
+            Ok(Err(error)) => {
+                let diagnostic = format_mac_diagnostic(
+                    "01:80:c2:00:00:0e",
+                    "lldp-passive",
+                    "FAIL",
+                    diagnostic_code(&error, protocols::ProbeStatus::Failure),
+                    &format!(
+                        "selected interface {}; capture window 30s",
+                        options.interface
+                    ),
+                    "capture",
+                    &error,
+                );
+                logger.log(diagnostic.clone());
+                errors.push(diagnostic);
+            }
+            Err(error) => {
+                let diagnostic = format_mac_diagnostic(
+                    "01:80:c2:00:00:0e",
+                    "lldp-passive",
+                    "FAIL",
+                    "capture-task-failed",
+                    &format!(
+                        "selected interface {}; capture window 30s",
+                        options.interface
+                    ),
+                    "capture",
+                    &error.to_string(),
+                );
+                logger.log(diagnostic.clone());
+                errors.push(diagnostic);
+            }
         }
     }
     let stopped = cancelled.load(Ordering::Relaxed);
@@ -1327,21 +1664,71 @@ async fn discover_profinet(
         )
     })
     .await
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string())
+    .and_then(|result| result);
     match &result {
-        Ok(found) => logger.log(format!(
-            "PROFINET DCP collection {} after {}s; found {} device(s).",
-            if cancelled.load(Ordering::Relaxed) {
-                "stopped"
+        Ok(found) => {
+            let (status, code, message) = if cancelled.load(Ordering::Relaxed) {
+                (
+                    "CANCELLED",
+                    "cancelled",
+                    format!(
+                        "Identify collection stopped after {}s; {} device(s) retained.",
+                        started.elapsed().as_secs(),
+                        found.len()
+                    ),
+                )
+            } else if found.is_empty() {
+                (
+                    "NO_RESPONSE",
+                    "no-identify-responses",
+                    format!(
+                        "No DCP Identify responses during the {}s selected-link window. No response does not establish that a device is absent.",
+                        started.elapsed().as_secs()
+                    ),
+                )
             } else {
-                "completed"
-            },
-            started.elapsed().as_secs(),
-            found.len()
+                (
+                    "SUCCESS",
+                    "identify-complete",
+                    format!(
+                        "Identify collection completed after {}s; found {} device(s).",
+                        started.elapsed().as_secs(),
+                        found.len()
+                    ),
+                )
+            };
+            logger.log(format_mac_diagnostic(
+                "01:0e:cf:00:00:00",
+                "profinet-dcp",
+                status,
+                code,
+                "ethernet DCP multicast; response window 60s",
+                "identify",
+                &message,
+            ));
+        }
+        Err(error) => logger.log(format_mac_diagnostic(
+            "01:0e:cf:00:00:00",
+            "profinet-dcp",
+            "FAIL",
+            diagnostic_code(error, protocols::ProbeStatus::Failure),
+            "ethernet DCP multicast; response window 60s",
+            "capture",
+            error,
         )),
-        Err(error) => logger.log(format!("PROFINET DCP error: {error}")),
     }
-    result
+    result.map_err(|error| {
+        format_mac_diagnostic(
+            "01:0e:cf:00:00:00",
+            "profinet-dcp",
+            "FAIL",
+            diagnostic_code(&error, protocols::ProbeStatus::Failure),
+            "ethernet DCP multicast; response window 60s",
+            "capture",
+            &error,
+        )
+    })
 }
 
 fn dcp_arp_targets(selected: &[Ipv4Addr], devices: &[Device]) -> Result<Vec<Ipv4Addr>, String> {
@@ -1437,9 +1824,10 @@ async fn probe_protocols(
     ads: &otserver_otter::protocols::AdsSettings,
     logger: &dyn LogOutput,
     cancelled: &Arc<AtomicBool>,
-) {
+) -> bool {
     let identities = unique_ip_identities(devices);
     let mut tasks = tokio::task::JoinSet::new();
+    let mut failed = false;
     for &ip in targets {
         if cancelled.load(Ordering::Relaxed) {
             break;
@@ -1449,7 +1837,7 @@ async fn probe_protocols(
                 () = wait_for_cancellation(cancelled) => break,
                 result = tasks.join_next() => result,
             };
-            apply_probe(configuration, devices, unresolved, warnings, logger, result);
+            failed |= apply_probe(configuration, devices, unresolved, warnings, logger, result);
         }
         let mac = identities.get(&ip.to_string()).cloned();
         let opcua = opcua.clone();
@@ -1469,9 +1857,10 @@ async fn probe_protocols(
         });
     }
     drain_tasks(&mut tasks, cancelled, |result| {
-        apply_probe(configuration, devices, unresolved, warnings, logger, result);
+        failed |= apply_probe(configuration, devices, unresolved, warnings, logger, result);
     })
     .await;
+    failed
 }
 
 fn ip_probe_targets(
@@ -1617,36 +2006,135 @@ fn apply_snmp_probe(
         warnings.push("An SNMP probe task failed.".into());
         return true;
     };
-    for attempt in attempts {
-        logger.log(format!(
-            "{ip} SNMP attempt {} {}",
-            attempt.description,
-            if attempt.success { "Success" } else { "Fail" }
+    let snmp_endpoint = "udp/161; timeout 30s";
+    for (index, attempt) in attempts.into_iter().enumerate() {
+        let (status, code, message) = if attempt.success {
+            (
+                "INFO",
+                "credential-attempt-accepted",
+                "SNMP version/security settings received a response.".to_owned(),
+            )
+        } else {
+            let message = attempt
+                .failure
+                .unwrap_or_else(|| "SNMP version/security settings did not complete.".into());
+            (
+                "INFO",
+                diagnostic_code(&message, protocols::ProbeStatus::Failure),
+                message,
+            )
+        };
+        logger.log(format_diagnostic(
+            &ip,
+            None,
+            "snmp",
+            status,
+            code,
+            snmp_endpoint,
+            "authenticate",
+            &format!("Attempt {} ({}): {message}", index + 1, attempt.description),
         ));
     }
     let mut result = match result {
         Ok(result) => result,
         Err(error) => {
-            if selection.inventory {
-                log_probe(logger, &ip, Source::Snmp.label(), false);
-            }
-            if selection.lldp {
-                log_probe(logger, &ip, Source::Lldp.label(), false);
-            }
+            let message = error.to_string();
             let failed = !error.is_no_response();
-            warnings.push(error.to_string());
+            for (enabled, protocol, stage) in [
+                (selection.inventory, "snmp", "inventory"),
+                (selection.lldp, "lldp-snmp", "neighbor-inventory"),
+            ] {
+                if !enabled {
+                    continue;
+                }
+                let diagnostic = format_diagnostic(
+                    &ip,
+                    None,
+                    protocol,
+                    if failed { "FAIL" } else { "NO_RESPONSE" },
+                    diagnostic_code(&message, protocols::ProbeStatus::Failure),
+                    snmp_endpoint,
+                    stage,
+                    &message,
+                );
+                logger.log(diagnostic.clone());
+                if failed {
+                    warnings.push(diagnostic);
+                }
+            }
             return failed;
         }
     };
     if selection.inventory {
-        log_probe(logger, &ip, Source::Snmp.label(), result.inventory_complete);
+        logger.log(format_diagnostic(
+            &ip,
+            result.identity_mac.as_deref(),
+            "snmp",
+            if result.inventory_complete {
+                "SUCCESS"
+            } else {
+                "PARTIAL"
+            },
+            if result.inventory_complete {
+                "inventory-complete"
+            } else {
+                "inventory-partial"
+            },
+            snmp_endpoint,
+            "inventory",
+            if result.inventory_complete {
+                "SNMP inventory collection completed."
+            } else {
+                "SNMP inventory collection completed with read failures; successful rows retained."
+            },
+        ));
     }
     if selection.lldp {
-        log_probe(logger, &ip, Source::Lldp.label(), result.lldp_complete);
+        logger.log(format_diagnostic(
+            &ip,
+            result.identity_mac.as_deref(),
+            "lldp-snmp",
+            if result.lldp_complete {
+                "SUCCESS"
+            } else {
+                "PARTIAL"
+            },
+            if result.lldp_complete {
+                "neighbor-inventory-complete"
+            } else {
+                "neighbor-inventory-partial"
+            },
+            snmp_endpoint,
+            "neighbor-inventory",
+            if result.lldp_complete {
+                "SNMP LLDP neighbor collection completed."
+            } else {
+                "SNMP LLDP neighbor collection was incomplete; successful rows retained."
+            },
+        ));
     }
-    let incomplete = selection.inventory && !result.inventory_complete
+    let mut incomplete = selection.inventory && !result.inventory_complete
         || selection.lldp && !result.lldp_complete;
-    warnings.append(&mut result.warnings);
+    for warning in result.warnings.drain(..) {
+        let protocol = if warning.contains("LLDP") || warning.contains("lldp") {
+            "lldp-snmp"
+        } else {
+            "snmp"
+        };
+        let formatted = format_diagnostic(
+            &ip,
+            result.identity_mac.as_deref(),
+            protocol,
+            "PARTIAL",
+            diagnostic_code(&warning, protocols::ProbeStatus::Partial),
+            snmp_endpoint,
+            "collection",
+            &warning,
+        );
+        logger.log(formatted.clone());
+        warnings.push(formatted);
+        incomplete = true;
+    }
     links.append(&mut result.links);
     if let Some(mac) = result.identity_mac {
         if let Some(device) = devices.iter_mut().find(|device| device.mac_address == mac) {
@@ -1686,21 +2174,61 @@ fn apply_probe(
     result: Option<
         Result<(Ipv4Addr, Option<String>, protocols::ProbeResult), tokio::task::JoinError>,
     >,
-) {
-    let Some(result) = result else { return };
+) -> bool {
+    let Some(result) = result else { return false };
     let Ok((ip, mac, mut result)) = result else {
         warnings.push("A native protocol probe task failed.".into());
-        return;
+        return true;
     };
-    for (index, (source, success)) in result.outcomes.iter().enumerate() {
-        let protocol = result
-            .outcome_protocols
-            .get(index)
-            .copied()
-            .unwrap_or(source.label());
-        log_probe(logger, &ip.to_string(), protocol, *success);
+    let mut failed = false;
+    for outcome in &result.outcomes {
+        let messages = if outcome.messages.is_empty() {
+            vec![match outcome.status {
+                protocols::ProbeStatus::Success => "Probe completed successfully.".to_owned(),
+                protocols::ProbeStatus::Partial => "Probe returned partial results.".to_owned(),
+                protocols::ProbeStatus::NoResponse => {
+                    "No correlated response was received.".to_owned()
+                }
+                protocols::ProbeStatus::Failure => "Probe failed.".to_owned(),
+                protocols::ProbeStatus::Cancelled => "Probe was cancelled.".to_owned(),
+            }]
+        } else {
+            outcome.messages.clone()
+        };
+        for message in messages {
+            let endpoint = format!("{}; timeout {}", outcome.endpoint, outcome.timeout);
+            let status = if outcome.status == protocols::ProbeStatus::Success
+                && !outcome.messages.is_empty()
+            {
+                "INFO"
+            } else {
+                outcome.status.label()
+            };
+            let formatted = format_diagnostic(
+                &ip.to_string(),
+                mac.as_deref(),
+                outcome.protocol,
+                status,
+                diagnostic_code(&message, outcome.status),
+                &endpoint,
+                outcome.stage,
+                &message,
+            );
+            logger.log(formatted.clone());
+            failed |= matches!(
+                outcome.status,
+                protocols::ProbeStatus::Failure | protocols::ProbeStatus::Partial
+            );
+            if matches!(
+                outcome.status,
+                protocols::ProbeStatus::Failure
+                    | protocols::ProbeStatus::Partial
+                    | protocols::ProbeStatus::Cancelled
+            ) {
+                warnings.push(formatted);
+            }
+        }
     }
-    warnings.append(&mut result.warnings);
     if let Some(device) = mac
         .as_deref()
         .and_then(|mac| devices.iter_mut().find(|device| device.mac_address == mac))
@@ -1711,6 +2239,7 @@ fn apply_probe(
         unresolved.append(&mut result.observations);
     }
     logger.devices(configuration, devices);
+    failed
 }
 
 async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -2457,8 +2986,15 @@ mod tests {
                     }],
                     ports: vec![],
                     warnings: vec![],
-                    outcomes: vec![(Source::EthernetIp, true)],
-                    outcome_protocols: vec![],
+                    outcomes: vec![protocols::ProbeOutcome {
+                        source: Source::EthernetIp,
+                        protocol: "ethernet-ip",
+                        status: protocols::ProbeStatus::Success,
+                        endpoint: "tcp+udp/44818".into(),
+                        timeout: "2s",
+                        stage: "probe",
+                        messages: vec![],
+                    }],
                 },
             ))),
         );
@@ -2508,7 +3044,7 @@ mod tests {
     }
 
     #[test]
-    fn logs_per_ip_protocol_outcomes_with_timestamp() {
+    fn formats_per_ip_protocol_outcomes_with_timestamp() {
         #[derive(Default)]
         struct CapturingLogger {
             lines: std::sync::Mutex<Vec<String>>,
@@ -2519,13 +3055,115 @@ mod tests {
             }
         }
         let logger = CapturingLogger::default();
-        log_probe(&logger, "192.0.2.10", Source::Snmp.label(), true);
-        log_probe(&logger, "192.0.2.11", Source::S7.label(), false);
+        logger.log(format_diagnostic(
+            "192.0.2.10",
+            None,
+            "snmp",
+            "SUCCESS",
+            "probe-complete",
+            "udp/161; timeout 30s",
+            "inventory",
+            "SNMP inventory collection completed.",
+        ));
+        logger.log(format_diagnostic(
+            "192.0.2.11",
+            None,
+            "s7",
+            "FAIL",
+            "response-mismatch",
+            "tcp/102; timeout 2s",
+            "setup-communication",
+            "S7 response did not match the outstanding request.",
+        ));
         let lines = logger.lines.lock().unwrap();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("["), "missing timestamp: {}", lines[0]);
-        assert!(lines[0].ends_with("] 192.0.2.10 Protocol snmp Success"));
-        assert!(lines[1].ends_with("] 192.0.2.11 Protocol s7 Fail"));
+        assert!(lines[0].starts_with("[ip=192.0.2.10] [snmp] ["));
+        assert!(
+            lines[0].contains(
+                "SUCCESS code=probe-complete endpoint=udp/161; timeout 30s stage=inventory"
+            )
+        );
+        assert!(lines[1].starts_with("[ip=192.0.2.11] [s7] ["));
+        assert!(lines[1].contains("FAIL code=response-mismatch endpoint=tcp/102; timeout 2s"));
+    }
+
+    #[test]
+    fn diagnostics_keep_target_protocol_and_one_line_safe_details() {
+        let formatted = format_log_line(&format_diagnostic(
+            "192.0.2.10",
+            Some("00:11:22:33:44:55"),
+            "s7",
+            "PARTIAL",
+            "response-mismatch",
+            "tcp/102; timeout 2s",
+            "setup-communication",
+            "S7 response mismatch\nnext fake log entry",
+        ));
+
+        assert!(formatted.starts_with("[ip=192.0.2.10 mac=00:11:22:33:44:55] [s7] ["));
+        assert!(formatted.contains("PARTIAL code=response-mismatch"));
+        assert!(formatted.contains("endpoint=tcp/102; timeout 2s"));
+        assert!(formatted.contains("Hint: Verify that replies come from the expected target"));
+        assert!(!formatted.contains('\n'));
+        assert_eq!(
+            diagnostic_code("connection refused", protocols::ProbeStatus::Failure),
+            "connection-refused"
+        );
+        assert_eq!(
+            diagnostic_code("response timed out", protocols::ProbeStatus::Failure),
+            "response-timeout"
+        );
+        assert_eq!(
+            diagnostic_code("Authentication failed", protocols::ProbeStatus::Failure),
+            "authentication-failed"
+        );
+    }
+
+    #[test]
+    fn expected_no_response_is_logged_without_marking_scan_partial() {
+        #[derive(Default)]
+        struct CapturingLogger(std::sync::Mutex<Vec<String>>);
+
+        impl LogOutput for CapturingLogger {
+            fn write(&self, message: String) {
+                self.0.lock().unwrap().push(message);
+            }
+        }
+
+        let logger = CapturingLogger::default();
+        let mut devices = Vec::new();
+        let mut unresolved = Vec::new();
+        let mut warnings = Vec::new();
+        let partial = apply_probe(
+            "Test",
+            &mut devices,
+            &mut unresolved,
+            &mut warnings,
+            &logger,
+            Some(Ok((
+                "192.0.2.10".parse().unwrap(),
+                None,
+                protocols::ProbeResult {
+                    observations: Vec::new(),
+                    ports: Vec::new(),
+                    warnings: Vec::new(),
+                    outcomes: vec![protocols::ProbeOutcome {
+                        source: Source::S7,
+                        protocol: "s7",
+                        status: protocols::ProbeStatus::NoResponse,
+                        endpoint: "tcp/102".into(),
+                        timeout: "2s",
+                        stage: "response",
+                        messages: vec!["No response received from tcp/102 (timeout 2s).".into()],
+                    }],
+                },
+            ))),
+        );
+
+        assert!(!partial);
+        assert!(warnings.is_empty());
+        assert!(logger.0.lock().unwrap()[0].starts_with("[ip=192.0.2.10] [s7] ["));
+        assert!(logger.0.lock().unwrap()[0].contains("NO_RESPONSE code=response-timeout"));
     }
 
     #[tokio::test]

@@ -44,7 +44,7 @@ async fn probe_at(address: SocketAddr) -> Result<Option<Finding>, String> {
                 ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset
             ) =>
         {
-            Ok(None)
+            Err(format!("NetBIOS UDP port {PORT} returned {error}"))
         }
         Ok(Err(error)) => Err(error.to_string()),
         Err(_) => Ok(None),

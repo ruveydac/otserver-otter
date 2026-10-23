@@ -46,6 +46,9 @@ const CONNECT_PORT: u16 = 102;
 const CONNECT_PORT: u16 = 10_102;
 
 pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
+    let mut connected = 0;
+    let mut rejected = 0;
+    let mut last_error = None;
     // Real CPUs reject a connect request whose TSAP does not match a configured
     // connection (RST, FIN, or silence), so every TSAP pairing gets its own connection.
     for (src_tsap, dst_tsap) in TSAP_PAIRS {
@@ -59,18 +62,43 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
         {
             Ok(Ok(stream)) => stream,
             Ok(Err(error)) if matches!(error.kind(), std::io::ErrorKind::ConnectionRefused) => {
-                return Ok(None);
+                return Err(format!(
+                    "TCP connection refused on port {CONNECT_PORT} while testing S7 TSAP {src_tsap:04X}->{dst_tsap:04X}."
+                ));
             }
             Ok(Err(error)) => return Err(format!("S7 {target}: {error}")),
-            Err(_) => return Ok(None),
+            Err(_) => {
+                return Err(format!(
+                    "S7 TCP connection to port {CONNECT_PORT} timed out for TSAP {src_tsap:04X}->{dst_tsap:04X}."
+                ));
+            }
         };
-        if negotiate(&mut stream, &request).await.unwrap_or(false)
-            && let Some(finding) = read_identity(stream, target, src_tsap, dst_tsap).await?
-        {
-            return Ok(Some(finding));
+        connected += 1;
+        match negotiate(&mut stream, &request).await {
+            Ok(true) => match read_identity(stream, target, src_tsap, dst_tsap).await {
+                Ok(Some(finding)) => return Ok(Some(finding)),
+                Ok(None) => rejected += 1,
+                Err(error) => {
+                    last_error = Some(format!("S7 TSAP {src_tsap:04X}->{dst_tsap:04X}: {error}"));
+                }
+            },
+            Ok(false) => rejected += 1,
+            Err(error) => {
+                last_error = Some(format!(
+                    "COTP negotiation failed for S7 TSAP {src_tsap:04X}->{dst_tsap:04X}: {error}"
+                ))
+            }
         }
     }
-    Ok(None)
+    if let Some(error) = last_error {
+        Err(error)
+    } else if connected > 0 && rejected > 0 {
+        Err(format!(
+            "TCP port {CONNECT_PORT} accepted {connected} connection(s), but rejected all tested S7 COTP/TSAP pairings."
+        ))
+    } else {
+        Ok(None)
+    }
 }
 
 fn connect_request(src_tsap: u16, dst_tsap: u16) -> [u8; 22] {
@@ -97,14 +125,14 @@ async fn read_identity(
 ) -> Result<Option<Finding>, String> {
     // COTP acceptance alone does not identify a usable S7 TSAP. A CPU can reject
     // S7 setup on this slot, and an MMS endpoint on port 102 can also accept COTP.
-    if write(&mut stream, SETUP).await.is_err() {
-        return Ok(None);
-    }
-    let Ok(frame) = read_frame(&mut stream).await else {
-        return Ok(None);
-    };
+    write(&mut stream, SETUP)
+        .await
+        .map_err(|error| format!("S7 Setup Communication request failed: {error}"))?;
+    let frame = read_frame(&mut stream)
+        .await
+        .map_err(|error| format!("S7 Setup Communication response failed: {error}"))?;
     if !setup_response(&frame) {
-        return Ok(None);
+        return Err("S7 Setup Communication was not accepted after COTP negotiation.".into());
     }
     let mut warnings = Vec::new();
     let mut responses = Vec::new();
@@ -904,16 +932,15 @@ mod tests {
                 // An MMS server accepts COTP but drops the S7 setup on every TSAP.
             }
         });
-        assert!(
-            timeout(
-                std::time::Duration::from_secs(5),
-                probe(Ipv4Addr::LOCALHOST)
-            )
-            .await
-            .unwrap()
-            .unwrap()
-            .is_none()
-        );
+        let error = timeout(
+            std::time::Duration::from_secs(5),
+            probe(Ipv4Addr::LOCALHOST),
+        )
+        .await
+        .unwrap()
+        .err()
+        .unwrap();
+        assert!(error.contains("S7 Setup Communication response failed"));
         timeout(TIMEOUT, responder).await.unwrap().unwrap();
     }
 

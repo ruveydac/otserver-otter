@@ -35,9 +35,39 @@ pub struct ProbeResult {
     pub observations: Vec<Observation>,
     pub ports: Vec<Port>,
     pub warnings: Vec<String>,
-    pub outcomes: Vec<(Source, bool)>,
-    /// Transport protocol labels aligned with outcomes (separate from export source).
-    pub outcome_protocols: Vec<&'static str>,
+    pub outcomes: Vec<ProbeOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeStatus {
+    Success,
+    Partial,
+    NoResponse,
+    Failure,
+    Cancelled,
+}
+
+impl ProbeStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Success => "SUCCESS",
+            Self::Partial => "PARTIAL",
+            Self::NoResponse => "NO_RESPONSE",
+            Self::Failure => "FAIL",
+            Self::Cancelled => "CANCELLED",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbeOutcome {
+    pub source: Source,
+    pub protocol: &'static str,
+    pub status: ProbeStatus,
+    pub endpoint: String,
+    pub timeout: &'static str,
+    pub stage: &'static str,
+    pub messages: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,7 +274,6 @@ pub async fn scan_with_cancellation(
         warnings.push("Protocol collection cancelled; completed findings retained.".into());
     }
     let mut outcomes = Vec::new();
-    let mut outcome_protocols = Vec::new();
     let results = [
         (selection.s7, Source::S7, "s7", s7),
         (selection.enip, Source::EthernetIp, "ethernet-ip", enip),
@@ -257,21 +286,84 @@ pub async fn scan_with_cancellation(
         (selection.smb, Source::OsFingerprint, "smb", smb),
         (selection.rpc, Source::OsFingerprint, "rpc", rpc),
         (selection.opcua, Source::OpcUa, "opc-ua", ua),
-        (selection.http, Source::Unknown, "http", take(11)),
-        (selection.http, Source::Unknown, "https", take(12)),
+        (selection.http, Source::Http, "http", take(11)),
+        (selection.http, Source::Https, "https", take(12)),
         (selection.ads, Source::BeckhoffAds, "beckhoff-ads", take(13)),
     ];
-    for (enabled, source, protocol, result) in results {
+    for (enabled, source, protocol, mut result) in results {
         if !enabled {
             continue;
         }
-        outcomes.push((source, matches!(result, Ok(Some(_)))));
-        outcome_protocols.push(protocol);
+        if protocol == "beckhoff-ads"
+            && cancelled.load(Ordering::Relaxed)
+            && let Ok(Some(finding)) = &mut result
+        {
+            ads::mark_cancelled(finding);
+        }
+        let endpoint = endpoint(protocol, target, opcua, ads_settings);
+        let (status, stage, messages) = match &result {
+            Ok(Some(finding))
+                if protocol == "beckhoff-ads" && cancelled.load(Ordering::Relaxed) =>
+            {
+                (
+                    ProbeStatus::Cancelled,
+                    "collection",
+                    finding.warnings.clone(),
+                )
+            }
+            Ok(Some(finding))
+                if finding
+                    .warnings
+                    .iter()
+                    .all(|warning| informational_warning(warning)) =>
+            {
+                (ProbeStatus::Success, "probe", finding.warnings.clone())
+            }
+            Ok(Some(finding)) => (ProbeStatus::Partial, "collection", finding.warnings.clone()),
+            Ok(None) if cancelled.load(Ordering::Relaxed) => (
+                ProbeStatus::Cancelled,
+                "probe",
+                vec!["Probe cancelled before a response was collected.".into()],
+            ),
+            Ok(None) => (
+                ProbeStatus::NoResponse,
+                "response",
+                vec![format!(
+                    "No response received from {endpoint} (timeout {}).",
+                    timeout(protocol)
+                )],
+            ),
+            Err(error) if connection_refused(error) || timed_out(error) || peer_closed(error) => (
+                ProbeStatus::NoResponse,
+                if connection_refused(error) {
+                    "connect"
+                } else {
+                    "response"
+                },
+                vec![error.clone()],
+            ),
+            Err(error) if cancelled.load(Ordering::Relaxed) && error.contains("cancelled") => (
+                ProbeStatus::Cancelled,
+                diagnostic_stage(protocol, error),
+                vec![error.clone()],
+            ),
+            Err(error) => (
+                ProbeStatus::Failure,
+                diagnostic_stage(protocol, error),
+                vec![error.clone()],
+            ),
+        };
+        outcomes.push(ProbeOutcome {
+            source,
+            protocol,
+            status,
+            endpoint,
+            timeout: timeout(protocol),
+            stage,
+            messages,
+        });
         match result {
             Ok(Some(mut finding)) => {
-                if cancelled.load(Ordering::Relaxed) && finding.source == Source::BeckhoffAds {
-                    ads::mark_cancelled(&mut finding);
-                }
                 let observed_at = crate::now();
                 finding
                     .fields
@@ -354,8 +446,121 @@ pub async fn scan_with_cancellation(
         ports,
         warnings,
         outcomes,
-        outcome_protocols,
     }
+}
+
+fn endpoint(
+    protocol: &str,
+    target: Ipv4Addr,
+    opcua: &opcua::ProbeSettings,
+    ads: &AdsSettings,
+) -> String {
+    match protocol {
+        "s7" => "tcp/102 (S7 TSAP candidates)".into(),
+        "ethernet-ip" => "tcp+udp/44818".into(),
+        "bacnet" => "udp/47808".into(),
+        "omron-fins" => "tcp+udp/9600".into(),
+        "niagara-fox" => "tcp/1911,4911".into(),
+        "dnp3" => "tcp/20000".into(),
+        "iec61850" => "tcp/102 (MMS)".into(),
+        "netbios" => "udp/137".into(),
+        "smb" => "tcp/445".into(),
+        "rpc" => "tcp/135".into(),
+        "opc-ua" => format!(
+            "opc.tcp/{}",
+            if opcua.ports.is_empty() {
+                "4840,4841,48400".to_owned()
+            } else {
+                opcua
+                    .ports
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        ),
+        "http" => "tcp/80".into(),
+        "https" => "tcp/443".into(),
+        "beckhoff-ads" if ads.target_net_ids.contains_key(&target) => {
+            "tcp/48898 (AMS; configured target NetID)".into()
+        }
+        "beckhoff-ads" => "udp/48899 and tcp/48898 (AMS)".into(),
+        _ => "configured endpoint".into(),
+    }
+}
+
+fn timeout(protocol: &str) -> &'static str {
+    match protocol {
+        "s7" => "2s per TSAP connect; 2s per response; 4s per SZL exchange",
+        "dnp3" => "2s connect; up to 4s per response exchange",
+        "opc-ua" => "4s endpoint request; 5s session; 4s per service request",
+        "beckhoff-ads" => "2s per UDP/TCP exchange",
+        _ => "2s",
+    }
+}
+
+fn informational_warning(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("unencrypted channel") || message.contains("differs from")
+}
+
+fn diagnostic_stage(protocol: &str, message: &str) -> &'static str {
+    let message = message.to_ascii_lowercase();
+    if message.contains("tcp connection")
+        || message.contains("connection to tcp")
+        || message.contains("connect timed out")
+    {
+        return "connect";
+    }
+    match protocol {
+        "s7" if message.contains("setup communication") => "setup-communication",
+        "s7" if message.contains("szl") => "szl-read",
+        "s7" if message.contains("tsap") || message.contains("cotp") => "tsap-negotiate",
+        "ethernet-ip" if message.contains("cip") => "cip-read",
+        "ethernet-ip" => "list-identity",
+        "bacnet" if message.contains("property") => "read-property",
+        "bacnet" => "device-instance",
+        "omron-fins" if message.contains("node-address") => "node-address-negotiate",
+        "omron-fins" => "fins-command",
+        "niagara-fox" if message.contains("tls") => "tls-hello",
+        "niagara-fox" => "fox-hello",
+        "dnp3" => "dnp3-read",
+        "iec61850" if message.contains("directory") => "mms-directory",
+        "iec61850" => "mms-read",
+        "netbios" => "node-status",
+        "smb" if message.contains("identity") || message.contains("challenge") => "session-setup",
+        "smb" => "negotiate",
+        "rpc" => "endpoint-mapper-bind",
+        "opc-ua" if message.contains("endpoint") => "get-endpoints",
+        "opc-ua" if message.contains("session") || message.contains("authentication") => {
+            "activate-session"
+        }
+        "opc-ua" if message.contains("buildinfo") => "read-build-info",
+        "opc-ua" if message.contains("asset") || message.contains("alias") => "asset-discovery",
+        "opc-ua" => "opc-ua-service",
+        "http" | "https" if message.contains("body") => "read-response-body",
+        "http" | "https" => "get-root",
+        "beckhoff-ads" if message.contains("readstate") => "read-state",
+        "beckhoff-ads" if message.contains("readdeviceinfo") => "read-device-info",
+        "beckhoff-ads" => "ams-exchange",
+        _ => "probe",
+    }
+}
+
+fn connection_refused(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("connection refused")
+}
+
+fn timed_out(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("timed out") || message.contains("timeout")
+}
+
+fn peer_closed(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("connection reset")
+        || message.contains("connection closed")
+        || message.contains("peer closed")
 }
 
 type CompletedProbes = Mutex<Vec<(usize, Result<Option<Finding>, String>)>>;
@@ -445,10 +650,38 @@ mod tests {
         assert!(result.observations.is_empty());
         assert!(result.ports.is_empty());
         assert_eq!(result.outcomes.len(), selection.labels().len());
-        assert_eq!(result.outcome_protocols.len(), result.outcomes.len());
-        assert_eq!(result.outcome_protocols.contains(&"smb"), selection.smb);
-        assert_eq!(result.outcome_protocols.contains(&"rpc"), selection.rpc);
-        assert!(result.outcomes.iter().all(|(_, success)| !success));
+        assert_eq!(
+            result
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.protocol == "smb"),
+            selection.smb
+        );
+        assert_eq!(
+            result
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.protocol == "rpc"),
+            selection.rpc
+        );
+        assert!(result.outcomes.iter().all(|outcome| {
+            matches!(
+                outcome.status,
+                ProbeStatus::NoResponse | ProbeStatus::Failure
+            ) && !outcome.messages.is_empty()
+        }));
+        assert!(
+            result
+                .outcomes
+                .iter()
+                .filter(|outcome| outcome.status == ProbeStatus::NoResponse)
+                .all(|outcome| {
+                    !outcome.messages.is_empty()
+                        && (!outcome.messages[0].starts_with("No response received")
+                            || outcome.messages[0].contains(&outcome.endpoint)
+                                && outcome.messages[0].contains(outcome.timeout))
+                })
+        );
         assert!(text(b"  value\0ignored").as_deref() == Some("value"));
         assert_eq!(text(b" \0"), None);
         assert_eq!(hex(&[0xaa, 0x01]), "AA01");
@@ -484,7 +717,6 @@ mod tests {
         assert!(result.ports.is_empty());
         assert!(result.warnings.is_empty());
         assert!(result.outcomes.is_empty());
-        assert!(result.outcome_protocols.is_empty());
     }
 
     #[tokio::test]
@@ -551,10 +783,9 @@ mod tests {
         assert_eq!(result.observations[0].source, Source::NiagaraFox);
         assert_eq!(result.observations[0].fields["name"], "PLC");
         assert_eq!(result.ports.len(), 2);
-        assert_eq!(
-            result.outcomes,
-            vec![(Source::Bacnet, false), (Source::NiagaraFox, true)]
-        );
+        assert_eq!(result.outcomes[0].status, ProbeStatus::Cancelled);
+        assert_eq!(result.outcomes[1].protocol, "niagara-fox");
+        assert_eq!(result.outcomes[1].status, ProbeStatus::Success);
         assert!(
             result
                 .warnings
@@ -708,10 +939,16 @@ mod tests {
         assert_eq!(result.observations[0].raw["subject"]["kind"], "endpoint");
         assert_eq!(result.observations[0].raw["listeners"][0]["port"], 1911);
         assert_eq!(result.ports.len(), 1);
-        let outcomes: std::collections::BTreeMap<Source, bool> =
-            result.outcomes.iter().copied().collect();
-        assert!(outcomes[&Source::NiagaraFox]);
-        assert!(!outcomes[&Source::S7]);
+        let outcomes: std::collections::BTreeMap<&str, ProbeStatus> = result
+            .outcomes
+            .iter()
+            .map(|outcome| (outcome.protocol, outcome.status))
+            .collect();
+        assert_eq!(outcomes["niagara-fox"], ProbeStatus::Success);
+        assert!(matches!(
+            outcomes["s7"],
+            ProbeStatus::NoResponse | ProbeStatus::Failure
+        ));
         assert!(
             result
                 .warnings

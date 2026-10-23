@@ -163,9 +163,14 @@ async fn probe_port(
     }
     if attempts.is_empty() {
         let supported = token_labels(&endpoints).join(", ");
-        warnings.push(format!(
-            "OPC UA server offers no usable authentication (supported: {supported}); configure opcuaCredentials with a username and password for username authentication."
-        ));
+        warnings.push(if username_supported {
+            "OPC UA server requires username authentication, but no usable username/password credential is configured; configure opcuaCredentials."
+                .into()
+        } else {
+            format!(
+                "OPC UA server offers no authentication mode supported by this probe (supported: {supported}); this probe supports anonymous and username/password tokens."
+            )
+        });
         return Ok(Some(finding(
             &url,
             port_number,
@@ -225,6 +230,17 @@ async fn probe_port(
     let mut fields = base_fields();
     match collect_build_info(&session).await {
         Ok(info) => {
+            if let Some(outcomes) = info["readOutcomes"].as_array() {
+                for outcome in outcomes {
+                    if outcome["outcome"] == "bad-status" {
+                        warnings.push(format!(
+                            "OPC UA BuildInfo read for {} returned status {}.",
+                            outcome["field"].as_str().unwrap_or("unknown field"),
+                            outcome["status"].as_str().unwrap_or("unknown")
+                        ));
+                    }
+                }
+            }
             raw.insert("serverBuildInfo".into(), info);
         }
         Err(error) => warnings.push(format!("OPC UA server BuildInfo: {error}")),

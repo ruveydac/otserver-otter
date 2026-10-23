@@ -384,7 +384,7 @@ def assert_web(observations: list[dict]) -> None:
     for item in observations:
         raw = item["raw"]
         tls = raw["protocol"] == "https"
-        assert item["source"] == "unknown" and item["warnings"] == []
+        assert item["source"] == raw["protocol"] and item["warnings"] == []
         assert raw["statusCode"] == (503 if tls else 200)
         assert raw["title"] == "Niagara & Web Panel"
         assert raw["server"] == "OT-Lab-Web/1.0"

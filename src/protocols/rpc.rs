@@ -3,6 +3,7 @@ use super::{Finding, TIMEOUT, hex, ntlm, port};
 use crate::contract::Source;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::io::ErrorKind;
 use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -35,15 +36,24 @@ fn bind() -> Vec<u8> {
 pub(super) async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
     match tokio::time::timeout(TIMEOUT, exchange(target, 135)).await {
         Ok(result) => result.map_err(|error| format!("RPC {target}: {error}")),
-        Err(_) => Ok(None),
+        Err(_) => Err(format!(
+            "RPC bind exchange on TCP port 135 timed out after {} seconds.",
+            TIMEOUT.as_secs()
+        )),
     }
 }
 
 async fn exchange(target: Ipv4Addr, number: u16) -> Result<Option<Finding>, String> {
     crate::traffic::wait().await;
-    let Ok(mut stream) = TcpStream::connect((target, number)).await else {
-        return Ok(None);
-    };
+    let mut stream = TcpStream::connect((target, number))
+        .await
+        .map_err(|error| match error.kind() {
+            ErrorKind::ConnectionRefused => {
+                format!("connection refused on TCP port {number}")
+            }
+            ErrorKind::TimedOut => format!("connection to TCP port {number} timed out"),
+            _ => format!("TCP connection to port {number} failed: {error}"),
+        })?;
     crate::traffic::wait().await;
     stream.write_all(&bind()).await.map_err(|e| e.to_string())?;
     let mut header = [0; 16];
@@ -80,7 +90,10 @@ fn parse(bytes: &[u8], number: u16) -> Result<Option<Finding>, String> {
         if bytes.len() < 19 {
             return Err("truncated RPC bind rejection".into());
         }
-        return Ok(None);
+        return Err(format!(
+            "RPC bind was rejected with bind-nak reason 0x{:04X}.",
+            ntlm::u16le(bytes, 16)?
+        ));
     }
     if bytes[2] != 12 {
         return Err("unsolicited RPC PDU".into());
@@ -120,7 +133,11 @@ fn parse(bytes: &[u8], number: u16) -> Result<Option<Finding>, String> {
         return Err("invalid RPC context result count".into());
     }
     if ntlm::u16le(result, 4)? != 0 {
-        return Ok(None);
+        return Err(format!(
+            "RPC endpoint-mapper presentation context was rejected (result {}, reason {}).",
+            ntlm::u16le(result, 4)?,
+            ntlm::u16le(result, 6)?
+        ));
     }
     if ntlm::u16le(result, 6)? != 0 || result[8..28] != NDR {
         return Err("unoffered RPC transfer syntax".into());
@@ -228,11 +245,21 @@ mod tests {
         assert!(!finding.fields.contains_key("operatingSystem"));
         assert!(finding.raw.get("ntlm").is_none());
         bytes[36] = 2; // Provider rejected the single presentation context.
-        assert!(parse(&bytes, 135).unwrap().is_none());
+        assert!(
+            parse(&bytes, 135)
+                .err()
+                .unwrap()
+                .contains("context was rejected")
+        );
         bytes.truncate(19);
         bytes[2] = 13;
         bytes[8] = 19;
         bytes[16..19].copy_from_slice(&[2, 0, 0]);
-        assert!(parse(&bytes, 135).unwrap().is_none());
+        assert!(
+            parse(&bytes, 135)
+                .err()
+                .unwrap()
+                .contains("bind-nak reason 0x0002")
+        );
     }
 }
