@@ -469,7 +469,7 @@ python3 -B databases/test_generate_database.py
 cargo check --locked
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
-cargo llvm-cov --lib --fail-under-lines 90 --summary-only -- --test-threads=1
+cargo llvm-cov --lib --fail-under-lines 90 --codecov --output-path target/codecov.json -- --test-threads=1
 ./lab/test.sh
 ./lab/test-pnio.sh
 python3 lab/controller_verify.py target/debug/otserver-otter
