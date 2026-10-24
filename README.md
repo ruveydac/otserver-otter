@@ -29,48 +29,6 @@ Otter uses ARP, PROFINET, S7, EtherNet/IP, BACnet, Omron FINS, Beckhoff ADS, Nia
 IEC 61850, NetBIOS, SMB, RPC, HTTP/HTTPS, OPC UA, SNMP, and LLDP to collect identity and network
 evidence.
 
-HTTP discovery sends one `GET /` to TCP 80 and HTTPS to TCP 443, collecting the response
-status code, HTML page title, and `Server` header when present. HTTPS discovery accepts invalid
-certificates, including untrusted, expired, and hostname-mismatched certificates. Each request has
-a two-second deadline and reads at most 64 KiB of body data; redirects are not followed. Disable
-both with `--no-http`, `"noHttp": true`, or the GUI's **HTTP/HTTPS** toggle. Results use the matching
-schema-v2 `http` or `https` observation and port source, with the same protocol in
-`fields.protocols` and `raw.protocol`, plus `raw.statusCode`,
-`raw.title`, and `raw.server`. Titles and server banners remain listener evidence rather than device
-names, operating systems, or firmware versions.
-Results retain per-protocol observations and warnings, including partial results when individual
-probes fail.
-
-The CLI and GUI scan logs report each target-specific probe as one line in the form
-`[ip=ADDRESS] [protocol] [time] OUTCOME code=REASON endpoint=ENDPOINT stage=STAGE: detail`,
-`[mac=MAC] ...` for link-layer scopes, or `[ip=ADDRESS mac=MAC] ...` when both identities are known.
-Layer-2 capture diagnostics identify their broadcast or multicast destination MAC. Outcomes
-distinguish `SUCCESS`, `PARTIAL`, `NO_RESPONSE`, `FAIL`, and `CANCELLED`; `INFO` is used for advisory
-details. `NO_RESPONSE` means only that no correlated reply arrived within the stated operation
-timeout, not that a device is offline or that its credentials are wrong. Failed authentication is
-reported only when the protocol provides explicit evidence.
-
-Beckhoff ADS discovery sends one unicast ServerInfo request to UDP 48899, then uses TCP 48898 to
-read device information and state from AMS ports 10000, 851, and 801. It records ADS runtime names,
-version tuples, states, and the logical AMS NetID; those values are not promoted to hardware model,
-serial number, or firmware. ADS access may require an AMS route already configured on the target.
-Otter does not create routes or change target settings. Disable it with `--no-ads`, `"noAds": true`,
-or the GUI's **Beckhoff ADS** toggle; legacy `noProtocols` disables it too. If UDP discovery is
-unavailable, configure a known target NetID as described below. Secure ADS is not implemented; the
-probe does not downgrade security or try an alternate secure port, so targets that disable plaintext
-ADS may not return identity data.
-
-LLDP includes a concurrent 30-second passive capture on the selected adapter, plus SNMP-reported
-neighbors and optional LLDP-MED inventory. Windows capture requires separately installed Npcap.
-`--no-lldp` disables both paths. Advertised management addresses do not add scan targets.
-EtherNet/IP adds three bounded CIP identity/interface reads after a successful TCP ListIdentity.
-
-Exports keep device firmware, device software revisions, and server/application versions separate.
-OPC UA endpoint security and server BuildInfo remain application evidence under `raw`; they do not
-identify the firmware of devices represented by a gateway. Protocol evidence includes field sources,
-scoped component identities, and collection outcomes where available. These are reported inventory
-values, not proof of patch compliance.
-
 Discovery uses fixed, read-only requests. Otter does not change device configuration, run exploits,
 or perform active vulnerability checks. Only scan networks you own or are authorized to assess.
 Read-only discovery still generates network traffic; assess its suitability for your network.
