@@ -7,7 +7,7 @@
 Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Beckhoff ADS · Fox · DNP3 · IEC 61850 · NetBIOS · SMB · RPC · HTTP/HTTPS · OPC UA · SNMP · LLDP
 
 [![Website](https://img.shields.io/badge/otserver.org-111111?logo=firefoxbrowser&logoColor=white)](https://otserver.org)
-[![codecov](https://codecov.io/gh/ruveydac/OTserver/graph/badge.svg)](https://codecov.io/gh/ruveydac/OTserver)
+[![codecov](https://codecov.io/gh/ruveydac/OTserver-otter/graph/badge.svg)](https://codecov.io/gh/ruveydac/OTserver-otter)
 [![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/Windows_%7C_Linux-0078D6?logo=windows&logoColor=white)](#quick-start)
 [![OTserver](https://img.shields.io/badge/OTserver-Next.js-000000?logo=javascript&logoColor=white)](https://github.com/ruveydac/OTserver)
