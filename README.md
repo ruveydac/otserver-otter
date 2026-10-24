@@ -76,11 +76,7 @@ Windows ARP discovery uses [Npcap](https://npcap.com/#download) when it is avail
 adapter, sending up to 35 requests/s while collecting replies.
 Active PROFINET DCP and PNIO I&M reads also require Npcap. Without it, Otter uses Windows pktmon for
 passive capture, which requires Administrator rights and cannot send DCP Identify or PNIO requests.
-
-With PROFINET enabled, Otter reads module identity and firmware after combining ARP and DCP results.
-PNIO requires an IPv4 address on the selected adapter and an unambiguous discovered device MAC/IP
-pair within the scan scope. Failed API/module enumeration still allows primary I&M0 reads. Skipped
-targets and failed records appear in the scan warnings; successful records remain in the JSON.
+Skipped targets and failed records appear in the scan warnings; successful records remain in the JSON.
 
 ### Use the results
 
@@ -92,20 +88,6 @@ Every scan requires `--ack-authorized`. Run `scan --help` for protocol switches 
 An optional `otter.json` beside the executable stores scan settings and multiple configurations.
 The GUI can edit these settings and run one or all configurations. Local credentials are stored
 in plaintext in that file; restrict its permissions and keep it out of source control.
-
-For Beckhoff ADS, the optional `adsTargetNetIds` mapping supplies the logical NetID for targets
-whose UDP ServerInfo discovery is filtered. `adsSourceNetId` overrides the client NetID derived from
-the selected TCP connection's local IPv4 address. `adsPorts` selects at most eight logical AMS ports
-to query; these are not TCP ports.
-
-```json
-{
-  "targets": ["192.168.1.10"],
-  "adsTargetNetIds": { "192.168.1.10": "192.168.1.10.1.1" },
-  "adsSourceNetId": "192.168.1.20.1.1",
-  "adsPorts": [851, 801]
-}
-```
 
 For central management, enroll the scanner using a token from OTserver:
 
@@ -130,29 +112,6 @@ Run as your normal user. To enroll and install in one step:
 For an already enrolled scanner, run `otserver-otter controller --install --ack-authorized`.
 The saved URL and connection settings are reused. Installation starts the controller and exits;
 the background process runs only managed scans assigned by OTserver.
-
-- **Linux:** installs `~/.local/bin/otserver-otter` and the systemd user unit
-  `otserver-otter-controller.service`. Enables lingering to start at boot and continue after logout.
-  Grants only `CAP_NET_RAW` to the installed executable. If needed, `sudo` prompts in a terminal or
-  PolicyKit prompts from the GUI for capability/lingering changes. Install systemd and the `setcap`
-  tool (usually `libcap2-bin` or `libcap`), plus `sudo` or a desktop PolicyKit agent. Add
-  `~/.local/bin` to your shell's `PATH` if it is not already there.
-- **Windows:** installs `%LOCALAPPDATA%\Programs\OTserver Otter\otserver-otter.exe` and the per-user
-  Task Scheduler task `OTserver Otter controller-<your SID>`. It starts immediately and at login,
-  uses a non-interactive S4U logon to continue after logout, and ignores duplicate task launches.
-  No Windows password is stored. Your account needs **Log on as a batch job** and permission to
-  create its own scheduled tasks. If policy denies these, installation reports the required rights;
-  ask an administrator to grant them and retry. S4U cannot use Windows-integrated network credentials
-  or encrypted files: keep the executable/state on a local, non-EFS path. Otter authenticates to
-  OTserver with its own machine credential. Npcap installation remains separate; raw capture needs
-  an Npcap configuration that allows this user to open the selected adapter.
-
-For unattended operation, installation saves the enrollment-issued **machine credential** in the
-existing private controller state file (Linux directory `0700`, file `0600`; Windows current-user
-ACL). Credential rotation retains that storage choice. Managed SNMP/OPC UA credentials still arrive
-from OTserver for each assignment and are never saved to disk. Connection settings, including proxy
-options and any TLS-validation override, are saved privately and reused after restarts. Enrollment
-tokens are never saved or included in startup commands.
 
 In the GUI, use **OTserver controller → Enroll**, confirm authorization, and enter the controller URL
 and single-use token. After enrollment, select **Install controller** and complete any OS prompt.
@@ -185,7 +144,13 @@ See [AGENTS.md](AGENTS.md) for protocol rules, export-contract requirements, tes
 and the virtual OT lab.
 
 ## License
+OTserver and OTserver Otter are dual-licensed:
 
+GNU Affero General Public License v3.
+A commercial license for enterprises, SaaS providers, and organizations integrating OTserver.
+The open-source core will remain open source, including the scanner, detection needed to find assets and device capabilities, and base asset-management features. Optional proprietary add-ons, such as SSO integrations or customized dashboards, do not replace or restrict that core.
+
+For commercial licensing, SLA support, or enterprise features, visit otserver.org/enterprise.
 OTserver Otter is available under [GNU AGPLv3](LICENCE.md) or a commercial license for proprietary
 use without AGPLv3 copyleft obligations. For commercial licensing, enterprise features, or managed
 hosting, visit [otserver.org/enterprise](https://otserver.org/enterprise/).
