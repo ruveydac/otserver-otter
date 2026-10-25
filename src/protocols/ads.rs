@@ -950,6 +950,43 @@ mod tests {
         assert!(ProbeSettings::from_config(Some("192.168.1.1"), &BTreeMap::new(), &[]).is_err());
         assert!(ProbeSettings::from_config(Some("0.0.0.0.0.0"), &BTreeMap::new(), &[]).is_err());
         assert!(ProbeSettings::from_config(None, &BTreeMap::new(), &[851, 851]).is_err());
+        assert!(ProbeSettings::from_config(None, &BTreeMap::new(), &[0]).is_err());
+        assert!(ProbeSettings::from_config(None, &BTreeMap::new(), &[1; 9]).is_err());
+        assert!(
+            ProbeSettings::from_config(
+                None,
+                &BTreeMap::from([("not-an-ip".into(), "1.2.3.4.5.6".into())]),
+                &[]
+            )
+            .is_err()
+        );
+        assert!(
+            ProbeSettings::from_config(
+                None,
+                &BTreeMap::from([
+                    ("192.0.2.10".into(), "1.2.3.4.5.6".into()),
+                    ("192.000.002.010".into(), "1.2.3.4.5.7".into())
+                ]),
+                &[],
+            )
+            .is_err()
+        );
+        let defaults = ProbeSettings::from_config(
+            None,
+            &BTreeMap::from([("192.0.2.10".into(), "1.2.3.4.5.6".into())]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(defaults.ports(), &DEFAULT_AMS_PORTS);
+
+        let oversized = (0..=MAX_TARGET_NETIDS)
+            .map(|ip| (Ipv4Addr::from(ip as u32).to_string(), "1.2.3.4.5.6".into()))
+            .collect();
+        assert!(ProbeSettings::from_config(None, &oversized, &[]).is_err());
+
+        for invalid in ["1..3.4.5.6", "1.2.3.4.5.256", "1.2.3.4.5.6.7"] {
+            assert!(ProbeSettings::from_config(Some(invalid), &BTreeMap::new(), &[]).is_err());
+        }
     }
 
     #[test]
@@ -962,10 +999,66 @@ mod tests {
         assert_eq!(state.device, 7);
         assert!(DeviceInfo::decode(&[0; 23]).is_err());
         assert!(AdsState::decode(&[0; 9]).is_err());
+        assert!(DeviceInfo::decode(&[0; 3]).is_err());
+        assert!(AdsState::decode(&[0; 3]).is_err());
         assert_eq!(
             DeviceInfo::decode(&1_u32.to_le_bytes()).unwrap_err(),
             AdsResponseError::Service(1),
         );
+        assert_eq!(
+            AdsState::decode(&1_u32.to_le_bytes()).unwrap_err(),
+            AdsResponseError::Service(1),
+        );
+
+        let mut padded = info_response_data();
+        padded[8..24].copy_from_slice(b"  Runtime name  ");
+        assert_eq!(
+            DeviceInfo::decode(&padded).unwrap().name().as_deref(),
+            Some("Runtime name")
+        );
+        padded[8..24].fill(b' ');
+        assert!(DeviceInfo::decode(&padded).unwrap().name().is_none());
+        padded[8..24].fill(b'X');
+        assert_eq!(
+            DeviceInfo::decode(&padded).unwrap().name().as_deref(),
+            Some("XXXXXXXXXXXXXXXX")
+        );
+    }
+
+    #[test]
+    fn state_names_cover_ads_state_values_and_unknown_codes() {
+        let names = [
+            "invalid",
+            "idle",
+            "reset",
+            "init",
+            "start",
+            "run",
+            "stop",
+            "save-config",
+            "load-config",
+            "power-failure",
+            "power-good",
+            "error",
+            "shutdown",
+            "suspend",
+            "resume",
+            "config",
+            "reconfig",
+            "stopping",
+            "incompatible",
+            "exception",
+        ];
+        for (state, name) in names.into_iter().enumerate() {
+            assert_eq!(ads_state_name(state as u16), name);
+        }
+        assert_eq!(ads_state_name(20), "unknown");
+        assert_eq!(ads_state_name(u16::MAX), "unknown");
+        assert_eq!(
+            net_id_from_ipv4(Ipv4Addr::new(192, 0, 2, 10)),
+            [192, 0, 2, 10, 1, 1]
+        );
+        assert_eq!(format_net_id([192, 0, 2, 10, 1, 1]), "192.0.2.10.1.1");
     }
 
     fn info_response_data() -> [u8; 24] {
@@ -992,8 +1085,20 @@ mod tests {
         let mut response = server_info_response(expected);
         response[0] ^= 1;
         assert!(parse_server_info_response(&response).is_err());
+        let mut response = server_info_response(expected);
+        response[4] = 1;
+        assert!(parse_server_info_response(&response).is_err());
+        let mut response = server_info_response(expected);
+        response[8] = 0;
+        assert!(parse_server_info_response(&response).is_err());
         assert!(parse_server_info_response(&server_info_response([0; 6])).is_err());
         assert!(parse_server_info_response(&vec![0; MAX_UDP_RESPONSE + 1]).is_err());
+        let mut response = server_info_response(expected);
+        response[20..24].copy_from_slice(&65_u32.to_le_bytes());
+        assert!(parse_server_info_response(&response).is_err());
+        let mut response = server_info_response(expected);
+        response.push(0);
+        assert!(parse_server_info_response(&response).is_err());
     }
 
     #[test]
@@ -1064,5 +1169,276 @@ mod tests {
         let info = DeviceInfo::decode(&data).unwrap();
         assert_eq!(info.name().as_deref(), Some("TwinCAT PLC 1"));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_collects_device_info_and_state_from_a_configured_target() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, ADS_TCP_PORT))
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for expected_command in [READ_DEVICE_INFO, READ_STATE] {
+                let mut prefix = [0; 6];
+                stream.read_exact(&mut prefix).await.unwrap();
+                let length = u32::from_le_bytes(prefix[2..].try_into().unwrap()) as usize;
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).await.unwrap();
+                let request = AmsHeader::decode(&body[..AMS_HEADER_LENGTH]).unwrap();
+                assert_eq!(request.command, expected_command);
+
+                let response = if expected_command == READ_DEVICE_INFO {
+                    info_response(request)
+                } else {
+                    let data = [0, 0, 0, 0, 5, 0, 7, 0];
+                    let response = AmsHeader {
+                        target_net_id: request.source_net_id,
+                        target_port: request.source_port,
+                        source_net_id: request.target_net_id,
+                        source_port: request.target_port,
+                        state_flags: AMS_RESPONSE,
+                        data_length: data.len() as u32,
+                        error_code: 0,
+                        ..request
+                    };
+                    tcp_frame(response, &data)
+                };
+                stream.write_all(&response).await.unwrap();
+            }
+        });
+
+        let target = Ipv4Addr::LOCALHOST;
+        let settings = ProbeSettings {
+            target_net_ids: BTreeMap::from([(target, [10, 0, 0, 1, 1, 1])]),
+            ams_ports: vec![851],
+            ..ProbeSettings::default()
+        };
+        let finding = probe(target, &settings, &AtomicBool::new(false), |_| {})
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(finding.fields["runtimeName"], "TwinCAT PLC 1");
+        assert_eq!(finding.fields["runtimeVersion"], "3.1.4021");
+        assert_eq!(
+            finding.raw["endpoints"][0]["readState"]["adsStateName"],
+            "run"
+        );
+        assert_eq!(finding.raw["collectionStatus"], "complete");
+        assert_eq!(finding.raw["discovery"]["outcome"], "configured");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_retains_a_configured_identity_when_tcp_is_refused() {
+        let target = "127.0.0.2".parse().unwrap();
+        let settings = ProbeSettings {
+            target_net_ids: BTreeMap::from([(target, [10, 0, 0, 1, 1, 1])]),
+            ..ProbeSettings::default()
+        };
+
+        let finding = probe(target, &settings, &AtomicBool::new(false), |_| {})
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(finding.raw["collectionStatus"], "tcp-connect-failed");
+        assert!(finding.ports.is_empty());
+        assert!(finding.warnings[0].contains("ADS TCP connection failed"));
+    }
+
+    #[tokio::test]
+    async fn probe_cancellation_before_discovery_sends_no_request() {
+        let settings = ProbeSettings::default();
+        let cancelled = AtomicBool::new(true);
+
+        assert!(
+            probe(Ipv4Addr::LOCALHOST, &settings, &cancelled, |_| {})
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_retains_server_info_when_cancelled_before_tcp_reads() {
+        let _network = crate::network_test_lock().await;
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, ADS_UDP_PORT))
+            .await
+            .unwrap();
+        let responder = tokio::spawn(async move {
+            let mut request = [0; 64];
+            let (length, peer) = socket.recv_from(&mut request).await.unwrap();
+            assert_eq!(&request[..length], &server_info_request());
+            socket
+                .send_to(&server_info_response([192, 0, 2, 10, 1, 1]), peer)
+                .await
+                .unwrap();
+        });
+        let cancelled = AtomicBool::new(false);
+        let mut checkpoints = 0;
+        let finding = probe(
+            Ipv4Addr::LOCALHOST,
+            &ProbeSettings::default(),
+            &cancelled,
+            |_| {
+                checkpoints += 1;
+                if checkpoints == 1 {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(checkpoints, 2);
+        assert_eq!(finding.raw["discovery"]["outcome"], "success");
+        assert_eq!(finding.raw["collectionStatus"], "cancelled");
+        assert_eq!(finding.ports.len(), 1);
+        assert_eq!(finding.ports[0].port_id.as_deref(), Some("48899"));
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_preserves_ads_and_payload_errors_then_stops_on_transport_loss() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, ADS_TCP_PORT))
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for (port, command) in [
+                (851, READ_DEVICE_INFO),
+                (851, READ_STATE),
+                (801, READ_DEVICE_INFO),
+                (801, READ_STATE),
+                (10_000, READ_DEVICE_INFO),
+                (10_000, READ_STATE),
+            ] {
+                let mut prefix = [0; 6];
+                stream.read_exact(&mut prefix).await.unwrap();
+                let length = u32::from_le_bytes(prefix[2..].try_into().unwrap()) as usize;
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).await.unwrap();
+                let request = AmsHeader::decode(&body[..AMS_HEADER_LENGTH]).unwrap();
+                assert_eq!((request.target_port, request.command), (port, command));
+                if port == 10_000 && command == READ_STATE {
+                    return;
+                }
+                let (ams_error, data): (u32, &[u8]) = match (port, command) {
+                    (851, READ_DEVICE_INFO) => (0, &1_u32.to_le_bytes()),
+                    (851, READ_STATE) => (0, &0_u32.to_le_bytes()),
+                    (801, READ_DEVICE_INFO) => (0x1234, &[]),
+                    (801, READ_STATE) => (0, &2_u32.to_le_bytes()),
+                    (10_000, READ_DEVICE_INFO) => (0, &[]),
+                    _ => unreachable!(),
+                };
+                let response = AmsHeader {
+                    target_net_id: request.source_net_id,
+                    target_port: request.source_port,
+                    source_net_id: request.target_net_id,
+                    source_port: request.target_port,
+                    state_flags: AMS_RESPONSE,
+                    data_length: data.len() as u32,
+                    error_code: ams_error,
+                    ..request
+                };
+                stream.write_all(&tcp_frame(response, data)).await.unwrap();
+            }
+        });
+        let target = Ipv4Addr::LOCALHOST;
+        let settings = ProbeSettings {
+            source_net_id: Some([10, 0, 0, 1, 1, 1]),
+            target_net_ids: BTreeMap::from([(target, [10, 0, 0, 2, 1, 1])]),
+            ams_ports: vec![851, 801, 10_000],
+        };
+
+        let finding = probe(target, &settings, &AtomicBool::new(false), |_| {})
+            .await
+            .unwrap()
+            .unwrap();
+
+        let endpoints = finding.raw["endpoints"].as_array().unwrap();
+        assert_eq!(endpoints[0]["deviceInfo"]["outcome"], "ads-error");
+        assert_eq!(endpoints[0]["readState"]["outcome"], "invalid-response");
+        assert_eq!(endpoints[1]["deviceInfo"]["outcome"], "ams-error");
+        assert_eq!(endpoints[1]["readState"]["outcome"], "ads-error");
+        assert_eq!(endpoints[2]["deviceInfo"]["outcome"], "invalid-response");
+        assert_eq!(endpoints[2]["readState"]["outcome"], "error");
+        assert_eq!(finding.raw["collectionStatus"], "transport-error");
+        assert!(
+            finding
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("ReadState exchange failed"))
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_reserved_oversized_and_truncated_frames() {
+        async fn read_error(frame: Vec<u8>) -> String {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream.write_all(&frame).await.unwrap();
+                stream.shutdown().await.unwrap();
+            });
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            let error = read_frame(&mut stream, Instant::now() + IO_TIMEOUT)
+                .await
+                .unwrap_err();
+            server.await.unwrap();
+            error
+        }
+
+        assert!(
+            read_error([vec![1, 0], 32_u32.to_le_bytes().to_vec(), vec![0; 32]].concat())
+                .await
+                .contains("reserved field")
+        );
+        assert!(
+            read_error(
+                [
+                    vec![0; 2],
+                    (MAX_TCP_RESPONSE as u32 + 1).to_le_bytes().to_vec()
+                ]
+                .concat()
+            )
+            .await
+            .contains("outside bounds")
+        );
+        assert!(read_error(vec![0, 0]).await.contains("prefix truncated"));
+        assert!(
+            read_error([vec![0; 2], 32_u32.to_le_bytes().to_vec(), vec![0; 8]].concat())
+                .await
+                .contains("body truncated")
+        );
+        let header = AmsHeader {
+            target_net_id: [1; 6],
+            target_port: 851,
+            source_net_id: [2; 6],
+            source_port: 32_768,
+            command: READ_DEVICE_INFO,
+            state_flags: AMS_RESPONSE,
+            data_length: 1,
+            error_code: 0,
+            invoke_id: 1,
+        };
+        assert!(
+            read_error(
+                [
+                    vec![0; 2],
+                    32_u32.to_le_bytes().to_vec(),
+                    header.encode().to_vec()
+                ]
+                .concat()
+            )
+            .await
+            .contains("lengths disagree")
+        );
     }
 }

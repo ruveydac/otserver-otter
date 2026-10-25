@@ -453,6 +453,14 @@ mod tests {
         assert_eq!(decode(&object, 0x4b, 1), Some(json!(42)));
         object[10] |= 8;
         assert_eq!(decode(&object, 0x4b, 1), None);
+
+        let mut routed = response(0x4b, 1, true);
+        routed[5] = 0x28;
+        routed.splice(6..6, [0, 1, 1, 0xaa, 5]);
+        routed.splice(11..11, [0, 1, 1, 0xbb]);
+        let length = routed.len() as u16;
+        routed[2..4].copy_from_slice(&length.to_be_bytes());
+        assert_eq!(decode(&routed, 0x4b, 1), Some(json!(42)));
     }
 
     #[test]
@@ -478,6 +486,13 @@ mod tests {
             error_outcome(&error, 7).as_deref(),
             Some("BACnet Abort reason 0x22")
         );
+
+        let unrecognized = [0x81, 0x0a, 0, 13, 1, 4, 0x50, 7, 0x0c, 0x19, 2, 0x19, 5];
+        assert_eq!(
+            error_outcome(&unrecognized, 7).as_deref(),
+            Some("BACnet Error response with an unrecognized error-class/code encoding")
+        );
+        assert_eq!(error_outcome(&unrecognized, 8), None);
     }
 
     #[tokio::test]
@@ -507,6 +522,9 @@ mod tests {
                         .unwrap();
                     continue;
                 }
+                if property == 0x1c {
+                    continue;
+                }
                 let mut answer = response(property, invoke, property == 0x4b);
                 if property == 0x0c {
                     answer[20..23].copy_from_slice(b"APP");
@@ -521,7 +539,20 @@ mod tests {
         assert_eq!(finding.fields["applicationSoftwareVersion"], "APP");
         assert_eq!(finding.raw["applicationSoftware"], "APP");
         assert!(!finding.fields.contains_key("model"));
-        assert_eq!(finding.warnings.len(), 1);
+        assert_eq!(finding.warnings.len(), 2);
+        assert!(
+            finding
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("BACnet property 28: no correlated response") })
+        );
+        assert!(
+            finding.raw["propertyResponses"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["property"] == 28 && entry["outcome"] == "timeout")
+        );
         responder.await.unwrap();
     }
 
@@ -542,8 +573,33 @@ mod tests {
         latin[19] = 5;
         assert_eq!(decode(&latin, 0x4d, 1), Some(json!("PLC")));
         let mut unknown = response(0x4d, 1, false);
-        unknown[17] = 0x65;
+        unknown[19] = 6;
         assert_eq!(decode(&unknown, 0x4d, 1), None);
+    }
+
+    #[test]
+    fn decodes_utf16_and_utf8_strings_and_rejects_invalid_or_empty_values() {
+        let mut utf16 = response(0x4d, 1, false);
+        utf16[18] = 7;
+        utf16.splice(19..23, [4, 0, b'P', 0, b'L', 0, b'C']);
+        let length = utf16.len() as u16;
+        utf16[2..4].copy_from_slice(&length.to_be_bytes());
+        assert_eq!(decode(&utf16, 0x4d, 1), Some(json!("PLC")));
+
+        let mut invalid_utf16 = utf16.clone();
+        invalid_utf16[20..26].copy_from_slice(&[0xd8, 0, 0, b'P', 0, b'C']);
+        assert_eq!(decode(&invalid_utf16, 0x4d, 1), None);
+
+        let mut invalid_utf8 = response(0x4d, 1, false);
+        invalid_utf8[18] = 2;
+        invalid_utf8.splice(19..23, [0, 0xff]);
+        let length = invalid_utf8.len() as u16;
+        invalid_utf8[2..4].copy_from_slice(&length.to_be_bytes());
+        assert_eq!(decode(&invalid_utf8, 0x4d, 1), None);
+
+        let mut empty = response(0x4d, 1, false);
+        empty[20..23].fill(b' ');
+        assert_eq!(decode(&empty, 0x4d, 1), None);
     }
 
     #[test]

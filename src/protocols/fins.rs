@@ -346,6 +346,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_reader_rejects_invalid_oversized_and_truncated_frames() {
+        async fn read_error(frame: Vec<u8>) -> String {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let responder = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream.write_all(&frame).await.unwrap();
+                stream.shutdown().await.unwrap();
+            });
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            let error = read_tcp(&mut stream).await.unwrap_err();
+            responder.await.unwrap();
+            error
+        }
+
+        assert!(
+            read_error(b"NOPE\0\0\0\0".to_vec())
+                .await
+                .contains("invalid FINS/TCP header")
+        );
+        let mut oversized = b"FINS".to_vec();
+        oversized.extend((65_528_u32).to_be_bytes());
+        assert!(
+            read_error(oversized)
+                .await
+                .contains("oversized FINS/TCP response")
+        );
+        let mut truncated = b"FINS".to_vec();
+        truncated.extend(4_u32.to_be_bytes());
+        truncated.extend([1, 2]);
+        assert!(!read_error(truncated).await.is_empty());
+    }
+
+    #[test]
+    fn parser_keeps_error_identity_and_rejects_truncated_success_data() {
+        let mut response = controller_response();
+        response[12..14].copy_from_slice(&0x1234_u16.to_be_bytes());
+        let (fields, raw, warnings) = parse(&response, 0).unwrap();
+        assert!(!fields.contains_key("model"));
+        assert_eq!(raw["responseCode"], "1234");
+        assert_eq!(warnings, ["Controller returned FINS status 1234."]);
+
+        response[12..14].fill(0);
+        response.truncate(105);
+        assert!(
+            parse(&response, 0)
+                .unwrap_err()
+                .contains("truncated FINS controller data")
+        );
+    }
+
+    #[tokio::test]
     async fn keeps_udp_identity_when_tcp_is_malformed() {
         let _network = crate::network_test_lock().await;
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 9600)).await.unwrap();
@@ -388,8 +440,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probes_tcp_controller_identity() {
+    async fn combines_tcp_and_udp_identity_and_reports_disagreements() {
         let _network = crate::network_test_lock().await;
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 9600)).await.unwrap();
+        let udp_responder = tokio::spawn(async move {
+            let mut request = [0; UDP_REQUEST.len()];
+            let (_, peer) = socket.recv_from(&mut request).await.unwrap();
+            assert_eq!(request, UDP_REQUEST);
+            let mut response = controller_response();
+            response[14..24].copy_from_slice(b"CJ2M-CPU15");
+            response[34..39].copy_from_slice(b"03.00");
+            socket.send_to(&response, peer).await.unwrap();
+        });
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 9600))
             .await
             .unwrap();
@@ -425,7 +487,37 @@ mod tests {
         });
         let finding = probe(Ipv4Addr::LOCALHOST).await.unwrap().unwrap();
         assert_eq!(finding.fields["model"], "CJ2M-CPU32");
-        assert_eq!(finding.ports.len(), 1);
+        assert_eq!(finding.fields["firmwareVersion"], "02.01");
+        assert_eq!(finding.ports.len(), 2);
+        assert_eq!(
+            finding.raw["transportResponses"].as_array().unwrap().len(),
+            2
+        );
+        assert!(
+            finding.warnings.iter().any(|warning| {
+                warning.contains("udp differs from the first identity for model")
+            })
+        );
+        assert!(finding.warnings.iter().any(|warning| {
+            warning.contains("udp differs from the first identity for firmwareVersion")
+        }));
+        responder.await.unwrap();
+        udp_responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_reports_malformed_responses_when_no_correlated_reply_arrives() {
+        let _network = crate::network_test_lock().await;
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 9600)).await.unwrap();
+        let responder = tokio::spawn(async move {
+            let mut request = [0; UDP_REQUEST.len()];
+            let (_, peer) = socket.recv_from(&mut request).await.unwrap();
+            socket.send_to(&[0; 106], peer).await.unwrap();
+        });
+
+        let error = udp(Ipv4Addr::LOCALHOST).await.unwrap_err();
+
+        assert_eq!(error, "malformed or uncorrelated FINS response");
         responder.await.unwrap();
     }
 }

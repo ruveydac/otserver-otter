@@ -721,6 +721,41 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_socket_initializes_link_metadata_without_transmitting() {
+        use std::os::fd::AsRawFd;
+
+        let (fd, address) = match open_raw_socket("lo", 0x0800) {
+            Ok(socket) => socket,
+            Err(error) if error.contains("root or grant CAP_NET_RAW") => return,
+            Err(error) => panic!("could not open loopback raw socket: {error}"),
+        };
+
+        assert!(fd.as_raw_fd() >= 0);
+        assert_eq!(address.sll_family, libc::AF_PACKET as u16);
+        assert_eq!(address.sll_protocol, 0x0800_u16.to_be());
+        assert_eq!(address.sll_halen, 6);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn loopback_arp_scan_handles_a_quiet_local_target() {
+        let result = scan(
+            "lo",
+            "02:00:00:00:00:01",
+            &[Ipv4Addr::LOCALHOST],
+            Duration::from_millis(5),
+            &AtomicBool::new(false),
+        );
+
+        match result {
+            Ok(devices) => assert!(devices.is_empty()),
+            Err(error) if error.contains("root or grant CAP_NET_RAW") => {}
+            Err(error) => panic!("loopback ARP scan failed: {error}"),
+        }
+    }
+
     #[test]
     fn expands_ipv4_targets_and_rejects_oversized_ranges() {
         assert_eq!(
@@ -728,7 +763,19 @@ mod tests {
             [Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::new(192, 0, 2, 2)]
         );
         assert!(expand_targets(&["10.0.0.0/8".into()]).is_err());
+        assert!(expand_targets(&["0.0.0.0/0".into()]).is_err());
         assert!(expand_targets(&["2001:db8::1".into()]).is_err());
+    }
+
+    #[test]
+    fn rejects_too_many_distinct_host_targets_after_deduplication() {
+        let targets: Vec<_> = (0..=MAX_TARGETS)
+            .map(|index| Ipv4Addr::from(index as u32).to_string())
+            .collect();
+
+        let error = expand_targets(&targets).unwrap_err();
+
+        assert!(error.contains("more than 65536 IPv4 addresses"));
     }
 
     #[test]
@@ -815,6 +862,103 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn classifies_only_the_supported_ttl_and_fragmentation_combinations() {
+        assert_eq!(
+            classify(Fingerprint {
+                ttl: 65,
+                dont_fragment: true,
+            }),
+            Some("Windows family")
+        );
+        assert_eq!(
+            classify(Fingerprint {
+                ttl: 1,
+                dont_fragment: true,
+            }),
+            Some("Linux/Unix family")
+        );
+        assert_eq!(
+            classify(Fingerprint {
+                ttl: 255,
+                dont_fragment: false,
+            }),
+            Some("Network/embedded family")
+        );
+        assert_eq!(
+            classify(Fingerprint {
+                ttl: 0,
+                dont_fragment: false,
+            }),
+            None
+        );
+        assert_eq!(
+            classify(Fingerprint {
+                ttl: 65,
+                dont_fragment: false,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn arp_reply_rejects_unrequested_and_mismatched_frames() {
+        let source_mac = [0, 1, 2, 3, 4, 5];
+        let target_mac = [0, 17, 34, 51, 68, 85];
+        let source_ip = Ipv4Addr::new(192, 0, 2, 10);
+        let target_ip = Ipv4Addr::new(192, 0, 2, 20);
+        let requested = BTreeSet::from([target_ip]);
+        let mut valid = request(source_mac, source_ip, target_ip);
+        valid[..6].copy_from_slice(&source_mac);
+        valid[6..12].copy_from_slice(&target_mac);
+        valid[20..22].copy_from_slice(&[0, 2]);
+        valid[22..28].copy_from_slice(&target_mac);
+        valid[28..32].copy_from_slice(&target_ip.octets());
+        valid[32..38].copy_from_slice(&source_mac);
+        valid[38..42].copy_from_slice(&source_ip.octets());
+
+        assert!(reply(&valid[..41], &requested, source_mac, source_ip).is_none());
+        for (offset, replacement) in [
+            (12, vec![0, 0]),
+            (20, vec![0, 1]),
+            (0, vec![1, 2, 3, 4, 5, 6]),
+            (6, vec![9, 9, 9, 9, 9, 9]),
+            (22, vec![9, 9, 9, 9, 9, 9]),
+            (28, vec![192, 0, 2, 21]),
+            (32, vec![9, 9, 9, 9, 9, 9]),
+            (38, vec![192, 0, 2, 11]),
+        ] {
+            let mut malformed = valid;
+            malformed[offset..offset + replacement.len()].copy_from_slice(&replacement);
+            assert!(reply(&malformed, &requested, source_mac, source_ip).is_none());
+        }
+        for invalid_mac in [[0; 6], BROADCAST] {
+            let mut malformed = valid;
+            malformed[6..12].copy_from_slice(&invalid_mac);
+            malformed[22..28].copy_from_slice(&invalid_mac);
+            assert!(reply(&malformed, &requested, source_mac, source_ip).is_none());
+        }
+        assert!(reply(&valid, &BTreeSet::new(), source_mac, source_ip).is_none());
+    }
+
+    #[test]
+    fn device_without_fingerprint_contains_only_arp_evidence() {
+        let device = device(Ipv4Addr::new(192, 0, 2, 30), [2, 0, 0, 0, 0, 1], None);
+
+        assert_eq!(device.observations.len(), 1);
+        assert_eq!(device.observations[0].source, Source::Arp);
+        assert!(!device.observations[0].fields.contains_key("vendor"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interface_ipv4_addresses_selects_only_the_named_interface() {
+        let addresses = interface_ipv4_addresses("lo").unwrap();
+
+        assert!(addresses.contains(&Ipv4Addr::LOCALHOST));
+        assert!(interface_ipv4_addresses("bad\0interface").is_err());
     }
 
     #[test]

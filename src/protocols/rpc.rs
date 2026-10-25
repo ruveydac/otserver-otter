@@ -262,4 +262,49 @@ mod tests {
                 .contains("bind-nak reason 0x0002")
         );
     }
+
+    #[test]
+    fn rejects_truncated_bind_naks_and_unterminated_secondary_addresses() {
+        let truncated_nak = vec![5, 0, 13, 3, 0x10, 0, 0, 0, 18, 0, 0, 0, 1, 0, 0, 0, 2, 0];
+        assert!(
+            parse(&truncated_nak, 135)
+                .err()
+                .unwrap()
+                .contains("truncated RPC bind rejection")
+        );
+        let mut unterminated_address = reply();
+        unterminated_address[29] = b'x';
+        assert!(
+            parse(&unterminated_address, 135)
+                .err()
+                .unwrap()
+                .contains("invalid RPC secondary address")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_fragment_lengths_before_reading_a_response_body() {
+        for fragment_length in [15_u16, 16_385] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let number = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; bind().len()];
+                stream.read_exact(&mut request).await.unwrap();
+                let mut response = [0_u8; 16];
+                response[..2].copy_from_slice(&[5, 0]);
+                response[2] = 12;
+                response[3] = 3;
+                response[4..8].copy_from_slice(&[0x10, 0, 0, 0]);
+                response[8..10].copy_from_slice(&fragment_length.to_le_bytes());
+                stream.write_all(&response).await.unwrap();
+            });
+
+            assert_eq!(
+                exchange(Ipv4Addr::LOCALHOST, number).await.err().unwrap(),
+                "invalid RPC fragment length"
+            );
+            server.await.unwrap();
+        }
+    }
 }

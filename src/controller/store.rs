@@ -360,6 +360,162 @@ fn replace(source: &Path, destination: &Path) -> Result<(), Error> {
         .map_err(|_| Error::Local("Could not atomically replace scanner state."))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("otter-store-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn state_defaults_and_result_sync_require_a_durable_private_file() {
+        let directory = state_dir();
+        let store = Store::open(Some(directory.clone())).unwrap();
+        let loaded = store.load().unwrap();
+        assert!(loaded.scanner.is_none());
+        assert!(loaded.pending_imports.is_empty());
+
+        std::fs::write(store.result_path("run-1"), b"scan export").unwrap();
+        store.sync_result("run-1").unwrap();
+        assert!(matches!(store.sync_result("missing"), Err(Error::Local(_))));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(store.result_path("run-1"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn relative_state_directories_resolve_from_the_current_directory() {
+        let current = std::env::current_dir().unwrap();
+
+        assert_eq!(
+            Store::directory(Some("relative-state".into())).unwrap(),
+            current.join("relative-state")
+        );
+    }
+
+    #[test]
+    fn default_state_directory_uses_the_platform_user_state_location() {
+        let directory = Store::directory(None).unwrap();
+
+        assert!(directory.is_absolute());
+        assert!(directory.ends_with("otserver-otter"));
+        #[cfg(target_os = "linux")]
+        {
+            let base = std::env::var_os("XDG_STATE_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+                })
+                .unwrap();
+            assert_eq!(directory, base.join("otserver-otter"));
+        }
+    }
+
+    #[test]
+    fn file_credentials_are_validated_and_a_missing_reference_is_an_error() {
+        let directory = state_dir();
+        let store = Store::open(Some(directory.clone())).unwrap();
+        let mut state = State::default();
+        assert!(matches!(store.credential(&state), Err(Error::Local(_))));
+
+        let credential = Credential {
+            credential: "a234567890123456789012345678901234567890".into(),
+            credential_expires_at: "2027-01-01T00:00:00Z".into(),
+        };
+        store
+            .persist_credential(&mut state, &credential, true)
+            .unwrap();
+        assert_eq!(
+            store.credential(&state).unwrap(),
+            "a234567890123456789012345678901234567890"
+        );
+
+        state.file_credential.as_mut().unwrap().credential.clear();
+        assert!(store.credential(&state).is_err());
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn malformed_state_is_rejected_instead_of_reset() {
+        let directory = state_dir();
+        let store = Store::open(Some(directory.clone())).unwrap();
+        let path = directory.join("agent-state.json");
+        std::fs::write(&path, b"{not-json").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        assert!(matches!(store.load(), Err(Error::Local(_))));
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn oversized_state_is_rejected_before_deserialization() {
+        let directory = state_dir();
+        let store = Store::open(Some(directory.clone())).unwrap();
+        let path = directory.join("agent-state.json");
+        std::fs::write(&path, vec![b' '; 1024 * 1024 + 1]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        assert!(matches!(store.load(), Err(Error::Invalid)));
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn saved_run_and_import_ids_are_validated_on_load() {
+        let directory = state_dir();
+        let store = Store::open(Some(directory.clone())).unwrap();
+        let invalid_run = State {
+            assignment: Some(super::super::RunState {
+                id: "../run".into(),
+                phase: super::super::Phase::Ready,
+                status: "completed".into(),
+                import_id: None,
+                message: None,
+                upload_attempts: 0,
+            }),
+            ..State::default()
+        };
+        store.save(&invalid_run).unwrap();
+        assert!(matches!(store.load(), Err(Error::Invalid)));
+
+        let invalid_import = State {
+            pending_imports: vec![super::super::PendingImport {
+                id: "bad/id".into(),
+                status: "pending".into(),
+                retries: 0,
+            }],
+            ..State::default()
+        };
+        store.save(&invalid_import).unwrap();
+        assert!(matches!(store.load(), Err(Error::Invalid)));
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
 #[cfg(windows)]
 fn replace(source: &Path, destination: &Path) -> Result<(), Error> {
     use std::os::windows::ffi::OsStrExt;

@@ -38,6 +38,69 @@ fn scanner() -> Scanner {
     }
 }
 
+#[test]
+fn interface_enumeration_failures_are_operator_actionable() {
+    assert_eq!(
+        Error::InterfacesUnavailable.to_string(),
+        "Could not enumerate capture interfaces; retrying in 5 minutes."
+    );
+}
+
+#[cfg(feature = "gui")]
+#[test]
+fn gui_enrollment_info_distinguishes_unenrolled_and_saved_state() {
+    let store = PrivateStore::new();
+    let directory = store.get().path().to_owned();
+
+    assert!(enrollment_info(Some(directory.clone())).unwrap().is_none());
+    store
+        .get()
+        .save(&State {
+            server_url: "https://otserver.example/".into(),
+            scanner: Some(scanner()),
+            settings: Settings {
+                http: HttpOptions {
+                    http_proxy: Some("http://proxy.example:8080".into()),
+                    ..HttpOptions::default()
+                },
+                ..Settings::default()
+            },
+            ..State::default()
+        })
+        .unwrap();
+
+    let info = enrollment_info(Some(directory)).unwrap().unwrap();
+
+    assert_eq!(info.server_url, "https://otserver.example/");
+    assert_eq!(info.name, "Test");
+    assert_eq!(info.site, "site1");
+    assert_eq!(
+        info.http.http_proxy.as_deref(),
+        Some("http://proxy.example:8080")
+    );
+}
+
+#[test]
+fn scanner_report_bounds_adapter_and_address_inventory() {
+    let report = scanner_report().unwrap();
+
+    assert!(report.interfaces.len() <= 32);
+    assert_eq!(report.interfaces.len(), report.network_adapters.len());
+    assert!(report.network_adapters.iter().all(|adapter| {
+        adapter.ip_addresses.len() <= 16
+            && adapter
+                .ip_addresses
+                .iter()
+                .all(|address| address.parse::<IpAddr>().is_ok())
+    }));
+    assert!(
+        report
+            .computer_name
+            .as_ref()
+            .is_none_or(|name| name.len() <= 256)
+    );
+}
+
 fn credential() -> Credential {
     Credential {
         credential: "a".repeat(43),
@@ -86,6 +149,23 @@ async fn server(responses: Vec<(u16, Value)>) -> (Api, tokio::task::JoinHandle<V
     .unwrap();
     api.credential = credential().credential;
     (api, serve(listener, responses))
+}
+
+async fn raw_server(response: Vec<u8>) -> (Api, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut api = Api::new(
+        base_url(&format!("http://{}", listener.local_addr().unwrap())).unwrap(),
+        &HttpOptions::default(),
+    )
+    .unwrap();
+    api.credential = credential().credential;
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let _ = socket.read(&mut request).await;
+        let _ = socket.write_all(&response).await;
+    });
+    (api, task)
 }
 
 fn serve(
@@ -353,6 +433,41 @@ async fn errors_redact_server_bodies_and_classify_auth_and_retry() {
     task.await.unwrap();
 }
 
+#[tokio::test]
+async fn decode_rejects_announced_and_chunked_bodies_over_the_limit() {
+    let oversized_length = crate::MAX_IMPORT_RESPONSE_BYTES + 1;
+    let (api, task) = raw_server(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {oversized_length}\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes(),
+    )
+    .await;
+    let response = api
+        .request(reqwest::Method::GET, "api/test")
+        .unwrap()
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(decode::<Value>(response).await.unwrap_err(), Error::Invalid);
+    task.await.unwrap();
+
+    let mut response =
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+    response.extend(format!("{oversized_length:X}\r\n").as_bytes());
+    response.extend(vec![b'x'; oversized_length]);
+    response.extend_from_slice(b"\r\n0\r\n\r\n");
+    let (api, task) = raw_server(response).await;
+    let response = api
+        .request(reqwest::Method::GET, "api/test")
+        .unwrap()
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(decode::<Value>(response).await.unwrap_err(), Error::Invalid);
+    task.await.unwrap();
+}
+
 #[test]
 fn configuration_maps_profile_options_and_separate_credentials() {
     let api = Api::new(
@@ -463,6 +578,23 @@ fn credentials_reject_unknown_or_invalid_protocol_settings() {
         job.credentials = secrets;
         assert!(mapped_config(&job, &api, &scanner()).is_err());
     }
+
+    let oversized_snmp = (0..33)
+        .map(|_| json!({"version":"2c", "community":"public"}))
+        .collect::<Vec<_>>();
+    let oversized_opcua = (0..33)
+        .map(|_| json!({"username":"operator", "password":"password"}))
+        .collect::<Vec<_>>();
+    for secrets in [
+        json!({"snmp": oversized_snmp}),
+        json!({"opcuaCredentials": oversized_opcua}),
+        json!({"snmp":{"version":"2c", "community":"x".repeat(513)}}),
+        json!({"opcuaPassword":"x".repeat(4097)}),
+    ] {
+        let mut job = assignment(&api);
+        job.credentials = secrets;
+        assert!(mapped_config(&job, &api, &scanner()).is_err());
+    }
 }
 
 #[tokio::test]
@@ -486,6 +618,59 @@ async fn rejected_configuration_reports_a_specific_reason_without_discovery() {
     assert_eq!(requests.len(), 1);
     assert!(requests[0].contains("controller URL does not match --server-url"));
     assert!(!store.get().result_path("run1").exists());
+}
+
+#[tokio::test]
+async fn assigned_run_persists_a_protocol_disabled_scan_then_uploads_and_finishes() {
+    let base = Api::new(
+        base_url("https://example.com").unwrap(),
+        &HttpOptions::default(),
+    )
+    .unwrap();
+    let mut job = assignment(&base);
+    let interfaces = otserver_otter::profinet::interfaces().unwrap();
+    let interface = interfaces
+        .iter()
+        .find(|interface| otserver_otter::profinet::interface_mac(interface).is_some())
+        .expect("test host has an interface with a MAC address");
+    job.configuration["interface"] = json!(interface.name);
+    job.configuration["sourceMac"] = json!(otserver_otter::profinet::interface_mac(interface));
+    job.configuration["noProtocols"] = json!(true);
+    job.configuration["noArp"] = json!(true);
+    job.configuration["noProfinet"] = json!(true);
+    job.configuration["noSnmp"] = json!(true);
+    job.configuration["noLldp"] = json!(true);
+    let lease = job.lease_expires_at.clone();
+    let (api, task) = server(vec![
+        (200, json!({"status":"running"})),
+        (200, json!({"cancelRequested":false,"leaseExpiresAt":lease})),
+        (200, json!({"cancelRequested":false,"leaseExpiresAt":lease})),
+        (200, json!({"cancelRequested":false,"leaseExpiresAt":lease})),
+        (201, json!({"doc":{"id":"import1","status":"completed"}})),
+        (200, json!({"status":"completed"})),
+    ])
+    .await;
+    job.configuration["serverUrl"] = json!(api.base.as_str());
+    let store = PrivateStore::new();
+    let mut state = State {
+        scanner: Some(scanner()),
+        ..State::default()
+    };
+
+    execute(&api, store.get(), &mut state, job).await.unwrap();
+
+    let run = state.assignment.as_ref().unwrap();
+    assert!(run.phase == Phase::Terminal);
+    assert_eq!(run.import_id.as_deref(), Some("import1"));
+    let export: crate::ScanExport =
+        serde_json::from_slice(&std::fs::read(store.get().result_path("run1")).unwrap()).unwrap();
+    assert!(!export.scan.partial);
+    assert!(export.devices.is_empty());
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 6);
+    assert!(requests[0].starts_with("POST /api/otter/v1/runs/run1/start "));
+    assert!(requests[4].starts_with("POST /api/asset-imports "));
+    assert!(requests[5].starts_with("POST /api/otter/v1/runs/run1/finish "));
 }
 
 #[test]
@@ -738,6 +923,13 @@ fn failure_diagnostics_do_not_forward_arbitrary_secret_text() {
         assert!(!scan_failure_reason(error).contains("managed-secret"));
     }
     assert!(scan_failure_reason("Could not write export: disk full").contains("disk space"));
+    assert!(scan_failure_reason("Could not finalize export: disk full").contains("finalize"));
+    assert!(
+        scan_failure_reason("Could not determine the current MAC of interface eth0")
+            .contains("current MAC")
+    );
+    assert!(scan_failure_reason("Operation not permitted").contains("capture privileges"));
+    assert!(scan_failure_reason("invalid scan").contains("validation failed"));
     let legacy: RunState = serde_json::from_value(json!({
         "id":"run1", "phase":"scanning", "status":"failed", "importId":null
     }))
@@ -1311,4 +1503,264 @@ fn installation_requires_enrollment_and_excludes_automatic_reenrollment_argument
         ])
         .is_err()
     );
+}
+
+#[test]
+fn managed_scan_options_resolve_the_selected_interface_and_reject_missing_interfaces() {
+    let interfaces = otserver_otter::profinet::interfaces().unwrap();
+    let candidates = interfaces
+        .iter()
+        .find(|interface| otserver_otter::profinet::interface_mac(interface).is_some())
+        .expect("test host has a capture interface with a MAC address");
+    let candidate_count = interfaces
+        .iter()
+        .filter(|interface| otserver_otter::profinet::interface_mac(interface).is_some())
+        .count();
+    let selected = candidates;
+    let source_mac = otserver_otter::profinet::interface_mac(selected).unwrap();
+    let config = ScannerConfig {
+        name: Some("Managed test".into()),
+        targets: Some(vec!["192.0.2.10".into()]),
+        interface: Some(selected.name.clone()),
+        ..ScannerConfig::default()
+    };
+
+    let options = scan_options(config, PathBuf::from("retained.json")).unwrap();
+    assert_eq!(options.interface, selected.name);
+    assert_eq!(options.source_mac, source_mac);
+    assert_eq!(options.output, PathBuf::from("retained.json"));
+
+    let omitted_interface = ScannerConfig {
+        name: Some("Managed test".into()),
+        targets: Some(vec!["192.0.2.10".into()]),
+        ..ScannerConfig::default()
+    };
+    let inferred = scan_options(omitted_interface, PathBuf::from("inferred.json"));
+    if candidate_count == 1 {
+        assert_eq!(inferred.unwrap().interface, selected.name);
+    } else {
+        assert!(matches!(
+            inferred,
+            Err(Error::Local(
+                "Select an explicit interface in the managed profile."
+            ))
+        ));
+    }
+
+    let missing = ScannerConfig {
+        name: Some("Managed test".into()),
+        targets: Some(vec!["192.0.2.10".into()]),
+        interface: Some("missing-test-interface".into()),
+        source_mac: Some("00:11:22:33:44:55".into()),
+        ..ScannerConfig::default()
+    };
+    assert!(matches!(
+        scan_options(missing, PathBuf::from("unused.json")),
+        Err(Error::Local(
+            "The selected network interface is not available on this scanner."
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn initialization_fails_closed_for_missing_authorization_or_enrollment() {
+    let mut private = PrivateStore::new();
+    private.store.take();
+    let mut args = controller_args(&[
+        "--server-url",
+        "https://example.com",
+        "--state-dir",
+        private.path.to_str().unwrap(),
+    ]);
+    args.ack_authorized = false;
+    assert!(matches!(
+        initialize(&args, None).await,
+        Err(Error::Local("Managed scanning requires --ack-authorized."))
+    ));
+
+    let store = store::Store::open(Some(private.path.clone())).unwrap();
+    let mut state = State {
+        server_url: "https://example.com/".into(),
+        ..State::default()
+    };
+    store
+        .persist_credential(&mut state, &credential(), true)
+        .unwrap();
+    drop(store);
+    assert!(matches!(
+        initialize(
+            &controller_args(&[
+                "--server-url",
+                "https://example.com",
+                "--state-dir",
+                private.path.to_str().unwrap(),
+            ]),
+            None
+        )
+        .await,
+        Err(Error::Local("Enroll this scanner before polling."))
+    ));
+}
+
+#[tokio::test]
+async fn cancellation_poll_finishes_the_matching_run_without_starting_it() {
+    let (mut api, task) = server(vec![
+        (200, json!({"action":"cancel", "runID":"run-cancel"})),
+        (200, json!({"status":"cancelled"})),
+    ])
+    .await;
+    api.credential = credential().credential;
+    let store = PrivateStore::new();
+    let mut state = State {
+        scanner: Some(scanner()),
+        credential_expires_at: credential().credential_expires_at,
+        ..State::default()
+    };
+
+    assert_eq!(
+        poll_once(&mut api, store.get(), &mut state, 45, true).await,
+        Ok(Duration::from_secs(45))
+    );
+    let run = state.assignment.as_ref().unwrap();
+    assert_eq!(run.id, "run-cancel");
+    assert!(run.phase == Phase::Terminal);
+    assert_eq!(run.status, "cancelled");
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].starts_with("POST /api/otter/v1/runs/run-cancel/finish "));
+    assert!(!requests.iter().any(|request| request.contains("/start ")));
+}
+
+#[tokio::test]
+async fn polling_rotates_a_near_expiry_credential_before_reporting_and_clamps_idle_delay() {
+    let rotated = Credential {
+        credential: "c".repeat(43),
+        credential_expires_at: (OffsetDateTime::now_utc() + time::Duration::days(365))
+            .format(&Rfc3339)
+            .unwrap(),
+    };
+    let (mut api, task) = server(vec![
+        (
+            200,
+            json!({
+                "credential": rotated.credential,
+                "credentialExpiresAt": rotated.credential_expires_at
+            }),
+        ),
+        (200, json!({"action":"idle", "retryAfterSeconds":999})),
+    ])
+    .await;
+    let old = Credential {
+        credential: "b".repeat(43),
+        credential_expires_at: (OffsetDateTime::now_utc() + time::Duration::days(10))
+            .format(&Rfc3339)
+            .unwrap(),
+    };
+    api.credential.clone_from(&old.credential);
+    let store = PrivateStore::new();
+    let mut state = State {
+        scanner: Some(scanner()),
+        ..State::default()
+    };
+    store
+        .get()
+        .persist_credential(&mut state, &old, true)
+        .unwrap();
+
+    assert_eq!(
+        poll_once(&mut api, store.get(), &mut state, 30, true).await,
+        Ok(Duration::from_secs(300))
+    );
+    assert_eq!(api.credential, rotated.credential);
+    assert_eq!(store.get().credential(&state).unwrap(), rotated.credential);
+    let requests = task.await.unwrap();
+    assert!(requests[0].starts_with("POST /api/otter/v1/credentials/rotate "));
+    assert!(requests[1].starts_with("POST /api/otter/v1/poll "));
+    assert!(requests[1].contains(&format!("authorization: Otter {}", rotated.credential)));
+}
+
+#[tokio::test]
+async fn queued_import_status_updates_retain_only_active_imports() {
+    let (api, task) = server(vec![
+        (200, json!({"id":"import-running", "status":"running"})),
+        (200, json!({"id":"import-done", "status":"completed"})),
+    ])
+    .await;
+    let store = PrivateStore::new();
+    let mut state = State {
+        pending_imports: vec![
+            PendingImport {
+                id: "import-running".into(),
+                status: "pending".into(),
+                retries: 0,
+            },
+            PendingImport {
+                id: "import-done".into(),
+                status: "running".into(),
+                retries: 1,
+            },
+        ],
+        ..State::default()
+    };
+
+    imports(&api, store.get(), &mut state).await.unwrap();
+
+    assert_eq!(state.pending_imports.len(), 1);
+    assert_eq!(state.pending_imports[0].status, "running");
+    assert_eq!(store.get().load().unwrap().pending_imports.len(), 1);
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("GET /api/asset-imports/import-running "));
+    assert!(requests[1].starts_with("GET /api/asset-imports/import-done "));
+}
+
+#[test]
+fn managed_profile_limits_reject_oversized_and_malformed_values() {
+    let api = Api::new(
+        base_url("https://example.com").unwrap(),
+        &HttpOptions::default(),
+    )
+    .unwrap();
+    for (key, value) in [
+        ("name", json!(" ")),
+        ("interface", json!("eth0\ninvalid")),
+        ("targets", json!([])),
+        ("targets", json!(["x".repeat(65)])),
+        ("opcuaPorts", json!(vec![4840; 65])),
+        ("opcuaPorts", json!([0])),
+        ("sourceMac", json!("invalid")),
+    ] {
+        let mut job = assignment(&api);
+        job.configuration[key] = value;
+        assert!(
+            mapped_config(&job, &api, &scanner()).is_err(),
+            "accepted {key}"
+        );
+    }
+
+    let mut too_many_targets = assignment(&api);
+    too_many_targets.configuration["targets"] = json!(vec!["192.0.2.1"; 1025]);
+    assert!(mapped_config(&too_many_targets, &api, &scanner()).is_err());
+
+    let mut too_many_netids = assignment(&api);
+    too_many_netids.configuration["adsTargetNetIds"] = json!(
+        (0..1025)
+            .map(|index| (
+                format!("192.0.{}.{}", index / 256, index % 256),
+                "1.2.3.4.5.6"
+            ))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    );
+    assert!(mapped_config(&too_many_netids, &api, &scanner()).is_err());
+
+    for credentials in [
+        json!({"snmp": vec![json!({"version":"2c"}); 33]}),
+        json!({"opcuaCredentials": vec![json!({"username":"reader"}); 33]}),
+        json!({"opcuaPassword": "x".repeat(4097)}),
+        json!({"snmp": [{"unexpected": "field"}]}),
+    ] {
+        let mut job = assignment(&api);
+        job.credentials = credentials;
+        assert!(mapped_config(&job, &api, &scanner()).is_err());
+    }
 }

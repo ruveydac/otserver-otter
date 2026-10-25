@@ -958,4 +958,57 @@ mod tests {
         fox_task.await.unwrap();
         bacnet_task.await.unwrap();
     }
+
+    #[test]
+    fn diagnostic_stages_identify_each_protocol_exchange() {
+        for (protocol, message, expected) in [
+            ("s7", "setup communication rejected", "setup-communication"),
+            ("s7", "SZL rejected", "szl-read"),
+            ("s7", "TSAP rejected", "tsap-negotiate"),
+            ("s7", "other", "probe"),
+            ("ethernet-ip", "CIP rejected", "cip-read"),
+            ("ethernet-ip", "other", "list-identity"),
+            ("bacnet", "property rejected", "read-property"),
+            ("bacnet", "other", "device-instance"),
+            (
+                "omron-fins",
+                "node-address rejected",
+                "node-address-negotiate",
+            ),
+            ("omron-fins", "other", "fins-command"),
+            ("niagara-fox", "TLS rejected", "tls-hello"),
+            ("niagara-fox", "other", "fox-hello"),
+            ("dnp3", "other", "dnp3-read"),
+            ("iec61850", "directory rejected", "mms-directory"),
+            ("iec61850", "other", "mms-read"),
+            ("netbios", "other", "node-status"),
+            ("smb", "identity rejected", "session-setup"),
+            ("smb", "other", "negotiate"),
+            ("rpc", "other", "endpoint-mapper-bind"),
+            ("opc-ua", "endpoint rejected", "get-endpoints"),
+            ("opc-ua", "session rejected", "activate-session"),
+            ("opc-ua", "BuildInfo rejected", "read-build-info"),
+            ("opc-ua", "asset rejected", "asset-discovery"),
+            ("opc-ua", "other", "opc-ua-service"),
+            ("http", "body rejected", "read-response-body"),
+            ("https", "other", "get-root"),
+            ("beckhoff-ads", "ReadState rejected", "read-state"),
+            (
+                "beckhoff-ads",
+                "ReadDeviceInfo rejected",
+                "read-device-info",
+            ),
+            ("beckhoff-ads", "other", "ams-exchange"),
+            ("unknown", "other", "probe"),
+            ("unknown", "TCP connection refused", "connect"),
+            ("unknown", "connection to TCP endpoint failed", "connect"),
+            ("unknown", "connect timed out", "connect"),
+        ] {
+            assert_eq!(
+                diagnostic_stage(protocol, message),
+                expected,
+                "{protocol}: {message}"
+            );
+        }
+    }
 }

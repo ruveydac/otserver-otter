@@ -530,6 +530,15 @@ mod tests {
     }
 
     #[test]
+    fn resolves_supported_vendor_ids_without_guessing_unknowns() {
+        assert_eq!(vendor(1), Some("Rockwell Automation/Allen-Bradley"));
+        assert_eq!(vendor(47), Some("Omron Corporation"));
+        assert_eq!(vendor(108), Some("Beckhoff Automation GmbH"));
+        assert_eq!(vendor(145), Some("Siemens"));
+        assert_eq!(vendor(0), None);
+    }
+
+    #[test]
     fn rejects_wrong_context_and_ambiguous_identity_items() {
         let mut response = identity_response();
         response[12] ^= 1;
@@ -545,6 +554,58 @@ mod tests {
                 .unwrap_err()
                 .contains("ambiguous")
         );
+    }
+
+    #[test]
+    fn rejects_malformed_cpf_items_and_identity_fields() {
+        let context = &LIST_IDENTITY[12..20];
+
+        let mut truncated = identity_response();
+        truncated.truncate(40);
+        truncated[2..4].copy_from_slice(&16_u16.to_le_bytes());
+        assert!(
+            parse(&truncated, context)
+                .unwrap_err()
+                .contains("truncated CPF")
+        );
+
+        let mut extra = identity_response();
+        extra.push(0);
+        extra[2..4].copy_from_slice(&45_u16.to_le_bytes());
+        assert!(parse(&extra, context).unwrap_err().contains("item count"));
+
+        let mut missing = identity_response();
+        missing[26..28].copy_from_slice(&0x1234_u16.to_le_bytes());
+        assert!(parse(&missing, context).unwrap_err().contains("missing"));
+
+        let mut invalid = identity_response();
+        invalid[30] = 0;
+        assert!(
+            parse(&invalid, context)
+                .unwrap_err()
+                .contains("List Identity item")
+        );
+
+        let mut bad_version = identity_response();
+        bad_version[32..34].copy_from_slice(&[1, 1]);
+        assert!(
+            parse(&bad_version, context)
+                .unwrap_err()
+                .contains("List Identity item")
+        );
+
+        let mut bad_name = identity_response();
+        bad_name[62] = 5;
+        assert!(
+            parse(&bad_name, context)
+                .unwrap_err()
+                .contains("product name")
+        );
+
+        let mut unknown_vendor = identity_response();
+        unknown_vendor[48..50].copy_from_slice(&u16::MAX.to_le_bytes());
+        let (fields, _) = parse(&unknown_vendor, context).unwrap();
+        assert!(!fields.contains_key("vendor"));
     }
 
     #[test]
@@ -672,5 +733,137 @@ mod tests {
         crate::contract::validate(&scan).unwrap();
         tcp_task.await.unwrap();
         udp_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_identity_survives_a_refused_tcp_listener() {
+        let _network = crate::network_test_lock().await;
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 44818)).await.unwrap();
+        let responder = tokio::spawn(async move {
+            let mut request = [0; 24];
+            let (_, peer) = udp.recv_from(&mut request).await.unwrap();
+            let mut response = identity_response();
+            response[12..20].copy_from_slice(&request[12..20]);
+            udp.send_to(&response, peer).await.unwrap();
+        });
+
+        let finding = probe(Ipv4Addr::LOCALHOST).await.unwrap().unwrap();
+
+        assert_eq!(finding.fields["model"], "PLC1");
+        assert_eq!(finding.ports.len(), 1);
+        assert_eq!(finding.ports[0].key, "udp:44818");
+        assert!(
+            finding
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("TCP connection refused on port 44818") })
+        );
+        assert_eq!(finding.raw["transportResponses"][0]["transport"], "udp");
+        assert!(finding.raw.get("cipReads").is_none());
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_loopback_ports_report_the_first_transport_error() {
+        let _network = crate::network_test_lock().await;
+
+        let error = match probe(Ipv4Addr::LOCALHOST).await {
+            Err(error) => error,
+            Ok(_) => panic!("expected both closed transports to fail"),
+        };
+
+        assert!(error.contains("TCP connection refused on port 44818"));
+    }
+
+    #[tokio::test]
+    async fn malformed_tcp_identity_is_reported_instead_of_becoming_a_finding() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 44818))
+            .await
+            .unwrap();
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 24];
+            stream.read_exact(&mut request).await.unwrap();
+            let mut response = vec![0; 24];
+            response[0] = 0x63;
+            response[12..20].copy_from_slice(&request[12..20]);
+            stream.write_all(&response).await.unwrap();
+        });
+
+        let error = match probe(Ipv4Addr::LOCALHOST).await {
+            Err(error) => error,
+            Ok(_) => panic!("expected malformed ListIdentity data to fail"),
+        };
+        responder.await.unwrap();
+
+        assert!(error.contains("invalid List Identity response"));
+    }
+
+    #[tokio::test]
+    async fn udp_stops_after_too_many_uncorrelated_list_identity_replies() {
+        let _network = crate::network_test_lock().await;
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 44818)).await.unwrap();
+        let responder = tokio::spawn(async move {
+            let mut request = [0; 24];
+            let (_, peer) = socket.recv_from(&mut request).await.unwrap();
+            for _ in 0..32 {
+                socket.send_to(&[0; 26], peer).await.unwrap();
+            }
+        });
+
+        let error = udp(Ipv4Addr::LOCALHOST, &LIST_IDENTITY).await.unwrap_err();
+
+        assert_eq!(error, "too many uncorrelated ListIdentity responses");
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_identity_survives_a_cip_session_that_closes_before_reply() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 44818))
+            .await
+            .unwrap();
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 24];
+            stream.read_exact(&mut request).await.unwrap();
+            let mut response = identity_response();
+            response[12..20].copy_from_slice(&request[12..20]);
+            stream.write_all(&response).await.unwrap();
+
+            let (mut cip, _) = listener.accept().await.unwrap();
+            let mut header = [0; 24];
+            cip.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[..2], [0x65, 0]);
+            let mut body = vec![0; u16::from_le_bytes([header[2], header[3]]) as usize];
+            cip.read_exact(&mut body).await.unwrap();
+            let mut register = [0; 24];
+            register[..2].copy_from_slice(&0x65_u16.to_le_bytes());
+            register[2..4].copy_from_slice(&4_u16.to_le_bytes());
+            register[4..8].copy_from_slice(&42_u32.to_le_bytes());
+            register[12..20].copy_from_slice(&header[12..20]);
+            cip.write_all(&register).await.unwrap();
+            cip.write_all(&[1, 0, 0, 0]).await.unwrap();
+
+            let mut read_header = [0; 24];
+            cip.read_exact(&mut read_header).await.unwrap();
+            assert_eq!(read_header[..2], [0x6f, 0]);
+            let mut read_body =
+                vec![0; u16::from_le_bytes([read_header[2], read_header[3]]) as usize];
+            cip.read_exact(&mut read_body).await.unwrap();
+        });
+
+        let finding = probe(Ipv4Addr::LOCALHOST).await.unwrap().unwrap();
+
+        assert_eq!(finding.fields["model"], "PLC1");
+        assert_eq!(finding.raw["cipReads"][0]["outcome"], "read-error");
+        assert!(
+            finding
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("CIP"))
+        );
+        responder.await.unwrap();
     }
 }
