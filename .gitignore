@@ -10,3 +10,4 @@ coverage/
 pki/
 agent-state.json
 agent.lock
+.opencode

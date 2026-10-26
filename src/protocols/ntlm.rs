@@ -324,7 +324,19 @@ mod tests {
             (6, 1, 7601),
             (6, 2, 9200),
             (6, 3, 9600),
+            (10, 0, 10240),
+            (10, 0, 10586),
+            (10, 0, 15063),
+            (10, 0, 16299),
+            (10, 0, 17134),
             (10, 0, 14393),
+            (10, 0, 18362),
+            (10, 0, 18363),
+            (10, 0, 19041),
+            (10, 0, 19042),
+            (10, 0, 19043),
+            (10, 0, 19044),
+            (10, 0, 19045),
             (10, 0, 20348),
             (10, 0, 22000),
             (10, 0, 22621),
@@ -334,5 +346,73 @@ mod tests {
         ] {
             assert!(!candidates(major, minor, build).is_empty());
         }
+    }
+
+    #[test]
+    fn recognizes_target_info_names_and_ignores_unknown_attributes() {
+        let pairs = [
+            (1_u16, "netbiosComputerName"),
+            (2, "netbiosDomainName"),
+            (3, "dnsComputerName"),
+            (4, "dnsDomainName"),
+            (5, "dnsTreeName"),
+        ];
+        for (id, key) in pairs {
+            let mut bytes = fixture();
+            bytes[56..58].copy_from_slice(&id.to_le_bytes());
+            let (fields, raw) = challenge(&bytes).unwrap();
+            assert_eq!(raw["names"][key], "OTTER-WIN");
+            if key == "dnsComputerName" {
+                assert_eq!(fields["name"], "OTTER-WIN");
+            }
+        }
+
+        let mut unknown = fixture();
+        unknown[56..58].copy_from_slice(&99_u16.to_le_bytes());
+        let (fields, raw) = challenge(&unknown).unwrap();
+        assert!(!fields.contains_key("name"));
+        assert_eq!(raw["names"], json!({}));
+    }
+
+    #[test]
+    fn validates_target_info_flags_and_attribute_lengths() {
+        let fixture = fixture();
+
+        let mut missing_flag = fixture.clone();
+        missing_flag[22] &= !0x80;
+        assert!(
+            challenge(&missing_flag)
+                .unwrap_err()
+                .contains("without negotiated flag")
+        );
+
+        for (id, length) in [(6_u16, 3_u16), (7, 7), (10, 15)] {
+            let mut malformed = fixture.clone();
+            malformed[56..58].copy_from_slice(&id.to_le_bytes());
+            malformed[58..60].copy_from_slice(&length.to_le_bytes());
+            assert!(
+                challenge(&malformed)
+                    .unwrap_err()
+                    .contains("invalid NTLM AV value length")
+            );
+        }
+
+        let mut invalid_terminator = fixture.clone();
+        invalid_terminator.extend_from_slice(&[0xaa, 0xbb]);
+        invalid_terminator[40..44].copy_from_slice(&28_u16.to_le_bytes().repeat(2));
+        invalid_terminator[80..82].copy_from_slice(&2_u16.to_le_bytes());
+        assert!(
+            challenge(&invalid_terminator)
+                .unwrap_err()
+                .contains("invalid NTLM AV terminator")
+        );
+
+        let mut missing_terminator = fixture;
+        missing_terminator[40..44].copy_from_slice(&22_u16.to_le_bytes().repeat(2));
+        assert!(
+            challenge(&missing_terminator)
+                .unwrap_err()
+                .contains("missing NTLM AV terminator")
+        );
     }
 }

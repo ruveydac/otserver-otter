@@ -686,15 +686,6 @@ fn mapped_config(
             ));
         }
     }
-    if config
-        .opcua_credentials
-        .as_ref()
-        .is_some_and(|c| c.to_vec().len() > 32)
-    {
-        return Err(Error::Local(
-            "Managed OPC UA credentials exceed the 32-entry limit.",
-        ));
-    }
     config.server_url = None;
     config.site = None;
     Ok(config)

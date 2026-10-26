@@ -779,8 +779,8 @@ impl GuiApp {
     }
 }
 
-impl eframe::App for GuiApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl GuiApp {
+    fn update_ui(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.controller_rx {
             let result = match rx.try_recv() {
                 Ok(result) => Some(result),
@@ -1526,6 +1526,12 @@ impl eframe::App for GuiApp {
     }
 }
 
+impl eframe::App for GuiApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_ui(ctx);
+    }
+}
+
 fn asset_title(device: &Device) -> String {
     device
         .ip_addresses
@@ -1676,16 +1682,17 @@ pub fn run_gui() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GuiApp, MANUFACTURER_KEYS, MODEL_KEYS, OS_KEYS, OpcuaCredential, OpcuaCredentials,
-        SnmpCredentials, SnmpSettings, asset_field, asset_protocols, asset_title,
-        bound_ip_addresses, json_value_text, merge_assets, opcua_credential_detail,
-        opcua_credential_label, snmp_credential_detail, snmp_version_label,
+        GuiApp, GuiLogger, MANUFACTURER_KEYS, MODEL_KEYS, OS_KEYS, OpcuaCredential,
+        OpcuaCredentials, ScanMessage, SnmpCredentials, SnmpSettings, asset_field, asset_protocols,
+        asset_title, bound_ip_addresses, json_value_text, merge_assets, opcua_credential_detail,
+        opcua_credential_label, protocol_combo, snmp_credential_detail, snmp_version_label,
         with_added_configuration,
     };
     use crate::{ScannerConfig, ScannerConfigs};
     use otserver_otter::contract::{Device, Observation, Source};
     use otserver_otter::profinet::{CaptureInterface, interface_mac};
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     #[test]
     fn gui_scans_do_not_upload_using_hidden_legacy_api_credentials() {
@@ -1719,6 +1726,30 @@ mod tests {
     }
 
     #[test]
+    fn gui_logger_forwards_worker_logs_and_device_snapshots() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let logger = GuiLogger { sender };
+        let device = Device {
+            mac_address: "00:11:22:33:44:55".into(),
+            ..Device::default()
+        };
+
+        crate::LogOutput::write(&logger, "scan started".into());
+        crate::LogOutput::devices(&logger, "Line A", std::slice::from_ref(&device));
+
+        assert!(
+            matches!(receiver.recv().unwrap(), ScanMessage::Log(message) if message == "scan started")
+        );
+        match receiver.recv().unwrap() {
+            ScanMessage::Devices(devices) => {
+                assert_eq!(devices.len(), 1);
+                assert_eq!(devices[0].mac_address, device.mac_address);
+            }
+            _ => panic!("expected device snapshot"),
+        }
+    }
+
+    #[test]
     fn controller_form_masks_tokens_and_has_real_enrollment_controls() {
         let mut app = GuiApp::new(ScannerConfigs::default());
         app.enrollment_token = "secret-enrollment-token".into();
@@ -1731,6 +1762,627 @@ mod tests {
         assert!(!rendered.contains("secret-enrollment-token"));
         assert!(!rendered.contains("API Key") && !rendered.contains("Direct Upload"));
         assert!(app.controller_rx.is_none());
+    }
+
+    #[test]
+    fn gui_update_renders_the_single_configuration_and_empty_assets_state() {
+        let mut app = GuiApp::new(ScannerConfigs::default());
+        app.asset_window_open = true;
+        let context = eframe::egui::Context::default();
+        let output = context.run(eframe::egui::RawInput::default(), |ctx| app.update_ui(ctx));
+        let rendered = format!("{:?}", output.shapes);
+
+        assert!(rendered.contains("This file currently contains one configuration."));
+        assert!(rendered.contains("No assets discovered."));
+        assert!(!app.is_scanning);
+    }
+
+    #[test]
+    fn gui_update_shows_the_empty_assets_message_while_scanning() {
+        let mut app = GuiApp::new(ScannerConfigs::default());
+        app.asset_window_open = true;
+        app.is_scanning = true;
+        let context = eframe::egui::Context::default();
+        let output = context.run(eframe::egui::RawInput::default(), |ctx| app.update_ui(ctx));
+
+        assert!(format!("{:?}", output.shapes).contains("Scanning... no assets found yet."));
+    }
+
+    #[test]
+    fn gui_update_renders_multiple_credentials_and_selected_asset_details() {
+        let configuration = ScannerConfig {
+            name: Some("Line A".into()),
+            snmp: Some(SnmpCredentials::Multiple(vec![SnmpSettings {
+                version: Some("3".into()),
+                username: Some("inventory".into()),
+                auth_protocol: Some("sha256".into()),
+                auth_password: Some("auth-secret".into()),
+                privacy_protocol: Some("aes128".into()),
+                privacy_password: Some("privacy-secret".into()),
+                ..SnmpSettings::default()
+            }])),
+            opcua_credentials: Some(OpcuaCredentials::Multiple(vec![OpcuaCredential {
+                username: Some("operator".into()),
+                password: Some("opcua-secret".into()),
+            }])),
+            ..ScannerConfig::default()
+        };
+        let other = ScannerConfig {
+            name: Some("Line B".into()),
+            ..ScannerConfig::default()
+        };
+        let mut app = GuiApp::new(ScannerConfigs::Multiple(vec![configuration, other]));
+        app.controller_info = Some(crate::controller::EnrollmentInfo {
+            server_url: "https://otserver.example".into(),
+            name: "scanner-1".into(),
+            site: "site-1".into(),
+            http: crate::HttpOptions::default(),
+        });
+        app.asset_window_open = true;
+        app.selected_asset = Some("00:11:22:33:44:55".into());
+        app.assets.push(Device {
+            mac_address: "00:11:22:33:44:55".into(),
+            ip_addresses: vec!["192.0.2.10".into()],
+            observations: vec![Observation {
+                source: Source::Arp,
+                observed_at: "2026-01-01T00:00:00Z".into(),
+                ip_address: Some("192.0.2.10".into()),
+                mac_address: Some("00:11:22:33:44:55".into()),
+                fields: BTreeMap::from([("manufacturer".into(), serde_json::json!("Acme"))]),
+                raw: serde_json::json!({"evidence": "wire", "nested": {"values": [1, 2]}}),
+                warnings: Vec::new(),
+            }],
+            ..Device::default()
+        });
+        let context = eframe::egui::Context::default();
+        let output = context.run(eframe::egui::RawInput::default(), |ctx| app.update_ui(ctx));
+        let rendered = format!("{:?}", output.shapes);
+
+        for text in [
+            "Selected:",
+            "Connection settings",
+            "Authentication Password:",
+            "Privacy Password:",
+            "OPC UA Credentials",
+            "Install controller",
+            "Discovered via: arp",
+            "manufacturer",
+            "evidence",
+        ] {
+            assert!(rendered.contains(text), "missing rendered text: {text}");
+        }
+        assert!(!rendered.contains("auth-secret"));
+        assert!(!rendered.contains("privacy-secret"));
+        assert!(!rendered.contains("opcua-secret"));
+    }
+
+    #[test]
+    fn asset_table_selects_rows_and_clear_log_empties_the_log() {
+        use eframe::egui::{self, epaint::Shape};
+
+        let mac = "00:11:22:33:44:55";
+        let mut app = GuiApp::new(ScannerConfigs::default());
+        app.asset_window_open = true;
+        app.assets.push(Device {
+            mac_address: mac.into(),
+            ip_addresses: vec!["192.0.2.10".into()],
+            ..Device::default()
+        });
+        let context = egui::Context::default();
+        let output = context.run(egui::RawInput::default(), |ctx| app.update_ui(ctx));
+        assert!(format!("{:?}", output.shapes).contains("Select an asset in the table"));
+
+        for label in [mac, "Clear Log"] {
+            let output = context.run(egui::RawInput::default(), |ctx| app.update_ui(ctx));
+            let position = output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    Shape::Text(text) if text.galley.job.text == label => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing clickable label {label}"));
+            for pressed in [true, false] {
+                let _ = context.run(
+                    egui::RawInput {
+                        events: vec![
+                            egui::Event::PointerMoved(position),
+                            egui::Event::PointerButton {
+                                pos: position,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::default(),
+                            },
+                        ],
+                        ..egui::RawInput::default()
+                    },
+                    |ctx| app.update_ui(ctx),
+                );
+            }
+            if label == mac {
+                assert_eq!(app.selected_asset.as_deref(), Some(mac));
+            }
+        }
+        assert!(app.log_text.is_empty());
+    }
+
+    #[test]
+    fn credential_controls_select_add_and_remove_credentials() {
+        use eframe::egui::{self, epaint::Shape};
+
+        let _config_guard = crate::CONFIG_FILE_TEST_LOCK.lock().unwrap();
+        let config_path = std::env::current_exe()
+            .unwrap()
+            .with_file_name("otter.json");
+        if config_path.exists() {
+            return;
+        }
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(config_path);
+
+        let config = ScannerConfig {
+            snmp: Some(SnmpCredentials::Multiple(vec![
+                SnmpSettings {
+                    community: Some("first-community".into()),
+                    ..SnmpSettings::default()
+                },
+                SnmpSettings {
+                    community: Some("second-community".into()),
+                    ..SnmpSettings::default()
+                },
+            ])),
+            opcua_credentials: Some(OpcuaCredentials::Multiple(vec![
+                OpcuaCredential {
+                    username: Some("first-user".into()),
+                    password: Some("first-password".into()),
+                },
+                OpcuaCredential {
+                    username: Some("second-user".into()),
+                    password: Some("second-password".into()),
+                },
+            ])),
+            ..ScannerConfig::default()
+        };
+        let mut app = GuiApp::new(ScannerConfigs::Single(Box::new(config)));
+        let context = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 4000.0));
+
+        fn click_text(
+            app: &mut GuiApp,
+            context: &egui::Context,
+            screen_rect: egui::Rect,
+            label: &str,
+            occurrence: usize,
+        ) {
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    ..egui::RawInput::default()
+                },
+                |ctx| app.update_ui(ctx),
+            );
+            let position = output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    Shape::Text(text) if text.galley.job.text == label => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .nth(occurrence)
+                .unwrap_or_else(|| panic!("missing clickable text {label} #{occurrence}"));
+            for pressed in [true, false] {
+                let _ = context.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen_rect),
+                        events: vec![
+                            egui::Event::PointerMoved(position),
+                            egui::Event::PointerButton {
+                                pos: position,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::default(),
+                            },
+                        ],
+                        ..egui::RawInput::default()
+                    },
+                    |ctx| app.update_ui(ctx),
+                );
+            }
+        }
+
+        click_text(&mut app, &context, screen_rect, "2. SNMPv2c", 0);
+        assert_eq!(app.selected_snmp, 1);
+        assert_eq!(app.snmp_community, "second-community");
+
+        click_text(&mut app, &context, screen_rect, "Add Credential", 0);
+        assert_eq!(app.snmp_credentials.len(), 3);
+        click_text(&mut app, &context, screen_rect, "Add Credential", 1);
+        assert_eq!(app.opcua_credentials.len(), 3);
+
+        click_text(&mut app, &context, screen_rect, "Remove", 1);
+        assert_eq!(app.snmp_credentials.len(), 2);
+        assert_eq!(app.selected_snmp, 1);
+        click_text(&mut app, &context, screen_rect, "Remove", 3);
+        assert_eq!(app.opcua_credentials.len(), 2);
+    }
+
+    #[test]
+    fn interface_selection_updates_the_source_mac_and_saved_configuration() {
+        use eframe::egui::{self, epaint::Shape};
+
+        let _config_guard = crate::CONFIG_FILE_TEST_LOCK.lock().unwrap();
+        let config_path = std::env::current_exe()
+            .unwrap()
+            .with_file_name("otter.json");
+        if config_path.exists() {
+            return;
+        }
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(config_path);
+
+        let first = CaptureInterface {
+            name: "interface-1".into(),
+            friendly_name: "Ethernet 1".into(),
+            description: "Primary Ethernet".into(),
+            addresses: vec!["02:00:00:00:00:01".into(), "192.0.2.1".into()],
+        };
+        let second = CaptureInterface {
+            name: "interface-2".into(),
+            friendly_name: "Ethernet 2".into(),
+            description: "Backup Ethernet".into(),
+            addresses: vec!["02:00:00:00:00:02".into(), "192.0.2.2".into()],
+        };
+        let mut app = GuiApp::new(ScannerConfigs::default());
+        app.interfaces = vec![first, second];
+        app.interface = "interface-1".into();
+        app.source_mac = "02:00:00:00:00:01".into();
+        let context = egui::Context::default();
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 4000.0));
+
+        fn click_text(
+            app: &mut GuiApp,
+            context: &egui::Context,
+            screen_rect: egui::Rect,
+            label: &str,
+        ) {
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    ..egui::RawInput::default()
+                },
+                |ctx| app.update_ui(ctx),
+            );
+            let position = output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    Shape::Text(text) if text.galley.job.text == label => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing clickable text {label}"));
+            for pressed in [true, false] {
+                let _ = context.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen_rect),
+                        events: vec![
+                            egui::Event::PointerMoved(position),
+                            egui::Event::PointerButton {
+                                pos: position,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::default(),
+                            },
+                        ],
+                        ..egui::RawInput::default()
+                    },
+                    |ctx| app.update_ui(ctx),
+                );
+            }
+        }
+
+        click_text(
+            &mut app,
+            &context,
+            screen_rect,
+            "Primary Ethernet (interface-1)",
+        );
+        click_text(
+            &mut app,
+            &context,
+            screen_rect,
+            "Backup Ethernet (interface-2)",
+        );
+
+        assert_eq!(app.interface, "interface-2");
+        assert_eq!(app.source_mac, "02:00:00:00:00:02");
+        app.source_mac = "stale-mac".into();
+        click_text(&mut app, &context, screen_rect, "Auto-fill from Interface");
+        assert_eq!(app.source_mac, "02:00:00:00:00:02");
+        click_text(&mut app, &context, screen_rect, "ARP");
+        assert!(!app.arp_enabled);
+        click_text(&mut app, &context, screen_rect, "Show Assets (0)");
+        assert!(app.asset_window_open);
+        click_text(&mut app, &context, screen_rect, "Save Config");
+        assert!(matches!(app.config_save_result, Some(Ok(_))));
+        let saved: ScannerConfig =
+            serde_json::from_slice(&std::fs::read(&_cleanup.0).unwrap()).unwrap();
+        assert_eq!(saved.interface.as_deref(), Some("interface-2"));
+        assert_eq!(saved.source_mac.as_deref(), Some("02:00:00:00:00:02"));
+        assert_eq!(saved.no_arp, Some(true));
+    }
+
+    #[test]
+    fn scan_buttons_cannot_start_without_authorization_or_valid_config() {
+        let mut unauthorized = GuiApp::new(ScannerConfigs::default());
+        unauthorized.start_scan(false);
+        assert!(unauthorized.status.contains("--ack-authorized required"));
+        assert!(!unauthorized.is_scanning);
+
+        let duplicate = ScannerConfig {
+            name: Some("Line".into()),
+            ..ScannerConfig::default()
+        };
+        let mut invalid = GuiApp::new(ScannerConfigs::Multiple(vec![duplicate.clone(), duplicate]));
+        invalid.ack_authorized = true;
+        invalid.start_scan(false);
+        assert_eq!(invalid.status, "Configuration could not be saved.");
+        assert!(!invalid.is_scanning);
+    }
+
+    #[test]
+    fn authorized_scan_rejects_invalid_ads_settings_before_starting_a_worker() {
+        let _config_guard = crate::CONFIG_FILE_TEST_LOCK.lock().unwrap();
+        let config_path = std::env::current_exe()
+            .unwrap()
+            .with_file_name("otter.json");
+        if config_path.exists() {
+            return;
+        }
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(config_path);
+
+        let config = ScannerConfig {
+            targets: Some(vec!["192.0.2.1".into()]),
+            interface: Some("test-interface".into()),
+            source_mac: Some("00:11:22:33:44:55".into()),
+            ads_ports: Some(vec![0]),
+            ..ScannerConfig::default()
+        };
+        let mut app = GuiApp::new(ScannerConfigs::Single(Box::new(config)));
+        app.ack_authorized = true;
+
+        app.start_scan(false);
+
+        assert!(!app.is_scanning);
+        assert!(app.status.starts_with("Configuration error:"));
+    }
+
+    #[test]
+    fn authorized_scan_persists_config_and_completes_with_probes_disabled() {
+        let _config_guard = crate::CONFIG_FILE_TEST_LOCK.lock().unwrap();
+        let config_path = std::env::current_exe()
+            .unwrap()
+            .with_file_name("otter.json");
+        if config_path.exists() {
+            return;
+        }
+        struct Cleanup {
+            config: PathBuf,
+            directory: PathBuf,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.config);
+                let _ = std::fs::remove_dir_all(&self.directory);
+            }
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "otter-gui-scan-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let _cleanup = Cleanup {
+            config: config_path.clone(),
+            directory: directory.clone(),
+        };
+        let output = directory.join("scan.json");
+        let config = ScannerConfig {
+            targets: Some(vec!["127.0.0.1".into()]),
+            interface: Some("lo".into()),
+            source_mac: Some("00:11:22:33:44:55".into()),
+            output: Some(output.clone()),
+            no_protocols: Some(true),
+            no_arp: Some(true),
+            no_profinet: Some(true),
+            no_snmp: Some(true),
+            no_lldp: Some(true),
+            ..ScannerConfig::default()
+        };
+        let mut app = GuiApp::new(ScannerConfigs::Single(Box::new(config)));
+        app.ack_authorized = true;
+        app.start_scan(false);
+        assert!(app.is_scanning);
+
+        let context = eframe::egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.is_scanning && std::time::Instant::now() < deadline {
+            let _ = context.run(eframe::egui::RawInput::default(), |ctx| app.update_ui(ctx));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(!app.is_scanning, "scan worker did not finish");
+        assert!(app.status.starts_with("Batch finished: 1 complete"));
+        assert!(config_path.exists());
+        let saved: ScannerConfig =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        assert_eq!(saved.output.as_deref(), Some(output.as_path()));
+        let export: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(export["format"], "otserver-scan");
+        assert_eq!(export["devices"].as_array().unwrap().len(), 0);
+
+        app.add_configuration();
+        assert_eq!(app.configs.configs().len(), 2);
+        assert_eq!(app.selected_config, 1);
+        assert_eq!(
+            app.configs.configs()[1].name.as_deref(),
+            Some("Configuration 2")
+        );
+        assert!(matches!(app.config_save_result, Some(Ok(_))));
+
+        app.start_scan(true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.is_scanning && std::time::Instant::now() < deadline {
+            let _ = context.run(eframe::egui::RawInput::default(), |ctx| app.update_ui(ctx));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!app.is_scanning, "run-all worker did not finish");
+        assert!(app.status.starts_with("Batch finished: 2 complete"));
+    }
+
+    #[test]
+    fn gui_update_applies_log_device_and_cancelled_batch_messages() {
+        let mut app = GuiApp::new(ScannerConfigs::default());
+        app.is_scanning = true;
+        app.selected_asset = Some("00:11:22:33:44:66".into());
+        app.cancellation = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(ScanMessage::Log("capture started".into()))
+            .unwrap();
+        sender
+            .send(ScanMessage::Devices(vec![Device {
+                mac_address: "00:11:22:33:44:55".into(),
+                ip_addresses: vec!["192.0.2.10".into()],
+                ..Device::default()
+            }]))
+            .unwrap();
+        sender
+            .send(ScanMessage::Finished(crate::BatchResult {
+                completed: 1,
+                cancelled: true,
+                ..crate::BatchResult::default()
+            }))
+            .unwrap();
+        app.log_rx = Some(receiver);
+        let context = eframe::egui::Context::default();
+
+        let _ = context.run(eframe::egui::RawInput::default(), |ctx| app.update_ui(ctx));
+
+        assert_eq!(app.assets.len(), 1);
+        assert!(app.selected_asset.is_none());
+        assert!(app.log_text.contains("capture started"));
+        assert!(!app.is_scanning);
+        assert!(app.cancellation.is_none());
+        assert!(app.log_rx.is_none());
+        assert!(app.status.starts_with("Batch stopped:"));
+    }
+
+    #[test]
+    fn gui_update_reports_a_disconnected_controller_worker() {
+        let mut app = GuiApp::new(ScannerConfigs::default());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(sender);
+        app.controller_rx = Some(receiver);
+        let context = eframe::egui::Context::default();
+
+        let _ = context.run(eframe::egui::RawInput::default(), |ctx| app.update_ui(ctx));
+
+        assert!(app.controller_rx.is_none());
+        assert!(app.controller_status.contains("stopped unexpectedly"));
+    }
+
+    #[test]
+    fn gui_update_keeps_polling_a_pending_controller_worker() {
+        let mut app = GuiApp::new(ScannerConfigs::default());
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        app.controller_rx = Some(receiver);
+        let context = eframe::egui::Context::default();
+
+        let _ = context.run(eframe::egui::RawInput::default(), |ctx| app.update_ui(ctx));
+
+        assert!(app.controller_rx.is_some());
+        assert!(app.controller_status.starts_with("Not enrolled."));
+    }
+
+    #[test]
+    fn gui_update_applies_controller_installation_and_failure_results() {
+        let context = eframe::egui::Context::default();
+        for (result, expected) in [
+            (
+                Ok(super::ControllerMessage::Installed("Installed.".into())),
+                "Installed.",
+            ),
+            (
+                Err("worker failed".into()),
+                "Controller setup failed: worker failed",
+            ),
+        ] {
+            let mut app = GuiApp::new(ScannerConfigs::default());
+            let (sender, receiver) = std::sync::mpsc::channel();
+            assert!(sender.send(result).is_ok());
+            app.controller_rx = Some(receiver);
+
+            let _ = context.run(eframe::egui::RawInput::default(), |ctx| app.update_ui(ctx));
+
+            assert_eq!(app.controller_status, expected);
+            assert!(app.controller_rx.is_none());
+        }
+    }
+
+    #[test]
+    fn gui_update_reports_a_non_cancelled_batch_summary() {
+        let mut app = GuiApp::new(ScannerConfigs::default());
+        app.is_scanning = true;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(ScanMessage::Finished(crate::BatchResult {
+                completed: 2,
+                partial: 1,
+                failures: vec!["upload failed".into()],
+                cancelled: false,
+            }))
+            .unwrap();
+        app.log_rx = Some(receiver);
+        let context = eframe::egui::Context::default();
+
+        let _ = context.run(eframe::egui::RawInput::default(), |ctx| app.update_ui(ctx));
+
+        assert_eq!(
+            app.status,
+            "Batch finished: 2 complete, 1 partial, 1 failed."
+        );
+        assert!(
+            app.log_text
+                .contains("Batch finished: 2 complete, 1 partial, 1 failed.")
+        );
+        assert!(!app.is_scanning);
+        assert!(app.log_rx.is_none());
     }
 
     #[test]
@@ -2104,6 +2756,142 @@ mod tests {
         assert_eq!(detail, "User ops, authentication + encryption");
         assert!(!detail.contains("auth-secret"));
         assert!(!detail.contains("privacy-secret"));
+        assert_eq!(
+            snmp_credential_detail(&SnmpSettings {
+                version: Some("3".into()),
+                privacy_protocol: Some("aes128".into()),
+                ..SnmpSettings::default()
+            }),
+            "User (username missing), invalid: encryption requires authentication"
+        );
+        assert_eq!(snmp_version_label("unsupported"), "SNMPv2c");
+        assert_eq!(
+            snmp_credential_detail(&SnmpSettings {
+                version: Some("auto".into()),
+                ..SnmpSettings::default()
+            }),
+            "Fallback: v3 if configured, then v2c, then v1"
+        );
+        assert_eq!(
+            snmp_credential_detail(&SnmpSettings {
+                version: Some("3".into()),
+                username: Some("ops".into()),
+                ..SnmpSettings::default()
+            }),
+            "User ops, no authentication"
+        );
+        assert_eq!(
+            snmp_credential_detail(&SnmpSettings {
+                version: Some("3".into()),
+                username: Some("ops".into()),
+                auth_protocol: Some("sha256".into()),
+                ..SnmpSettings::default()
+            }),
+            "User ops, authentication"
+        );
+    }
+
+    #[test]
+    fn single_snmp_credential_is_saved_without_promoting_passwords_to_labels() {
+        let config = ScannerConfig {
+            snmp: Some(SnmpCredentials::Single(SnmpSettings {
+                version: Some("3".into()),
+                username: Some("inventory".into()),
+                auth_protocol: Some("sha256".into()),
+                auth_password: Some("not-for-display".into()),
+                ..SnmpSettings::default()
+            })),
+            ..ScannerConfig::default()
+        };
+        let app = GuiApp::new(ScannerConfigs::Single(Box::new(config)));
+
+        let saved = app.to_config().snmp.unwrap();
+        assert!(
+            matches!(saved, SnmpCredentials::Single(settings) if settings.username.as_deref() == Some("inventory") && settings.auth_password.as_deref() == Some("not-for-display"))
+        );
+        assert!(!snmp_credential_detail(&app.snmp_credentials[0]).contains("not-for-display"));
+    }
+
+    #[test]
+    fn protocol_combo_opens_and_selects_a_supported_option() {
+        use eframe::egui::{self, epaint::Shape};
+
+        let context = egui::Context::default();
+        let mut value = "2c".to_owned();
+        let options = [("2c", "SNMPv2c"), ("3", "SNMPv3")];
+        let output = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                protocol_combo(ui, "test-version", &mut value, &options)
+            });
+        });
+        let combo = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                Shape::Text(text) if text.galley.job.text == "SNMPv2c" => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("selected protocol");
+        for pressed in [true, false] {
+            let _ = context.run(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(combo),
+                        egui::Event::PointerButton {
+                            pos: combo,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::default(),
+                        },
+                    ],
+                    ..egui::RawInput::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        protocol_combo(ui, "test-version", &mut value, &options)
+                    });
+                },
+            );
+        }
+        let output = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                protocol_combo(ui, "test-version", &mut value, &options)
+            });
+        });
+        let option = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                Shape::Text(text) if text.galley.job.text == "SNMPv3" => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("SNMPv3 option in the open menu");
+        for pressed in [true, false] {
+            let _ = context.run(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(option),
+                        egui::Event::PointerButton {
+                            pos: option,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::default(),
+                        },
+                    ],
+                    ..egui::RawInput::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        protocol_combo(ui, "test-version", &mut value, &options)
+                    });
+                },
+            );
+        }
+        assert_eq!(value, "3");
     }
 
     #[test]
@@ -2178,6 +2966,13 @@ mod tests {
         });
         assert_eq!(detail, "Password set");
         assert!(!detail.contains("secret"));
+        assert_eq!(
+            opcua_credential_detail(&OpcuaCredential {
+                username: Some("ops".into()),
+                password: None,
+            }),
+            "Password missing"
+        );
     }
 
     #[test]
@@ -2199,5 +2994,34 @@ mod tests {
             Some(std::path::Path::new("scan-2.json"))
         );
         assert_eq!(added.configs()[1].opcua_ports, Some(vec![4841]));
+    }
+
+    #[test]
+    fn adding_to_multiple_configs_skips_existing_names_and_output_paths() {
+        let configs = ScannerConfigs::Multiple(vec![
+            ScannerConfig {
+                name: Some("Configuration 1".into()),
+                output: Some("scan".into()),
+                ..ScannerConfig::default()
+            },
+            ScannerConfig {
+                name: Some("Configuration 2".into()),
+                output: Some("scan-2".into()),
+                ..ScannerConfig::default()
+            },
+            ScannerConfig {
+                name: Some("Configuration 4".into()),
+                output: Some("scan-3".into()),
+                ..ScannerConfig::default()
+            },
+        ]);
+
+        let added = with_added_configuration(&configs, 0, configs.configs()[0].clone());
+
+        assert_eq!(added.configs()[3].name.as_deref(), Some("Configuration 5"));
+        assert_eq!(
+            added.configs()[3].output.as_deref(),
+            Some(std::path::Path::new("scan-4"))
+        );
     }
 }

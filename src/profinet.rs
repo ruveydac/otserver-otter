@@ -1833,6 +1833,32 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_dcp_capture_stops_on_cancellation_on_loopback() {
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let stop = std::sync::Arc::clone(&cancelled);
+        let cancellation = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            stop.store(true, Ordering::Relaxed);
+        });
+
+        let result = scan(
+            "lo",
+            "02:00:00:00:00:01",
+            Duration::from_millis(1),
+            &cancelled,
+        );
+
+        cancellation.join().unwrap();
+        match result {
+            Ok(devices) => assert!(devices.is_empty()),
+            Err(error) if error.contains("root or grant CAP_NET_RAW") => return,
+            Err(error) => panic!("loopback DCP capture failed: {error}"),
+        }
+        assert!(cancelled.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn parses_identity_and_ip_blocks() {
         let xid = 0x1234_5678;

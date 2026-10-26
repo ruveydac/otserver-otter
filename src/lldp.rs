@@ -468,6 +468,95 @@ mod tests {
         bad[management + 2] = 1;
         assert!(parse(&bad, "02:00:00:00:00:02").is_none());
     }
+
+    #[test]
+    fn parser_retains_optional_text_and_rejects_invalid_mandatory_and_organizational_tlvs() {
+        let mut frame = advertisement();
+        let end = frame.len() - 2;
+        frame.truncate(end);
+        for (kind, value) in [(4_u16, b"port description".as_slice()), (6, b"switch")] {
+            frame.extend(((kind << 9) | value.len() as u16).to_be_bytes());
+            frame.extend(value);
+        }
+        frame.extend([0, 0]);
+        let (device, _) = parse(&frame, "02:00:00:00:00:02").unwrap();
+        assert_eq!(
+            device.observations[0].fields["portDescription"],
+            "port description"
+        );
+        assert_eq!(device.observations[0].fields["description"], "switch");
+
+        let mut oversized_org = b"\x00\x12\xbb\x08".to_vec();
+        oversized_org.extend([b'A'; 33]);
+        for (kind, value) in [
+            (1_u16, vec![0, b'x']),
+            (3, vec![0]),
+            (7, vec![0, 0, 0]),
+            (8, vec![1, 2, 3]),
+            (127, oversized_org),
+        ] {
+            let mut malformed = advertisement();
+            let end = malformed.len() - 2;
+            malformed.truncate(end);
+            malformed.extend(((kind << 9) | value.len() as u16).to_be_bytes());
+            malformed.extend(value);
+            malformed.extend([0, 0]);
+            assert!(
+                parse(&malformed, "02:00:00:00:00:02").is_none(),
+                "accepted malformed TLV type {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_identifier_lengths_and_incomplete_tlv_sequences() {
+        let local = "02:00:00:00:00:02";
+
+        let mut short_mac_chassis = advertisement();
+        short_mac_chassis.splice(22..23, []);
+        short_mac_chassis[15] = 6;
+        assert!(parse(&short_mac_chassis, local).is_none());
+
+        let mut short_mac_port = advertisement();
+        short_mac_port[25] = 3;
+        assert!(parse(&short_mac_port, local).is_none());
+
+        let mut unterminated = advertisement();
+        unterminated.truncate(unterminated.len() - 2);
+        assert!(parse(&unterminated, local).is_none());
+
+        let mut too_many_tlvs = unterminated;
+        for _ in 0..64 {
+            too_many_tlvs.extend((9_u16 << 9).to_be_bytes());
+        }
+        assert!(parse(&too_many_tlvs, local).is_none());
+
+        let mut unknown_med_subtype = advertisement();
+        unknown_med_subtype.truncate(unknown_med_subtype.len() - 2);
+        let value = [0, 0x12, 0xbb, 99];
+        unknown_med_subtype.extend(((127_u16 << 9) | value.len() as u16).to_be_bytes());
+        unknown_med_subtype.extend(value);
+        unknown_med_subtype.extend([0, 0]);
+        let (device, _) = parse(&unknown_med_subtype, local).unwrap();
+        assert_eq!(
+            device.observations[0].raw["inventory"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn rejects_non_lldp_destination_and_multicast_source() {
+        let mut frame = advertisement();
+        frame[5] = 0x0f;
+        assert!(parse(&frame, "02:00:00:00:00:02").is_none());
+
+        let mut frame = advertisement();
+        frame[6] |= 1;
+        assert!(parse(&frame, "02:00:00:00:00:02").is_none());
+    }
     #[test]
     fn cancelled_capture_does_not_open_an_interface() {
         let result = scan("absent", "invalid", &AtomicBool::new(true)).unwrap();
@@ -479,6 +568,33 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.starts_with("Passive LLDP capture:"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn passive_linux_capture_stops_on_cancellation_without_transmitting() {
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let stop = std::sync::Arc::clone(&cancelled);
+        let cancellation = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            stop.store(true, Ordering::Relaxed);
+        });
+
+        let result = scan("lo", "02:00:00:00:00:02", &cancelled).unwrap();
+
+        cancellation.join().unwrap();
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("observed the selected link"))
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("neighbor limit reached"))
         );
     }
 

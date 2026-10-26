@@ -2225,6 +2225,10 @@ mod tests {
             Some("192.0.2.1")
         );
         assert_eq!(
+            ip_address_index("3.8.192.0.2.2.0.0.0.0").as_deref(),
+            Some("192.0.2.2")
+        );
+        assert_eq!(
             ip_address_index("2.16.32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.1").as_deref(),
             Some("2001:db8::1")
         );
@@ -2232,6 +2236,7 @@ mod tests {
             ip_address_index("4.20.254.128.0.0.0.0.0.0.0.0.0.0.0.0.0.1.0.0.0.7").as_deref(),
             Some("fe80::1")
         );
+        assert_eq!(ip_address_index("3.8.192.0.2.2.0.0.0.0.0"), None);
         assert_eq!(
             indexed_mac("0.1.2.3.4.5").as_deref(),
             Some("00:01:02:03:04:05")
@@ -2245,6 +2250,80 @@ mod tests {
             lldp_management_address("4294967295.7.1.1.4.192.0.2.2"),
             Some(("4294967295.7.1".into(), "192.0.2.2".into()))
         );
+    }
+
+    #[test]
+    fn maps_physical_entity_classes_and_med_columns() {
+        assert_eq!(
+            (3..=12).map(entity_class).collect::<Vec<_>>(),
+            [
+                "chassis",
+                "backplane",
+                "container",
+                "power-supply",
+                "fan",
+                "sensor",
+                "module",
+                "port",
+                "stack",
+                "cpu"
+            ]
+        );
+        assert_eq!(entity_class(0), "unknown");
+        assert_eq!(
+            (1..=7).map(med_inventory_name).collect::<Vec<_>>(),
+            [
+                Some("hardwareRevision"),
+                Some("firmwareRevision"),
+                Some("softwareRevision"),
+                Some("serialNumber"),
+                Some("manufacturer"),
+                Some("model"),
+                Some("assetId")
+            ]
+        );
+        assert_eq!(med_inventory_name(0), None);
+        assert_eq!(med_inventory_name(8), None);
+    }
+
+    #[test]
+    fn decodes_lldp_management_addresses_and_rejects_invalid_indices() {
+        assert_eq!(
+            lldp_management_address("0.7.2.2.16.32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.1"),
+            Some(("0.7.2".into(), "2001:db8::1".into()))
+        );
+        assert_eq!(lldp_management_address("0.7"), None);
+        assert_eq!(lldp_management_address("0.7.1.1.4.192.0.2.999"), None);
+        assert_eq!(lldp_management_address("0.7.1.9.4.192.0.2.2"), None);
+    }
+
+    #[tokio::test]
+    async fn query_skips_snmpv3_credentials_that_fail_local_validation() {
+        let invalid = Settings {
+            version: Some("3".into()),
+            username: Some("inventory".into()),
+            auth_protocol: Some("sha256".into()),
+            auth_password: Some("short".into()),
+            ..Settings::default()
+        };
+
+        let (attempts, result) = query_with_attempts(
+            "127.0.0.1",
+            None,
+            &[invalid],
+            QuerySelection {
+                inventory: true,
+                lldp: false,
+            },
+        )
+        .await;
+
+        assert!(attempts.is_empty());
+        let error = result
+            .err()
+            .expect("invalid credentials should be rejected");
+        assert!(!error.is_no_response());
+        assert!(error.to_string().contains("password of at least 8 bytes"));
     }
 
     #[tokio::test]
@@ -2273,6 +2352,14 @@ mod tests {
             (
                 "1.0.8802.1.1.2.1.5.32962.1.2.3.1.2.7.300",
                 string("lab-vlan"),
+            ),
+            (
+                "1.0.8802.1.1.2.1.5.1.1.3.3.1.1.0.7.1",
+                string("MED hardware revision"),
+            ),
+            (
+                "1.0.8802.1.1.2.1.5.4795.1.3.3.1.4.0.7.1",
+                string("MED serial number"),
             ),
             (
                 "1.0.8802.1.1.2.1.5.32962.1.3.1.1.1.0.7.1",
@@ -2340,6 +2427,14 @@ mod tests {
             ("1.0.8802.1.1.2.1.4.1.1.9.0.7.1", string("peer")),
             ("1.0.8802.1.1.2.1.4.1.1.10.0.7.1", string("peer switch")),
             (
+                "1.0.8802.1.1.2.1.4.1.1.11.0.7.1",
+                Value::OctetString(vec![0x14].into()),
+            ),
+            (
+                "1.0.8802.1.1.2.1.4.1.1.12.0.7.1",
+                Value::OctetString(vec![0x04].into()),
+            ),
+            (
                 "1.0.8802.1.1.2.1.4.2.1.3.0.7.1.1.4.192.0.2.2",
                 Value::Integer(2),
             ),
@@ -2375,6 +2470,10 @@ mod tests {
                 "1.3.6.1.2.1.4.34.1.3.2.16.32.1.13.184.0.0.0.0.0.0.0.0.0.0.0.1",
                 Value::Integer(1),
             ),
+            (
+                "1.3.6.1.2.1.4.34.1.3.3.8.192.0.2.2.0.0.0.0.0.0",
+                Value::Integer(1),
+            ),
             ("1.3.6.1.2.1.4.20.1.2.10.10.10.1", Value::Integer(1)),
             (
                 "1.3.6.1.2.1.17.1.1.0",
@@ -2395,7 +2494,10 @@ mod tests {
             ),
             ("1.3.6.1.2.1.17.7.1.4.5.1.1.7", Value::Integer(100)),
             ("1.3.6.1.2.1.31.1.1.1.1.1", string("port-1")),
+            ("1.3.6.1.2.1.31.1.1.1.1.2", string("server port")),
             ("1.3.6.1.2.1.31.1.1.1.15.1", Value::Gauge32(1000)),
+            ("1.3.6.1.2.1.31.1.1.1.18.1", string("uplink alias")),
+            ("1.3.6.1.2.1.31.1.1.1.18.2", string("server port")),
             ("1.3.6.1.2.1.47.1.1.1.1.2.2", string("Main chassis")),
             (
                 "1.3.6.1.2.1.47.1.1.1.1.3.2",
@@ -2417,8 +2519,23 @@ mod tests {
             ("1.3.6.1.2.1.47.1.1.1.1.13.1", string("Power supply")),
             ("1.3.6.1.2.1.47.1.1.1.1.13.2", string("SCALANCE X")),
             ("1.3.6.1.2.1.47.1.1.1.1.13.3", string("SCALANCE stack")),
+            ("1.3.6.1.2.1.47.1.1.1.1.8.3", string("HW8")),
+            ("1.3.6.1.2.1.47.1.1.1.1.11.3", string("STACK-SERIAL")),
+            ("1.3.6.1.2.1.47.1.1.1.1.12.3", string("Siemens")),
+            ("1.3.6.1.2.1.47.1.1.1.1.15.3", string("ASSET-3")),
+            ("1.3.6.1.2.1.47.1.1.1.1.17.3", string("2024-01-01")),
             ("1.3.6.1.2.1.47.1.1.1.1.14.2", string("cabinet-a")),
             ("1.3.6.1.2.1.47.1.1.1.1.16.2", Value::Integer(1)),
+            (
+                "1.3.6.1.2.1.47.1.1.1.1.18.3",
+                string("https://assets.example/stack-3"),
+            ),
+            (
+                "1.3.6.1.2.1.47.1.1.1.1.19.3",
+                Value::OctetString(
+                    vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16].into(),
+                ),
+            ),
             (
                 "1.3.6.1.2.1.47.1.3.2.1.2.2.0",
                 Value::ObjectIdentifier(Oid::parse("1.3.6.1.2.1.2.2.1.1.1").unwrap()),
@@ -2516,8 +2633,10 @@ mod tests {
         assert_eq!(observation.fields["operatingSystem"], "Linux");
         assert_eq!(observation.fields["model"], "SCALANCE stack");
         assert_eq!(observation.fields["firmwareVersion"], "FW8.1");
+        assert_eq!(observation.fields["serialNumber"], "STACK-SERIAL");
+        assert_eq!(observation.fields["hardwareVersion"], "HW8");
         assert_eq!(observation.raw["identityComponentRef"], "entity:3");
-        assert!(observation.raw.get("serialClaim").is_none());
+        assert_eq!(observation.raw["serialClaim"]["original"], "STACK-SERIAL");
         assert_eq!(
             observation.raw["subject"]["macAddress"],
             "00:11:22:33:44:55"
@@ -2532,8 +2651,21 @@ mod tests {
         );
         assert_eq!(result.interfaces[0].speed, Some(1_000_000_000));
         assert_eq!(result.interfaces[0].oper_status.as_deref(), Some("down"));
+        assert_eq!(result.interfaces[0].raw["ifAlias"], "uplink alias");
+        assert_eq!(
+            result.interfaces[1].description.as_deref(),
+            Some("server port")
+        );
         assert_eq!(result.links[0].remote.mac_address, "00:01:02:03:04:05");
         assert_eq!(result.links[0].local.port_id.as_deref(), Some("port-1"));
+        assert_eq!(
+            result.links[0].raw["remoteInventory"]["hardwareRevision"]["value"],
+            "MED hardware revision"
+        );
+        assert_eq!(
+            result.links[0].raw["remoteInventory"]["serialNumber"]["value"],
+            "MED serial number"
+        );
         assert_eq!(
             result.links[0].raw["remoteManagementAddresses"][0],
             "192.0.2.2"
@@ -2585,6 +2717,15 @@ mod tests {
         assert_eq!(
             observation.raw["physicalEntities"][1]["serialClaim"]["scope"],
             "chassis"
+        );
+        assert_eq!(observation.raw["physicalEntities"][2]["assetId"], "ASSET-3");
+        assert_eq!(
+            observation.raw["physicalEntities"][2]["uris"],
+            "https://assets.example/stack-3"
+        );
+        assert_eq!(
+            observation.raw["physicalEntities"][2]["uuid"],
+            "0102030405060708090A0B0C0D0E0F10"
         );
         assert_eq!(
             observation.raw["entityInterfaceMappings"][0]["interfaceKey"],
@@ -2755,6 +2896,93 @@ mod tests {
         );
         assert_eq!(degraded.links.len(), 1);
         assert!(degraded.links[0].raw["remoteDot3"].is_null());
+
+        *failed_oid.lock().unwrap() = Some("1.3.6.1.2.1.1.1.0".into());
+        let (attempts, failed) = query_with_attempts(
+            "127.0.0.1",
+            Some("00:11:22:33:44:55"),
+            &[settings("2c")],
+            QuerySelection {
+                inventory: true,
+                lldp: false,
+            },
+        )
+        .await;
+        assert_eq!(attempts.len(), 1);
+        assert!(!attempts[0].success);
+        assert!(attempts[0].failure.is_some());
+        let error = failed.err().expect("the agent error should be returned");
+        assert!(!error.is_no_response());
+
+        for (prefix, inventory_complete) in [
+            ("1.3.6.1.2.1.31.1.1.1.18", false),
+            ("1.3.6.1.2.1.4.20.1.2", false),
+            ("1.3.6.1.2.1.4.34.1.3", false),
+            ("1.3.6.1.2.1.47.1.1.1.1.2", false),
+            ("1.3.6.1.2.1.47.1.1.1.1.3", false),
+            ("1.3.6.1.2.1.47.1.3.2.1.2", false),
+            ("1.3.6.1.2.1.17.1.4.1.2", false),
+            ("1.3.6.1.2.1.17.4.3.1.2", false),
+            ("1.3.6.1.2.1.17.7.1.4.2.1.4", false),
+            ("1.3.6.1.2.1.17.7.1.4.5.1.1", false),
+            ("1.0.62439.1", false),
+        ] {
+            *failed_oid.lock().unwrap() = Some(prefix.into());
+            let result = query(
+                "127.0.0.1",
+                Some("00:11:22:33:44:55"),
+                &settings("2c"),
+                QuerySelection {
+                    inventory: true,
+                    lldp: false,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.inventory_complete, inventory_complete, "{prefix}");
+            assert!(
+                result
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(prefix)),
+                "missing warning for {prefix}"
+            );
+        }
+
+        for prefix in [
+            "1.0.8802.1.1.2.1.3.1.0",
+            "1.0.8802.1.1.2.1.3.7.1.2",
+            "1.0.8802.1.1.2.1.5.4623.1.2",
+            "1.0.8802.1.1.2.1.3.8.1.3",
+            "1.0.8802.1.1.2.1.4.2.1.3",
+        ] {
+            *failed_oid.lock().unwrap() = Some(prefix.into());
+            let result = query(
+                "127.0.0.1",
+                Some("00:11:22:33:44:55"),
+                &settings("2c"),
+                QuerySelection {
+                    inventory: false,
+                    lldp: true,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!result.lldp_complete, "{prefix}");
+        }
+
+        *failed_oid.lock().unwrap() = Some("1.0.8802.1.1.2.1.4.1.1.4".into());
+        let failed_lldp = query(
+            "127.0.0.1",
+            Some("00:11:22:33:44:55"),
+            &settings("2c"),
+            QuerySelection {
+                inventory: false,
+                lldp: true,
+            },
+        )
+        .await;
+        assert!(failed_lldp.is_err());
 
         task.abort();
     }
