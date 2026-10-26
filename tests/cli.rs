@@ -65,18 +65,18 @@ fn validate_command_reports_a_valid_contract_export() {
 fn validate_command_returns_a_nonzero_exit_for_a_missing_file() {
     let directory = temporary_directory("missing-export");
     let missing = directory.join("missing.json");
+    let expected_error = std::fs::read(&missing).unwrap_err();
+    assert_eq!(expected_error.kind(), std::io::ErrorKind::NotFound);
+
     let output = Command::new(BINARY)
         .args(["validate"])
         .arg(&missing)
         .output()
         .unwrap();
 
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("No such file")
-    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(&expected_error.to_string()), "{stderr}");
     std::fs::remove_dir_all(directory).unwrap();
 }
 
