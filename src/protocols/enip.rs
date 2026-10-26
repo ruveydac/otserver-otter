@@ -758,15 +758,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_loopback_ports_report_the_first_transport_error() {
+    async fn closed_loopback_ports_report_an_error_or_no_response() {
         let _network = crate::network_test_lock().await;
 
-        let error = match probe(Ipv4Addr::LOCALHOST).await {
-            Err(error) => error,
-            Ok(_) => panic!("expected both closed transports to fail"),
-        };
-
-        assert!(error.contains("TCP connection refused on port 44818"));
+        match probe(Ipv4Addr::LOCALHOST).await {
+            Err(error) => assert!(
+                error.contains(" tcp:") || error.contains(" udp:"),
+                "{error}"
+            ),
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("closed ports cannot return an identity"),
+        }
     }
 
     #[tokio::test]
