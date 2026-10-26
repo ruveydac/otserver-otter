@@ -3663,10 +3663,17 @@ mod tests {
     }
 
     fn local_scan_options(output: PathBuf) -> ScanOptions {
+        let (interface, source_mac) = profinet::interfaces()
+            .unwrap()
+            .into_iter()
+            .find_map(|interface| {
+                profinet::interface_mac(&interface).map(|mac| (interface.name, mac))
+            })
+            .expect("cancellation tests require a local interface with a MAC address");
         ScanOptions {
             targets: vec![Ipv4Addr::LOCALHOST.to_string()],
-            interface: "lo".into(),
-            source_mac: "00:11:22:33:44:55".into(),
+            interface,
+            source_mac,
             output,
             protocols: no_protocols(),
             allow_dcp_source: false,
@@ -3790,10 +3797,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_retains_a_correlated_udp_identity_when_tcp_is_refused() {
+    async fn scan_retains_a_correlated_udp_identity_when_tcp_is_malformed() {
+        // A closed port may time out on Windows instead of reporting connection refusal.
+        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 44818))
+            .await
+            .unwrap();
         let udp = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 44818))
             .await
             .unwrap();
+        let tcp_responder = tokio::spawn(async move {
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            let mut request = [0; 24];
+            stream.read_exact(&mut request).await.unwrap();
+            stream.write_all(&[0; 24]).await.unwrap();
+        });
         let responder = tokio::spawn(async move {
             let mut request = [0; 24];
             let (_, peer) = udp.recv_from(&mut request).await.unwrap();
@@ -3844,9 +3861,11 @@ mod tests {
         let export: ScanExport =
             serde_json::from_slice(&tokio::fs::read(&output).await.unwrap()).unwrap();
         tokio::fs::remove_file(output).await.unwrap();
+        tcp_responder.await.unwrap();
         responder.await.unwrap();
 
         assert!(partial);
+        assert!(export.scan.partial);
         assert_eq!(export.unresolved.len(), 1);
         assert_eq!(export.unresolved[0].source, Source::EthernetIp);
         assert_eq!(export.unresolved[0].fields["model"], "PLC1");
@@ -3859,7 +3878,7 @@ mod tests {
             export
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("TCP connection refused"))
+                .any(|warning| warning.contains("tcp: invalid List Identity response"))
         );
     }
 

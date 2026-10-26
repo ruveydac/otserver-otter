@@ -91,6 +91,10 @@ fn copy_executable(source: &Path, destination: &Path) -> Result<(), String> {
             .and_then(|_| target.sync_all())
             .map_err(|_| "Could not copy the controller executable.")?;
         drop(target);
+        // Windows would otherwise move a directory aside as if it were the old executable.
+        if destination.is_dir() {
+            return Err("Could not publish the installed controller executable.".into());
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -504,6 +508,12 @@ mod tests {
                 .next()
                 .is_none()
         );
+        std::fs::write(&destination, b"existing executable").unwrap();
+        assert_eq!(
+            copy_executable(&directory.join("missing"), &destination).unwrap_err(),
+            "Could not read the controller executable."
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"existing executable");
 
         let source = directory.join("source");
         let blocked_parent = directory.join("not-a-directory");
@@ -515,17 +525,26 @@ mod tests {
             "Could not create the user installation directory."
         );
         std::fs::create_dir(&blocked_destination).unwrap();
-        assert_eq!(
-            copy_executable(&source, &blocked_destination).unwrap_err(),
-            "Could not publish the installed controller executable."
-        );
-        assert!(blocked_destination.is_dir());
-        assert_eq!(
-            std::fs::read_dir(blocked_destination.parent().unwrap())
-                .unwrap()
-                .count(),
-            1
-        );
+        for contents in [None, Some(b"keep directory contents".as_slice())] {
+            let retained_file = blocked_destination.join("keep");
+            if let Some(contents) = contents {
+                std::fs::write(&retained_file, contents).unwrap();
+            }
+            assert_eq!(
+                copy_executable(&source, &blocked_destination).unwrap_err(),
+                "Could not publish the installed controller executable."
+            );
+            assert!(blocked_destination.is_dir());
+            if let Some(contents) = contents {
+                assert_eq!(std::fs::read(&retained_file).unwrap(), contents);
+            }
+            assert_eq!(
+                std::fs::read_dir(blocked_destination.parent().unwrap())
+                    .unwrap()
+                    .count(),
+                2
+            );
+        }
         std::fs::remove_dir_all(directory).unwrap();
     }
 
