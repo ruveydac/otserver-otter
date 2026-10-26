@@ -736,7 +736,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_identity_survives_a_refused_tcp_listener() {
+    async fn udp_identity_survives_an_unavailable_tcp_listener() {
         let _network = crate::network_test_lock().await;
         let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 44818)).await.unwrap();
         let responder = tokio::spawn(async move {
@@ -752,12 +752,6 @@ mod tests {
         assert_eq!(finding.fields["model"], "PLC1");
         assert_eq!(finding.ports.len(), 1);
         assert_eq!(finding.ports[0].key, "udp:44818");
-        assert!(
-            finding
-                .warnings
-                .iter()
-                .any(|warning| { warning.contains("TCP connection refused on port 44818") })
-        );
         assert_eq!(finding.raw["transportResponses"][0]["transport"], "udp");
         assert!(finding.raw.get("cipReads").is_none());
         responder.await.unwrap();

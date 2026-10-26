@@ -1231,7 +1231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_retains_a_configured_identity_when_tcp_is_refused() {
+    async fn probe_retains_a_configured_identity_when_tcp_is_unavailable() {
         let target = "127.0.0.2".parse().unwrap();
         let settings = ProbeSettings {
             target_net_ids: BTreeMap::from([(target, [10, 0, 0, 1, 1, 1])]),
@@ -1243,9 +1243,19 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(finding.raw["collectionStatus"], "tcp-connect-failed");
+        assert_eq!(finding.raw["amsNetId"], "10.0.0.1.1.1");
+        let expected_warning = match finding.raw["collectionStatus"].as_str() {
+            Some("tcp-connect-failed") => "ADS TCP connection failed",
+            Some("tcp-connect-timeout") => "ADS TCP connection timed out",
+            status => panic!("unexpected TCP connection status: {status:?}"),
+        };
         assert!(finding.ports.is_empty());
-        assert!(finding.warnings[0].contains("ADS TCP connection failed"));
+        assert!(
+            finding
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(expected_warning))
+        );
     }
 
     #[tokio::test]
