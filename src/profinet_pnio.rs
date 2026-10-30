@@ -2299,4 +2299,458 @@ mod tests {
         };
         assert!(parse_read_response(&header, &body, &wrong).is_err());
     }
+
+    #[test]
+    fn read_response_rejects_invalid_ndr_counts_headers_and_record_lengths() {
+        let target = RecordTarget {
+            api: 0,
+            slot: 0,
+            subslot: 1,
+            index: 0xAFF0,
+            data_length: 128,
+        };
+        let packet = response_packet(&target, &endpoint(false), &[], 1);
+        let (header, body) = parse_rpc_fragment(&packet).unwrap();
+        let mut cases = vec![(body[..83].to_vec(), "truncated before its IOD header")];
+
+        let mut invalid = body.clone();
+        invalid[..4].copy_from_slice(&1_u32.to_le_bytes());
+        cases.push((invalid, "returned status"));
+        let mut invalid = body.clone();
+        invalid[4..8].copy_from_slice(&65_u32.to_le_bytes());
+        cases.push((invalid, "invalid NDR counts"));
+        let mut invalid = body.clone();
+        invalid[12..16].copy_from_slice(&1_u32.to_le_bytes());
+        cases.push((invalid, "invalid NDR counts"));
+        let mut invalid = body.clone();
+        invalid[8..12].copy_from_slice(&63_u32.to_le_bytes());
+        cases.push((invalid, "invalid NDR counts"));
+        let mut invalid = body.clone();
+        invalid[4..8].copy_from_slice(&70_u32.to_le_bytes());
+        invalid[8..12].copy_from_slice(&70_u32.to_le_bytes());
+        invalid[16..20].copy_from_slice(&70_u32.to_le_bytes());
+        cases.push((invalid, "truncated NDR payload"));
+        let mut invalid = body.clone();
+        invalid[4..8].copy_from_slice(&63_u32.to_le_bytes());
+        invalid[8..12].copy_from_slice(&63_u32.to_le_bytes());
+        invalid[16..20].copy_from_slice(&63_u32.to_le_bytes());
+        cases.push((invalid, "truncated NDR payload"));
+        let mut invalid = body.clone();
+        invalid[20..22].copy_from_slice(&0_u16.to_le_bytes());
+        cases.push((invalid, "IODReadResHeader"));
+        let mut invalid = body.clone();
+        invalid[44..48].copy_from_slice(&1_u32.to_le_bytes());
+        cases.push((invalid, "did not echo the requested target"));
+        let mut invalid = body.clone();
+        invalid[56..60].copy_from_slice(&129_u32.to_be_bytes());
+        cases.push((invalid, "exceeded the requested data length"));
+        let mut invalid = body;
+        invalid[56..60].copy_from_slice(&1_u32.to_be_bytes());
+        cases.push((invalid, "truncated before the record ended"));
+
+        for (malformed, expected) in cases {
+            let error = parse_read_response(&header, &malformed, &target).unwrap_err();
+            assert!(
+                error.contains(expected),
+                "{error:?} did not contain {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_parsers_reject_invalid_api_filter_and_im5_entries() {
+        let mut api_list = api_list_record();
+        api_list[6..8].copy_from_slice(&2_u16.to_be_bytes());
+        assert!(
+            parse_record(0xF821, &api_list)
+                .unwrap_err()
+                .contains("API list")
+        );
+
+        let mut real_identification = module_record(0x0013, (1, 1));
+        real_identification.push(0);
+        assert!(
+            parse_record(0xF000, &real_identification)
+                .unwrap_err()
+                .contains("trailing bytes")
+        );
+
+        let unexpected_filter = block_record(0x0033, (1, 0), &[]);
+        assert!(
+            parse_record(0xF840, &unexpected_filter)
+                .unwrap_err()
+                .contains("unexpected block type")
+        );
+        let unsupported_filter = block_record(0x0030, (2, 0), &[]);
+        assert!(
+            parse_record(0xF840, &unsupported_filter)
+                .unwrap_err()
+                .contains("unsupported block version")
+        );
+
+        let non_crc_im4 = block_record(0x0024, (1, 0), &[0; 54]);
+        assert!(
+            parse_record(0xAFF4, &non_crc_im4)
+                .unwrap()
+                .get("checkOverall")
+                .is_none()
+        );
+
+        let empty_im5 = block_record(0x0025, (1, 0), &[0, 0]);
+        assert_eq!(
+            parse_record(0xAFF5, &empty_im5).unwrap()["numberOfEntries"],
+            0
+        );
+        let mut im5_with_trailing = empty_im5.clone();
+        im5_with_trailing.push(0);
+        assert!(
+            parse_record(0xAFF5, &im5_with_trailing)
+                .unwrap_err()
+                .contains("trailing bytes")
+        );
+
+        let short_im5_data = block_record(0x0034, (1, 0), &[0; 151]);
+        let mut embedded_im5 = vec![0, 1];
+        embedded_im5.extend(short_im5_data);
+        let malformed_im5 = block_record(0x0025, (1, 0), &embedded_im5);
+        assert!(
+            parse_record(0xAFF5, &malformed_im5)
+                .unwrap_err()
+                .contains("I&M5 data entry was truncated")
+        );
+        assert!(
+            parse_record(0xFFFF, &[])
+                .unwrap_err()
+                .contains("Unsupported PROFINET record index")
+        );
+    }
+
+    #[test]
+    fn rpc_reassembly_rejects_missing_mismatched_and_oversized_fragments() {
+        let base = RpcHeader::new(
+            2,
+            0x02,
+            false,
+            endpoint(false).object_uuid,
+            endpoint(false).interface_uuid,
+            endpoint(false).activity_uuid,
+            1,
+            7,
+            5,
+            0,
+        )
+        .unwrap();
+        assert!(
+            reassemble_rpc_fragments(Vec::new())
+                .unwrap_err()
+                .contains("no fragments")
+        );
+        assert!(
+            reassemble_rpc_fragments(vec![(
+                RpcHeader {
+                    packet_type: 3,
+                    ..base.clone()
+                },
+                vec![]
+            )])
+            .unwrap_err()
+            .contains("not a response")
+        );
+
+        let first = RpcHeader {
+            flags: 0x04,
+            fragment_number: 0,
+            ..base.clone()
+        };
+        let last = RpcHeader {
+            flags: 0x06,
+            fragment_number: 1,
+            ..base.clone()
+        };
+        assert!(
+            reassemble_rpc_fragments(vec![(first.clone(), vec![1]), (last.clone(), vec![2])])
+                .is_ok()
+        );
+        assert!(
+            reassemble_rpc_fragments(vec![
+                (first.clone(), vec![1]),
+                (last.clone(), vec![2]),
+                (last.clone(), vec![3])
+            ])
+            .unwrap_err()
+            .contains("incomplete or out of order")
+        );
+        assert!(
+            reassemble_rpc_fragments(vec![
+                (first.clone(), vec![1]),
+                (
+                    RpcHeader {
+                        sequence: 8,
+                        ..last.clone()
+                    },
+                    vec![2]
+                ),
+            ])
+            .unwrap_err()
+            .contains("did not describe one request")
+        );
+        assert!(
+            reassemble_rpc_fragments(vec![(
+                RpcHeader { flags: 0, ..base },
+                vec![0; MAX_RPC_BODY_LENGTH + 1],
+            )])
+            .unwrap_err()
+            .contains("bounded reassembly length")
+        );
+    }
+
+    #[test]
+    fn epm_without_a_pnio_endpoint_uses_continuation_then_fails_closed() {
+        let mut epm_calls = 0;
+        let error = read_records(
+            RESPONSE_TIMEOUT,
+            &AtomicBool::new(false),
+            |_, request, _, _| {
+                let header = parse_rpc_header(request)?;
+                epm_calls += 1;
+                parse_rpc_fragment(&epm_response_packet(
+                    &header,
+                    None,
+                    &EpmHandle {
+                        entry: 12,
+                        uuid: uuid("11111111-2222-3333-4444-555555555555"),
+                    },
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(epm_calls, 2);
+        assert!(error.contains("did not return a PNIO endpoint"));
+    }
+
+    #[test]
+    fn pnio_read_and_rpc_header_lengths_are_bounded_and_validated() {
+        let target = RecordTarget {
+            api: 0,
+            slot: 0,
+            subslot: 1,
+            index: 0xAFF0,
+            data_length: 0,
+        };
+        let packet = build_read_request(&endpoint(false), &target, 1).unwrap();
+        assert_eq!(
+            u32::from_be_bytes(packet[136..140].try_into().unwrap()),
+            DEFAULT_RECORD_DATA_LENGTH
+        );
+
+        let too_large = RecordTarget {
+            data_length: MAX_RECORD_DATA_LENGTH + 1,
+            ..target
+        };
+        assert!(
+            build_read_request(&endpoint(false), &too_large, 1)
+                .unwrap_err()
+                .contains("bounded data length")
+        );
+
+        let header = RpcHeader::new(
+            2,
+            2,
+            false,
+            endpoint(false).object_uuid,
+            endpoint(false).interface_uuid,
+            endpoint(false).activity_uuid,
+            1,
+            1,
+            5,
+            0,
+        )
+        .unwrap();
+        let valid = encode_rpc_header(&header);
+        assert!(parse_rpc_header(&valid).is_ok());
+        assert!(parse_rpc_header(&valid[..RPC_HEADER_LENGTH - 1]).is_err());
+
+        for (offset, value) in [(0, 3), (5, 1), (4, 1), (4, 0x20), (78, 1)] {
+            let mut malformed = valid.clone();
+            malformed[offset] = value;
+            assert!(
+                parse_rpc_header(&malformed).is_err(),
+                "header byte {offset}"
+            );
+        }
+        let mut mismatched_length = valid;
+        mismatched_length[74..76].copy_from_slice(&1_u16.to_le_bytes());
+        assert!(
+            parse_rpc_header(&mismatched_length)
+                .unwrap_err()
+                .contains("fragment length")
+        );
+    }
+
+    #[test]
+    fn epm_response_rejects_invalid_counts_towers_and_trailing_data() {
+        let request =
+            parse_rpc_header(&build_epm_request(Uuid::new_v4(), 0, None).unwrap()).unwrap();
+        let endpoint = endpoint(false);
+        let handle = EpmHandle::default();
+        let valid = epm_response_packet(&request, Some(&endpoint), &handle);
+
+        let mut invalid_count = valid.clone();
+        invalid_count[104..108].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(
+            parse_epm_response(&invalid_count)
+                .unwrap_err()
+                .contains("invalid entry counts")
+        );
+
+        let mut oversized_annotation = valid.clone();
+        oversized_annotation[140..144].copy_from_slice(&257_u32.to_le_bytes());
+        assert!(
+            parse_epm_response(&oversized_annotation)
+                .unwrap_err()
+                .contains("annotation was oversized")
+        );
+
+        let mut mismatched_floor = valid.clone();
+        mismatched_floor[148..152].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(
+            parse_epm_response(&mismatched_floor)
+                .unwrap_err()
+                .contains("tower length was invalid")
+        );
+
+        let mut invalid_floor_count = valid.clone();
+        invalid_floor_count[152..154].copy_from_slice(&4_u16.to_le_bytes());
+        assert!(
+            parse_epm_response(&invalid_floor_count)
+                .unwrap_err()
+                .contains("five floors")
+        );
+
+        let mut wrong_floor_length = valid.clone();
+        let floor_length = u32::from_le_bytes(wrong_floor_length[144..148].try_into().unwrap());
+        wrong_floor_length[144..148].copy_from_slice(&(floor_length + 1).to_le_bytes());
+        wrong_floor_length[148..152].copy_from_slice(&(floor_length + 1).to_le_bytes());
+        assert!(
+            parse_epm_response(&wrong_floor_length)
+                .unwrap_err()
+                .contains("floor length did not match")
+        );
+
+        let mut truncated_uuid_floor = valid.clone();
+        truncated_uuid_floor[154..156].copy_from_slice(&18_u16.to_le_bytes());
+        assert!(
+            parse_epm_response(&truncated_uuid_floor)
+                .unwrap_err()
+                .contains("UUID floor was truncated")
+        );
+
+        let mut invalid_uuid_protocol = valid.clone();
+        invalid_uuid_protocol[156] = 1;
+        assert!(
+            parse_epm_response(&invalid_uuid_protocol)
+                .unwrap_err()
+                .contains("UUID protocol floors")
+        );
+
+        let mut trailing = valid.clone();
+        trailing.extend([0, 0]);
+        let trailing_body_length = (trailing.len() - RPC_HEADER_LENGTH) as u16;
+        trailing[74..76].copy_from_slice(&trailing_body_length.to_le_bytes());
+        assert!(
+            parse_epm_response(&trailing)
+                .unwrap_err()
+                .contains("trailing bytes")
+        );
+
+        let mut wrong_interface = valid;
+        wrong_interface[24] ^= 1;
+        assert!(
+            parse_epm_response(&wrong_interface)
+                .unwrap_err()
+                .contains("unexpected interface UUID")
+        );
+    }
+
+    #[test]
+    fn udp_frame_decoder_rejects_truncation_bad_headers_lengths_and_checksums() {
+        let source_mac = [0, 1, 2, 3, 4, 5];
+        let target_mac = [6, 7, 8, 9, 10, 11];
+        let source_ip = Ipv4Addr::new(192, 0, 2, 2);
+        let target_ip = Ipv4Addr::new(192, 0, 2, 1);
+        let valid = ethernet_ipv4_udp_frame(
+            source_mac, target_mac, source_ip, target_ip, 1000, 2000, b"payload",
+        )
+        .unwrap();
+        assert!(parse_ipv4_udp_frame(&valid).is_some());
+        assert!(parse_ipv4_udp_frame(&valid[..41]).is_none());
+
+        let mut bad = valid.clone();
+        bad[12] = 0x86;
+        assert!(parse_ipv4_udp_frame(&bad).is_none());
+
+        for (offset, value) in [(14, 0x65), (23, 6), (20, 0x20), (14, 0x44)] {
+            let mut malformed = valid.clone();
+            malformed[offset] = value;
+            assert!(
+                parse_ipv4_udp_frame(&malformed).is_none(),
+                "frame byte {offset}"
+            );
+        }
+
+        let mut short_ip = valid.clone();
+        short_ip[16..18].copy_from_slice(&20_u16.to_be_bytes());
+        repair_frame_ip_checksum(&mut short_ip);
+        assert!(parse_ipv4_udp_frame(&short_ip).is_none());
+
+        let mut oversized_ip = valid.clone();
+        oversized_ip[16..18].copy_from_slice(&u16::MAX.to_be_bytes());
+        repair_frame_ip_checksum(&mut oversized_ip);
+        assert!(parse_ipv4_udp_frame(&oversized_ip).is_none());
+
+        let mut bad_ip_checksum = valid.clone();
+        bad_ip_checksum[24] ^= 1;
+        assert!(parse_ipv4_udp_frame(&bad_ip_checksum).is_none());
+
+        let mut short_udp = valid.clone();
+        short_udp[38..40].copy_from_slice(&7_u16.to_be_bytes());
+        assert!(parse_ipv4_udp_frame(&short_udp).is_none());
+
+        let mut bad_udp_checksum = valid.clone();
+        bad_udp_checksum[42] ^= 1;
+        assert!(parse_ipv4_udp_frame(&bad_udp_checksum).is_none());
+
+        let mut no_udp_checksum = valid;
+        no_udp_checksum[40..42].fill(0);
+        assert!(parse_ipv4_udp_frame(&no_udp_checksum).is_some());
+    }
+
+    fn repair_frame_ip_checksum(frame: &mut [u8]) {
+        frame[24..26].fill(0);
+        let checksum = checksum(&frame[14..34]);
+        frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+    }
+
+    #[test]
+    fn endpoint_lookup_cancellation_stops_before_the_continuation_request() {
+        let cancelled = AtomicBool::new(false);
+        let mut calls = 0;
+        let result = read_records(RESPONSE_TIMEOUT, &cancelled, |_, request, _, _| {
+            calls += 1;
+            let header = parse_rpc_header(request)?;
+            let response = epm_response_packet(&header, None, &EpmHandle::default());
+            if calls == 1 {
+                cancelled.store(true, Ordering::Relaxed);
+            }
+            parse_rpc_fragment(&response)
+        });
+
+        assert_eq!(calls, 1);
+        assert!(
+            result
+                .unwrap_err()
+                .contains("endpoint lookup was cancelled")
+        );
+    }
 }

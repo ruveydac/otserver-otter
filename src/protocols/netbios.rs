@@ -349,4 +349,17 @@ mod tests {
         assert!(probe_at(address).await.unwrap().is_none());
         server.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn closed_udp_port_is_absence_or_an_explicit_connection_refusal() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = socket.local_addr().unwrap();
+        drop(socket);
+
+        match probe_at(address).await {
+            Err(error) => assert!(error.contains("returned"), "{error}"),
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("a closed UDP port cannot return an identity"),
+        }
+    }
 }

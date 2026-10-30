@@ -16,6 +16,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+#[cfg(test)]
+pub(crate) static CONFIG_FILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub trait LogOutput: Send + Sync {
     fn write(&self, msg: String);
 
@@ -425,7 +428,18 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
-    match Cli::parse().command {
+    run_cli(Cli::parse()).await
+}
+
+async fn run_cli(cli: Cli) -> Result<(), String> {
+    run_cli_with_configs(cli, None).await
+}
+
+async fn run_cli_with_configs(
+    cli: Cli,
+    scanner_configs: Option<ScannerConfigs>,
+) -> Result<(), String> {
+    match cli.command {
         Some(Commands::Controller(args)) => controller::run(args).await,
         Some(Commands::Doctor) => doctor(),
         Some(Commands::Interfaces { json }) => {
@@ -466,7 +480,10 @@ async fn run() -> Result<(), String> {
             Ok(())
         }
         Some(Commands::Scan(args)) => {
-            let configs = load_config()?;
+            let configs = match scanner_configs {
+                Some(configs) => configs,
+                None => load_config()?,
+            };
             let logger = StdoutLogger;
             let cancelled = Arc::new(AtomicBool::new(false));
             let (scans, mut failures) = prepare_scans(
@@ -2311,6 +2328,28 @@ mod tests {
         }
     }
 
+    fn no_protocols() -> ProtocolOptions {
+        ProtocolOptions {
+            arp: false,
+            profinet: false,
+            s7: false,
+            enip: false,
+            bacnet: false,
+            fins: false,
+            fox: false,
+            dnp3: false,
+            iec61850: false,
+            netbios: false,
+            smb: false,
+            rpc: false,
+            http: false,
+            opcua: false,
+            snmp: false,
+            lldp: false,
+            ads: false,
+        }
+    }
+
     #[test]
     fn rejects_malformed_explicit_proxy_urls() {
         assert_eq!(
@@ -2329,6 +2368,33 @@ mod tests {
             .validate(),
             Err("HTTPS proxy URL is invalid.")
         );
+    }
+
+    #[tokio::test]
+    async fn validate_command_dispatch_accepts_contract_exports_and_rejects_bad_versions() {
+        let valid =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("contracts/otserver-scan-v2-valid.json");
+        assert!(
+            run_cli(Cli {
+                command: Some(Commands::Validate { file: valid }),
+            })
+            .await
+            .is_ok()
+        );
+
+        let invalid = std::env::temp_dir().join(format!("{}.json", Uuid::new_v4()));
+        tokio::fs::write(&invalid, br#"{"format":"otserver-scan","schemaVersion":1}"#)
+            .await
+            .unwrap();
+        let error = run_cli(Cli {
+            command: Some(Commands::Validate {
+                file: invalid.clone(),
+            }),
+        })
+        .await
+        .unwrap_err();
+        tokio::fs::remove_file(invalid).await.unwrap();
+        assert!(error.contains("Expected otserver-scan schemaVersion 2"));
     }
 
     #[test]
@@ -2504,6 +2570,18 @@ mod tests {
         assert_eq!(scans.len(), 1);
         assert_eq!(scans[0].name, "Valid");
         assert_eq!(failures.len(), 1);
+    }
+
+    #[test]
+    fn prepare_scans_reports_empty_and_all_invalid_batches() {
+        assert!(matches!(
+            prepare_scans(args(), Vec::new(), None),
+            Err(error) if error == "No configurations are available to scan."
+        ));
+        assert!(matches!(
+            prepare_scans(args(), vec![("Invalid".into(), ScannerConfig::default())], None),
+            Err(error) if error.starts_with("Configuration \"Invalid\":")
+        ));
     }
 
     #[test]
@@ -2889,6 +2967,28 @@ mod tests {
     }
 
     #[test]
+    fn dcp_discovered_addresses_cannot_overflow_the_arp_target_limit() {
+        let selected: Vec<_> = (0..discovery::MAX_TARGETS)
+            .map(|index| Ipv4Addr::from(index as u32))
+            .collect();
+        let dcp = Device {
+            ip_addresses: vec![Ipv4Addr::from(discovery::MAX_TARGETS as u32).to_string()],
+            observations: vec![otserver_otter::contract::Observation {
+                source: Source::ProfinetDcp,
+                observed_at: String::new(),
+                ip_address: None,
+                mac_address: None,
+                fields: BTreeMap::new(),
+                raw: serde_json::Value::Null,
+                warnings: Vec::new(),
+            }],
+            ..Device::default()
+        };
+
+        assert!(dcp_arp_targets(&selected, &[dcp]).is_err());
+    }
+
+    #[test]
     fn scan_uses_current_interface_mac_instead_of_stale_saved_mac() {
         let interfaces = [profinet::CaptureInterface {
             name: "wlan-test".into(),
@@ -3145,6 +3245,130 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_codes_distinguish_transport_security_and_protocol_failures() {
+        use protocols::ProbeStatus::{Cancelled, Failure, NoResponse, Partial, Success};
+
+        for (message, status, expected) in [
+            ("connection refused", NoResponse, "connection-refused"),
+            ("peer closed", NoResponse, "connection-closed"),
+            ("connection timed out", NoResponse, "connect-timeout"),
+            ("response timeout", NoResponse, "response-timeout"),
+            ("quiet", NoResponse, "no-response"),
+            ("cancelled", Failure, "cancelled"),
+            ("other", Cancelled, "cancelled"),
+            ("unencrypted channel", Failure, "security-mode"),
+            (
+                "value differs from expected",
+                Failure,
+                "identity-disagreement",
+            ),
+            (
+                "no endpoint with SecurityPolicy",
+                Failure,
+                "security-policy-unsupported",
+            ),
+            (
+                "requires username authentication",
+                Failure,
+                "authentication-required",
+            ),
+            (
+                "no usable authentication mode",
+                Failure,
+                "authentication-mode-unsupported",
+            ),
+            ("need a username", Failure, "authentication-required"),
+            (
+                "unsupported SNMP privacy",
+                Failure,
+                "authentication-mode-unsupported",
+            ),
+            ("connection reset", Failure, "connection-closed"),
+            ("no route to host", Failure, "network-unreachable"),
+            ("operation not permitted", Failure, "permission-denied"),
+            ("connect timed out", Failure, "connect-timeout"),
+            ("timed out", Failure, "response-timeout"),
+            ("credentials rejected", Failure, "authentication-failed"),
+            ("access-denied", Failure, "access-denied"),
+            ("BACnet error class 2", Failure, "device-status-error"),
+            ("request rejected", Failure, "request-rejected"),
+            ("request aborted", Failure, "request-aborted"),
+            ("not implemented", Failure, "unsupported-operation"),
+            ("uncorrelated response", Failure, "response-mismatch"),
+            ("oversized payload", Failure, "malformed-response"),
+            ("other partial result", Partial, "partial-collection"),
+            ("other failure", Failure, "protocol-error"),
+            (
+                "message text does not override success",
+                Success,
+                "protocol-error",
+            ),
+        ] {
+            assert_eq!(diagnostic_code(message, status), expected, "{message}");
+        }
+    }
+
+    #[test]
+    fn diagnostic_hints_and_sanitization_are_bounded() {
+        for code in [
+            "no-response",
+            "connect-timeout",
+            "connection-refused",
+            "authentication-failed",
+            "authentication-required",
+            "authentication-mode-unsupported",
+            "access-denied",
+            "unsupported-operation",
+            "response-mismatch",
+            "malformed-response",
+            "permission-denied",
+            "request-rejected",
+            "device-status-error",
+        ] {
+            assert!(diagnostic_hint(code).is_some(), "missing hint for {code}");
+        }
+        assert!(diagnostic_hint("unknown").is_none());
+        assert_eq!(safe_diagnostic_text("line\nnext\tentry"), "line next entry");
+        assert!(safe_diagnostic_text(&"x".repeat(513)).ends_with("… (truncated)"));
+    }
+
+    #[test]
+    fn pnio_warning_targets_are_normalized_without_accepting_arbitrary_text() {
+        assert_eq!(
+            pnio_warning_target("PROFINET PNIO skipped for 192.0.2.1: outside scope"),
+            Some("192.0.2.1".into())
+        );
+        assert_eq!(
+            pnio_warning_target("PROFINET PNIO record scan failed for 00:11:22:33:44:55: timeout"),
+            Some("00:11:22:33:44:55".into())
+        );
+        assert_eq!(pnio_warning_target("unknown target: invalid"), None);
+        assert_eq!(
+            pnio_warning_target("PROFINET PNIO skipped for invalid"),
+            None
+        );
+    }
+
+    #[test]
+    fn import_endpoint_appends_to_base_path_and_rejects_non_base_urls() {
+        assert_eq!(
+            import_endpoint("https://otserver.example/base/")
+                .unwrap()
+                .as_str(),
+            "https://otserver.example/base/api/asset-imports"
+        );
+        for input in [
+            "not a URL",
+            "ftp://otserver.example",
+            "https://otserver.example/?token=secret",
+            "https://otserver.example/#fragment",
+            "mailto:ops@example.com",
+        ] {
+            assert!(import_endpoint(input).is_err(), "accepted {input}");
+        }
+    }
+
+    #[test]
     fn pnio_endpoint_timeout_is_expected_no_response() {
         assert!(pnio_no_response(
             "PROFINET PNIO record scan failed for 192.0.2.10: RPC response timed out"
@@ -3235,6 +3459,82 @@ mod tests {
         assert!(export.scan.interface.addresses.is_empty());
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn passive_lldp_capture_stops_before_ip_probes_and_keeps_partial_export() {
+        #[derive(Default)]
+        struct CancelAfterLayer2 {
+            cancelled: Option<Arc<AtomicBool>>,
+            messages: std::sync::Mutex<Vec<String>>,
+        }
+
+        impl LogOutput for CancelAfterLayer2 {
+            fn write(&self, message: String) {
+                if message.contains("Unique devices after Layer 2 discovery:")
+                    && let Some(cancelled) = &self.cancelled
+                {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+                self.messages.lock().unwrap().push(message);
+            }
+        }
+
+        let interfaces = profinet::interfaces().unwrap();
+        let Some(interface) = interfaces
+            .iter()
+            .find(|interface| profinet::interface_mac(interface).is_some())
+        else {
+            return;
+        };
+        let output = std::env::temp_dir().join(format!("{}.json", Uuid::new_v4()));
+        let mut protocols = no_protocols();
+        protocols.lldp = true;
+        let options = ScanOptions {
+            targets: vec![Ipv4Addr::LOCALHOST.to_string()],
+            interface: interface.name.clone(),
+            source_mac: "02:00:00:00:00:01".into(),
+            output: output.clone(),
+            protocols,
+            allow_dcp_source: false,
+            snmp: Vec::new(),
+            opcua: protocols::OpcuaSettings::default(),
+            ads: protocols::AdsSettings::default(),
+            upload: None,
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let logger = CancelAfterLayer2 {
+            cancelled: Some(Arc::clone(&cancelled)),
+            ..CancelAfterLayer2::default()
+        };
+
+        let partial = scan("Passive LLDP", &options, &logger, &cancelled)
+            .await
+            .unwrap();
+        let export: ScanExport =
+            serde_json::from_slice(&tokio::fs::read(&output).await.unwrap()).unwrap();
+        tokio::fs::remove_file(output).await.unwrap();
+        let messages = logger.messages.lock().unwrap();
+
+        assert!(partial && export.scan.partial);
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(
+            export
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("stopped by user"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("Unique devices after Layer 2 discovery:"))
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("Querying LLDP"))
+        );
+    }
+
     #[test]
     fn scan_metadata_keeps_only_selected_interface_ip_addresses() {
         let interfaces = [
@@ -3272,6 +3572,370 @@ mod tests {
         );
     }
 
+    #[test]
+    fn named_configs_supplies_display_names_without_rewriting_configs() {
+        let configs = ScannerConfigs::Multiple(vec![
+            ScannerConfig {
+                targets: Some(vec!["192.0.2.1".into()]),
+                ..ScannerConfig::default()
+            },
+            ScannerConfig {
+                name: Some("Cell B".into()),
+                targets: Some(vec!["192.0.2.2".into()]),
+                ..ScannerConfig::default()
+            },
+        ]);
+
+        let named = configs.named_configs();
+
+        assert_eq!(named[0].0, "Configuration 1");
+        assert_eq!(named[1].0, "Cell B");
+        assert!(configs.configs()[0].name.is_none());
+    }
+
+    #[test]
+    fn configs_mut_updates_a_single_configuration() {
+        let mut configs = ScannerConfigs::default();
+        configs.configs_mut()[0].targets = Some(vec!["192.0.2.7".into()]);
+
+        assert_eq!(
+            configs.configs()[0].targets.as_deref(),
+            Some(["192.0.2.7".into()].as_slice())
+        );
+    }
+
+    #[test]
+    fn mac_diagnostics_keep_target_scope_and_sanitize_text() {
+        let line = format_mac_diagnostic(
+            "01:80:c2:00:00:0e",
+            "lldp-passive",
+            "PARTIAL",
+            "capture-error",
+            "selected interface eth0",
+            "capture",
+            "bad\npacket\ttext",
+        );
+
+        assert!(line.starts_with("[mac=01:80:c2:00:00:0e] [lldp-passive] PARTIAL"));
+        assert!(line.contains("endpoint=selected interface eth0 stage=capture"));
+        assert!(line.contains("bad packet text"));
+        assert!(!line.contains('\n'));
+    }
+
+    #[tokio::test]
+    async fn dcp_capture_setup_failure_reports_the_multicast_endpoint() {
+        struct CapturingLogger(std::sync::Mutex<Vec<String>>);
+        impl LogOutput for CapturingLogger {
+            fn write(&self, message: String) {
+                self.0.lock().unwrap().push(message);
+            }
+        }
+
+        let logger = CapturingLogger(std::sync::Mutex::new(Vec::new()));
+        let interface = format!("missing-{}", Uuid::new_v4());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let result = discover_profinet(&interface, "00:11:22:33:44:55", &logger, &cancelled).await;
+
+        assert!(result.is_err());
+        let logs = logger.0.lock().unwrap();
+        let diagnostic = logs
+            .iter()
+            .find(|line| line.contains("[profinet-dcp]") && line.contains(" FAIL"))
+            .unwrap();
+        assert!(diagnostic.starts_with("[mac=01:0e:cf:00:00:00]"));
+        assert!(diagnostic.contains("endpoint=ethernet DCP multicast; response window 60s"));
+        assert!(diagnostic.contains("stage=capture"));
+    }
+
+    struct CancelOnLog {
+        trigger: &'static str,
+        cancelled: Arc<AtomicBool>,
+        messages: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl LogOutput for CancelOnLog {
+        fn write(&self, message: String) {
+            if message.contains(self.trigger) {
+                self.cancelled.store(true, Ordering::Relaxed);
+            }
+            self.messages.lock().unwrap().push(message);
+        }
+    }
+
+    fn local_scan_options(output: PathBuf) -> ScanOptions {
+        let (interface, source_mac) = profinet::interfaces()
+            .unwrap()
+            .into_iter()
+            .find_map(|interface| {
+                profinet::interface_mac(&interface).map(|mac| (interface.name, mac))
+            })
+            .expect("cancellation tests require a local interface with a MAC address");
+        ScanOptions {
+            targets: vec![Ipv4Addr::LOCALHOST.to_string()],
+            interface,
+            source_mac,
+            output,
+            protocols: no_protocols(),
+            allow_dcp_source: false,
+            snmp: Vec::new(),
+            opcua: protocols::OpcuaSettings::default(),
+            ads: protocols::AdsSettings::default(),
+            upload: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn arp_dispatch_retains_an_empty_result_when_cancelled_before_sending() {
+        let output = std::env::temp_dir().join(format!("{}.json", Uuid::new_v4()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let logger = CancelOnLog {
+            trigger: "Executing ARP discovery...",
+            cancelled: Arc::clone(&cancelled),
+            messages: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut options = local_scan_options(output.clone());
+        options.protocols.arp = true;
+
+        assert!(
+            scan("ARP cancel", &options, &logger, &cancelled)
+                .await
+                .unwrap()
+        );
+        let export: ScanExport =
+            serde_json::from_slice(&tokio::fs::read(&output).await.unwrap()).unwrap();
+        {
+            let messages = logger.messages.lock().unwrap();
+            assert!(cancelled.load(Ordering::Relaxed));
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.contains("ARP discovery found 0 device(s)."))
+            );
+        }
+        assert!(export.scan.partial);
+        assert!(export.devices.is_empty());
+        tokio::fs::remove_file(output).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dcp_dispatch_stops_before_sending_when_cancelled_during_setup() {
+        let output = std::env::temp_dir().join(format!("{}.json", Uuid::new_v4()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let logger = CancelOnLog {
+            trigger: "Scanning PROFINET DCP;",
+            cancelled: Arc::clone(&cancelled),
+            messages: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut options = local_scan_options(output.clone());
+        options.protocols.arp = true;
+        options.protocols.profinet = true;
+        options.allow_dcp_source = true;
+
+        assert!(
+            scan("DCP cancel", &options, &logger, &cancelled)
+                .await
+                .unwrap()
+        );
+        let export: ScanExport =
+            serde_json::from_slice(&tokio::fs::read(&output).await.unwrap()).unwrap();
+        {
+            let messages = logger.messages.lock().unwrap();
+            assert!(cancelled.load(Ordering::Relaxed));
+            assert!(messages.iter().any(|message| {
+                message.contains("[profinet-dcp]") && message.contains("CANCELLED code=cancelled")
+            }));
+        }
+        assert!(export.scan.partial);
+        assert!(export.devices.is_empty());
+        tokio::fs::remove_file(output).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scan_runs_a_local_no_response_probe_and_writes_a_complete_export() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let output = std::env::temp_dir().join(format!("{}.json", Uuid::new_v4()));
+        let protocols = ProtocolOptions {
+            opcua: true,
+            ..no_protocols()
+        };
+        let options = ScanOptions {
+            targets: vec![Ipv4Addr::LOCALHOST.to_string()],
+            interface: "not-bound-for-ip-probes".into(),
+            source_mac: "00:11:22:33:44:55".into(),
+            output: output.clone(),
+            protocols,
+            allow_dcp_source: false,
+            snmp: Vec::new(),
+            opcua: protocols::OpcuaSettings {
+                ports: vec![port],
+                credentials: Vec::new(),
+            },
+            ads: protocols::AdsSettings::default(),
+            upload: None,
+        };
+
+        let partial = scan(
+            "Local closed listener",
+            &options,
+            &StdoutLogger,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        let export: ScanExport =
+            serde_json::from_slice(&tokio::fs::read(&output).await.unwrap()).unwrap();
+        tokio::fs::remove_file(output).await.unwrap();
+
+        assert!(!partial);
+        assert!(!export.scan.partial);
+        assert!(export.devices.is_empty());
+        assert!(export.errors.is_empty());
+        assert_eq!(export.scan.targets, [Ipv4Addr::LOCALHOST.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn scan_retains_a_correlated_udp_identity_when_tcp_is_malformed() {
+        // A closed port may time out on Windows instead of reporting connection refusal.
+        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 44818))
+            .await
+            .unwrap();
+        let udp = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 44818))
+            .await
+            .unwrap();
+        let tcp_responder = tokio::spawn(async move {
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            let mut request = [0; 24];
+            stream.read_exact(&mut request).await.unwrap();
+            stream.write_all(&[0; 24]).await.unwrap();
+        });
+        let responder = tokio::spawn(async move {
+            let mut request = [0; 24];
+            let (_, peer) = udp.recv_from(&mut request).await.unwrap();
+            let mut response = vec![0; 68];
+            response[0] = 0x63;
+            response[2..4].copy_from_slice(&44_u16.to_le_bytes());
+            response[12..20].copy_from_slice(&request[12..20]);
+            response[24..26].copy_from_slice(&1_u16.to_le_bytes());
+            response[26..28].copy_from_slice(&0x000c_u16.to_le_bytes());
+            response[28..30].copy_from_slice(&38_u16.to_le_bytes());
+            response[30] = 1;
+            response[32..34].copy_from_slice(&2_u16.to_be_bytes());
+            response[36..40].copy_from_slice(&[127, 0, 0, 1]);
+            response[48..50].copy_from_slice(&1_u16.to_le_bytes());
+            response[50..52].copy_from_slice(&12_u16.to_le_bytes());
+            response[52..54].copy_from_slice(&158_u16.to_le_bytes());
+            response[54..56].copy_from_slice(&[3, 7]);
+            response[58..62].copy_from_slice(&42_u32.to_le_bytes());
+            response[62] = 4;
+            response[63..67].copy_from_slice(b"PLC1");
+            udp.send_to(&response, peer).await.unwrap();
+        });
+
+        let output = std::env::temp_dir().join(format!("{}.json", Uuid::new_v4()));
+        let mut protocols = no_protocols();
+        protocols.enip = true;
+        let options = ScanOptions {
+            targets: vec![Ipv4Addr::LOCALHOST.to_string()],
+            interface: "not-bound-for-ip-probes".into(),
+            source_mac: "00:11:22:33:44:55".into(),
+            output: output.clone(),
+            protocols,
+            allow_dcp_source: false,
+            snmp: Vec::new(),
+            opcua: protocols::OpcuaSettings::default(),
+            ads: protocols::AdsSettings::default(),
+            upload: None,
+        };
+
+        let partial = scan(
+            "Local EtherNet/IP responder",
+            &options,
+            &StdoutLogger,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        let export: ScanExport =
+            serde_json::from_slice(&tokio::fs::read(&output).await.unwrap()).unwrap();
+        tokio::fs::remove_file(output).await.unwrap();
+        tcp_responder.await.unwrap();
+        responder.await.unwrap();
+
+        assert!(partial);
+        assert!(export.scan.partial);
+        assert_eq!(export.unresolved.len(), 1);
+        assert_eq!(export.unresolved[0].source, Source::EthernetIp);
+        assert_eq!(export.unresolved[0].fields["model"], "PLC1");
+        assert_eq!(export.unresolved[0].raw["serialClaim"]["scope"], "adapter");
+        assert_eq!(
+            export.unresolved[0].raw["serialClaim"]["original"],
+            "0000002A"
+        );
+        assert!(
+            export
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("tcp: invalid List Identity response"))
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_exports_snmp_configuration_failures_as_partial_results() {
+        let output = std::env::temp_dir().join(format!("{}.json", Uuid::new_v4()));
+        let mut protocols = no_protocols();
+        protocols.snmp = true;
+        let options = ScanOptions {
+            targets: vec![Ipv4Addr::LOCALHOST.to_string()],
+            interface: "not-bound-for-ip-probes".into(),
+            source_mac: "00:11:22:33:44:55".into(),
+            output: output.clone(),
+            protocols,
+            allow_dcp_source: false,
+            snmp: vec![snmp::Settings {
+                version: Some("unsupported".into()),
+                ..snmp::Settings::default()
+            }],
+            opcua: protocols::OpcuaSettings::default(),
+            ads: protocols::AdsSettings::default(),
+            upload: None,
+        };
+
+        let partial = scan(
+            "Invalid SNMP configuration",
+            &options,
+            &StdoutLogger,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        let export: ScanExport =
+            serde_json::from_slice(&tokio::fs::read(&output).await.unwrap()).unwrap();
+        tokio::fs::remove_file(output).await.unwrap();
+
+        assert!(partial);
+        assert!(export.scan.partial);
+        assert!(export.devices.is_empty());
+        assert!(
+            export
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Unsupported SNMP version"))
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_export_reports_a_missing_parent_directory() {
+        let directory = std::env::temp_dir().join(format!("otter-missing-{}", Uuid::new_v4()));
+        let error = write_atomic(&directory.join("scan.json"), b"{}")
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("Could not write export:"));
+        assert!(!directory.exists());
+    }
+
     #[tokio::test]
     async fn scan_reports_device_snapshots_with_the_configuration_name() {
         let output = std::env::temp_dir().join(format!("{}.json", Uuid::new_v4()));
@@ -3300,6 +3964,138 @@ mod tests {
                 .iter()
                 .all(|(name, count)| name == "Line A" && *count == 0)
         );
+    }
+
+    #[tokio::test]
+    async fn disabled_probe_batch_writes_a_complete_empty_export() {
+        let output = std::env::temp_dir().join(format!("{}.json", Uuid::new_v4()));
+        let configured = ConfiguredScan {
+            name: "Quiet line".into(),
+            options: ScanOptions {
+                targets: vec!["127.0.0.1".into()],
+                interface: "lo".into(),
+                source_mac: "00:11:22:33:44:55".into(),
+                output: output.clone(),
+                protocols: no_protocols(),
+                allow_dcp_source: false,
+                snmp: Vec::new(),
+                opcua: protocols::OpcuaSettings::default(),
+                ads: protocols::AdsSettings::default(),
+                upload: None,
+            },
+        };
+        let result = run_scan_batch(
+            &[configured],
+            &DeviceLogger::default(),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            BatchResult {
+                completed: 1,
+                ..BatchResult::default()
+            }
+        );
+        let export: ScanExport =
+            serde_json::from_slice(&tokio::fs::read(&output).await.unwrap()).unwrap();
+        assert!(!export.scan.partial);
+        assert!(export.devices.is_empty());
+        assert_eq!(export.scan.targets, ["127.0.0.1"]);
+        tokio::fs::remove_file(output).await.unwrap();
+    }
+
+    fn empty_batch_scan(name: &str, output: PathBuf) -> ConfiguredScan {
+        ConfiguredScan {
+            name: name.into(),
+            options: ScanOptions {
+                targets: vec!["127.0.0.1".into()],
+                interface: "not-bound-for-ip-probes".into(),
+                source_mac: "00:11:22:33:44:55".into(),
+                output,
+                protocols: no_protocols(),
+                allow_dcp_source: false,
+                snmp: Vec::new(),
+                opcua: protocols::OpcuaSettings::default(),
+                ads: protocols::AdsSettings::default(),
+                upload: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_stops_when_cancelled_during_discovery_and_keeps_export() {
+        struct CancelAtDiscovery(Arc<AtomicBool>);
+        impl LogOutput for CancelAtDiscovery {
+            fn write(&self, message: String) {
+                if message.contains("Starting discovery for target(s):") {
+                    self.0.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let output = std::env::temp_dir().join(format!("{}.json", Uuid::new_v4()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let result = run_scan_batch(
+            &[empty_batch_scan("Cell", output.clone())],
+            &CancelAtDiscovery(Arc::clone(&cancelled)),
+            &cancelled,
+        )
+        .await;
+
+        assert!(result.cancelled);
+        assert_eq!(result.completed, 0);
+        let export: ScanExport =
+            serde_json::from_slice(&tokio::fs::read(&output).await.unwrap()).unwrap();
+        assert!(export.scan.partial);
+        tokio::fs::remove_file(output).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_retains_partial_results_and_continues_after_upload_failure() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let endpoint = format!(
+            "http://{}/api/asset-imports",
+            listener.local_addr().unwrap()
+        );
+        drop(listener);
+
+        let partial_output = std::env::temp_dir().join(format!("{}.json", Uuid::new_v4()));
+        let failed_upload_output = std::env::temp_dir().join(format!("{}.json", Uuid::new_v4()));
+        let complete_output = std::env::temp_dir().join(format!("{}.json", Uuid::new_v4()));
+        let mut partial = empty_batch_scan("Partial", partial_output.clone());
+        partial.options.protocols.snmp = true;
+        partial.options.snmp = vec![snmp::Settings {
+            version: Some("unsupported".into()),
+            ..snmp::Settings::default()
+        }];
+        let mut failed_upload = empty_batch_scan("Upload failure", failed_upload_output.clone());
+        failed_upload.options.upload = Some(UploadOptions {
+            endpoint: reqwest::Url::parse(&endpoint).unwrap(),
+            site: "site-1".into(),
+            api_key: "test-key".into(),
+            http: HttpOptions::default(),
+        });
+        let complete = empty_batch_scan("Complete", complete_output.clone());
+
+        let result = run_scan_batch(
+            &[partial, failed_upload, complete],
+            &StdoutLogger,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+
+        assert_eq!(result.partial, 1);
+        assert_eq!(result.completed, 1);
+        assert_eq!(result.failures.len(), 1);
+        assert!(result.failures[0].contains("upload failed"));
+        assert!(partial_output.exists());
+        assert!(failed_upload_output.exists());
+        assert!(complete_output.exists());
+        for path in [partial_output, failed_upload_output, complete_output] {
+            tokio::fs::remove_file(path).await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -3483,5 +4279,554 @@ mod tests {
                 .status,
             "completed"
         );
+    }
+
+    #[test]
+    fn applies_native_outcomes_and_scopes_observations_to_correlated_devices() {
+        #[derive(Default)]
+        struct CapturingLogger(std::sync::Mutex<Vec<String>>);
+
+        impl LogOutput for CapturingLogger {
+            fn write(&self, message: String) {
+                self.0.lock().unwrap().push(message);
+            }
+        }
+
+        let observation = |source| otserver_otter::contract::Observation {
+            source,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            ip_address: Some("192.0.2.10".into()),
+            mac_address: None,
+            fields: BTreeMap::new(),
+            raw: serde_json::Value::Null,
+            warnings: Vec::new(),
+        };
+        let outcome = |status, messages| protocols::ProbeOutcome {
+            source: Source::S7,
+            protocol: "s7",
+            status,
+            endpoint: "tcp/102".into(),
+            timeout: "2s",
+            stage: "read",
+            messages,
+        };
+        let mac = "00:11:22:33:44:55";
+        let logger = CapturingLogger::default();
+        let mut devices = vec![Device {
+            mac_address: mac.into(),
+            ..Device::default()
+        }];
+        let mut unresolved = Vec::new();
+        let mut warnings = Vec::new();
+
+        let failed = apply_probe(
+            "Line A",
+            &mut devices,
+            &mut unresolved,
+            &mut warnings,
+            &logger,
+            Some(Ok((
+                "192.0.2.10".parse().unwrap(),
+                Some(mac.into()),
+                protocols::ProbeResult {
+                    observations: vec![observation(Source::S7)],
+                    ports: Vec::new(),
+                    warnings: Vec::new(),
+                    outcomes: vec![
+                        outcome(protocols::ProbeStatus::Success, Vec::new()),
+                        outcome(
+                            protocols::ProbeStatus::Success,
+                            vec!["identity read completed".into()],
+                        ),
+                        outcome(protocols::ProbeStatus::Partial, Vec::new()),
+                        outcome(protocols::ProbeStatus::NoResponse, Vec::new()),
+                        outcome(protocols::ProbeStatus::Failure, Vec::new()),
+                        outcome(protocols::ProbeStatus::Cancelled, Vec::new()),
+                    ],
+                },
+            ))),
+        );
+
+        assert!(failed);
+        assert_eq!(devices[0].observations.len(), 1);
+        assert!(unresolved.is_empty());
+        assert_eq!(warnings.len(), 3);
+        let logs = logger.0.lock().unwrap();
+        assert_eq!(logs.len(), 6);
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("INFO code=protocol-error"))
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("NO_RESPONSE code=no-response"))
+        );
+        drop(logs);
+
+        assert!(!apply_probe(
+            "Line A",
+            &mut devices,
+            &mut unresolved,
+            &mut warnings,
+            &logger,
+            Some(Ok((
+                "192.0.2.10".parse().unwrap(),
+                None,
+                protocols::ProbeResult {
+                    observations: vec![observation(Source::OpcUa)],
+                    ports: Vec::new(),
+                    warnings: Vec::new(),
+                    outcomes: Vec::new(),
+                },
+            ))),
+        ));
+        assert_eq!(unresolved.len(), 1);
+        assert!(!apply_probe(
+            "Line A",
+            &mut devices,
+            &mut unresolved,
+            &mut warnings,
+            &logger,
+            None,
+        ));
+    }
+
+    #[tokio::test]
+    async fn applies_snmp_success_partial_and_configuration_failure_results() {
+        #[derive(Default)]
+        struct CapturingLogger(std::sync::Mutex<Vec<String>>);
+
+        impl LogOutput for CapturingLogger {
+            fn write(&self, message: String) {
+                self.0.lock().unwrap().push(message);
+            }
+        }
+
+        let observation = || otserver_otter::contract::Observation {
+            source: Source::Snmp,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            ip_address: Some("192.0.2.10".into()),
+            mac_address: None,
+            fields: BTreeMap::new(),
+            raw: serde_json::Value::Null,
+            warnings: Vec::new(),
+        };
+        let result = |identity_mac, warnings, inventory_complete, lldp_complete| snmp::ResultData {
+            identity_mac,
+            observation: Some(observation()),
+            interfaces: Vec::new(),
+            ports: Vec::new(),
+            links: Vec::new(),
+            warnings,
+            inventory_complete,
+            lldp_complete,
+        };
+        let logger = CapturingLogger::default();
+        let mut devices = vec![Device {
+            mac_address: "00:11:22:33:44:55".into(),
+            ..Device::default()
+        }];
+        let mut links = Vec::new();
+        let mut unresolved = Vec::new();
+        let mut warnings = Vec::new();
+        let attempts = vec![
+            snmp::QueryAttempt {
+                description: "version=3 security=user".into(),
+                success: false,
+                failure: Some("unsupported SNMP privacy".into()),
+            },
+            snmp::QueryAttempt {
+                description: "version=2c security=community".into(),
+                success: true,
+                failure: None,
+            },
+            snmp::QueryAttempt {
+                description: "version=1 security=community".into(),
+                success: false,
+                failure: None,
+            },
+        ];
+
+        assert!(apply_snmp_probe(
+            "Line A",
+            &mut devices,
+            &mut links,
+            &mut unresolved,
+            &mut warnings,
+            &logger,
+            snmp::QuerySelection {
+                inventory: true,
+                lldp: true,
+            },
+            Some(Ok((
+                "192.0.2.10".into(),
+                attempts,
+                Ok(result(
+                    Some("00:11:22:33:44:55".into()),
+                    vec!["LLDP neighbor table was incomplete".into()],
+                    false,
+                    true,
+                )),
+            ))),
+        ));
+        assert_eq!(devices[0].observations.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("lldp-snmp"));
+        assert!(logger.0.lock().unwrap().iter().any(|line| {
+            line.contains("Attempt 1") && line.contains("authentication-mode-unsupported")
+        }));
+        assert!(
+            logger
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("SNMP version/security settings did not complete."))
+        );
+
+        assert!(!apply_snmp_probe(
+            "Line A",
+            &mut devices,
+            &mut links,
+            &mut unresolved,
+            &mut warnings,
+            &logger,
+            snmp::QuerySelection {
+                inventory: false,
+                lldp: false,
+            },
+            Some(Ok((
+                "192.0.2.11".into(),
+                Vec::new(),
+                Ok(result(None, Vec::new(), true, true)),
+            ))),
+        ));
+        assert_eq!(unresolved.len(), 1);
+
+        assert!(!apply_snmp_probe(
+            "Line A",
+            &mut devices,
+            &mut links,
+            &mut unresolved,
+            &mut warnings,
+            &logger,
+            snmp::QuerySelection {
+                inventory: true,
+                lldp: false,
+            },
+            Some(Ok((
+                "192.0.2.12".into(),
+                Vec::new(),
+                Ok(result(
+                    Some("00:11:22:33:44:66".into()),
+                    Vec::new(),
+                    true,
+                    true,
+                )),
+            ))),
+        ));
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[1].mac_address, "00:11:22:33:44:66");
+        assert!(!apply_snmp_probe(
+            "Line A",
+            &mut devices,
+            &mut links,
+            &mut unresolved,
+            &mut warnings,
+            &logger,
+            snmp::QuerySelection {
+                inventory: true,
+                lldp: false,
+            },
+            None,
+        ));
+
+        let (attempts, error) = snmp::query_with_attempts(
+            "192.0.2.20",
+            None,
+            &[snmp::Settings {
+                version: Some("4".into()),
+                ..snmp::Settings::default()
+            }],
+            snmp::QuerySelection {
+                inventory: true,
+                lldp: true,
+            },
+        )
+        .await;
+        let Err(error) = error else {
+            panic!("unsupported SNMP version unexpectedly succeeded")
+        };
+        assert!(!error.is_no_response());
+        assert!(apply_snmp_probe(
+            "Line A",
+            &mut devices,
+            &mut links,
+            &mut unresolved,
+            &mut warnings,
+            &logger,
+            snmp::QuerySelection {
+                inventory: true,
+                lldp: true,
+            },
+            Some(Ok(("192.0.2.20".into(), attempts, Err(error)))),
+        ));
+        assert_eq!(warnings.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn cancelled_probe_workers_are_reported_without_panicking_the_scan() {
+        let native = tokio::spawn(std::future::pending::<()>());
+        native.abort();
+        let native_error = native.await.unwrap_err();
+        let snmp_task = tokio::spawn(std::future::pending::<()>());
+        snmp_task.abort();
+        let snmp_error = snmp_task.await.unwrap_err();
+        let logger = DeviceLogger::default();
+        let mut devices = Vec::new();
+        let mut links = Vec::new();
+        let mut unresolved = Vec::new();
+        let mut warnings = Vec::new();
+
+        assert!(apply_probe(
+            "Line A",
+            &mut devices,
+            &mut unresolved,
+            &mut warnings,
+            &logger,
+            Some(Err(native_error)),
+        ));
+        assert!(apply_snmp_probe(
+            "Line A",
+            &mut devices,
+            &mut links,
+            &mut unresolved,
+            &mut warnings,
+            &logger,
+            snmp::QuerySelection {
+                inventory: true,
+                lldp: true,
+            },
+            Some(Err(snmp_error)),
+        ));
+
+        assert_eq!(
+            warnings,
+            [
+                "A native protocol probe task failed.",
+                "An SNMP probe task failed."
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_tasks_keeps_ready_results_and_stops_waiting_after_cancellation() {
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async { 7 });
+        tasks.spawn(std::future::pending::<u8>());
+        tokio::task::yield_now().await;
+
+        let cancelled = AtomicBool::new(true);
+        let mut completed = Vec::new();
+        drain_tasks(&mut tasks, &cancelled, |result| {
+            if let Some(Ok(value)) = result {
+                completed.push(value);
+            }
+        })
+        .await;
+
+        assert_eq!(completed, [7]);
+    }
+
+    #[tokio::test]
+    async fn configuration_loading_prefers_current_name_then_legacy_and_atomic_exports_replace() {
+        let directory = std::env::temp_dir().join(format!("otter-config-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let current = directory.join("otter.json");
+        let legacy = directory.join("otscanner.json");
+        std::fs::write(&legacy, b"legacy").unwrap();
+        assert_eq!(config_load_path(&current), legacy);
+        std::fs::write(&current, b"current").unwrap();
+        assert_eq!(config_load_path(&current), current);
+        std::fs::remove_file(&legacy).unwrap();
+
+        let export = directory.join("scan.json");
+        write_atomic(&export, b"first").await.unwrap();
+        write_atomic(&export, b"replacement").await.unwrap();
+        assert_eq!(tokio::fs::read(&export).await.unwrap(), b"replacement");
+        assert!(
+            write_atomic(&directory.join("missing/scan.json"), b"data")
+                .await
+                .unwrap_err()
+                .starts_with("Could not write export:")
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cli_dispatches_safe_local_information_commands_and_batch_cancellation() {
+        for command in [
+            Commands::Interfaces { json: true },
+            Commands::Interfaces { json: false },
+            Commands::Doctor,
+        ] {
+            assert!(
+                run_cli(Cli {
+                    command: Some(command),
+                })
+                .await
+                .is_ok()
+            );
+        }
+
+        let result = run_scan_batch(
+            &[ConfiguredScan {
+                name: "Pending line".into(),
+                options: ScanOptions {
+                    targets: vec!["127.0.0.1".into()],
+                    interface: "lo".into(),
+                    source_mac: "00:11:22:33:44:55".into(),
+                    output: PathBuf::from("unused.json"),
+                    protocols: ProtocolOptions {
+                        arp: false,
+                        profinet: false,
+                        s7: false,
+                        enip: false,
+                        bacnet: false,
+                        fins: false,
+                        fox: false,
+                        dnp3: false,
+                        iec61850: false,
+                        netbios: false,
+                        smb: false,
+                        rpc: false,
+                        http: false,
+                        opcua: false,
+                        snmp: false,
+                        lldp: false,
+                        ads: false,
+                    },
+                    allow_dcp_source: false,
+                    snmp: Vec::new(),
+                    opcua: protocols::OpcuaSettings::default(),
+                    ads: protocols::AdsSettings::default(),
+                    upload: None,
+                },
+            }],
+            &DeviceLogger::default(),
+            &Arc::new(AtomicBool::new(true)),
+        )
+        .await;
+        assert_eq!(
+            result,
+            BatchResult {
+                cancelled: true,
+                ..BatchResult::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_command_dispatch_uses_supplied_config_without_reading_local_config() {
+        let directory = std::env::temp_dir().join(format!("otter-cli-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let output = directory.join("scan.json");
+        let mut scan = args();
+        scan.targets = vec!["127.0.0.1".into()];
+        scan.interface = Some("lo".into());
+        scan.source_mac = Some("00:11:22:33:44:55".into());
+        scan.output = Some(output.clone());
+        scan.no_protocols = true;
+        scan.no_arp = true;
+        scan.no_profinet = true;
+        scan.no_snmp = true;
+        scan.no_lldp = true;
+
+        let result = run_cli_with_configs(
+            Cli {
+                command: Some(Commands::Scan(scan)),
+            },
+            Some(ScannerConfigs::default()),
+        )
+        .await;
+
+        assert!(result.is_ok(), "{result:?}");
+        let export: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(export["format"], "otserver-scan");
+        assert!(export["scan"].get("partial").is_none());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn scan_command_reports_invalid_configurations_after_running_valid_ones() {
+        let directory = std::env::temp_dir().join(format!("otter-cli-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let output = directory.join("scan.json");
+        let mut scan = args();
+        scan.targets = vec!["127.0.0.1".into()];
+        scan.interface = Some("lo".into());
+        scan.source_mac = Some("00:11:22:33:44:55".into());
+        scan.output = Some(output.clone());
+        scan.no_protocols = true;
+        scan.no_arp = true;
+        scan.no_profinet = true;
+        scan.no_snmp = true;
+        scan.no_lldp = true;
+        let configs = ScannerConfigs::Multiple(vec![
+            ScannerConfig {
+                name: Some("valid".into()),
+                ..ScannerConfig::default()
+            },
+            ScannerConfig {
+                name: Some("invalid".into()),
+                ads_ports: Some(vec![0]),
+                ..ScannerConfig::default()
+            },
+        ]);
+
+        let error = run_cli_with_configs(
+            Cli {
+                command: Some(Commands::Scan(scan)),
+            },
+            Some(configs),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("1 configuration(s) failed"), "{error}");
+        assert!(output.is_file());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn controller_command_dispatch_fails_before_network_or_default_state_access() {
+        let directory = std::env::temp_dir().join(format!("otter-cli-{}", Uuid::new_v4()));
+        let cli = Cli::try_parse_from([
+            "otserver-otter",
+            "controller",
+            "--ack-authorized",
+            "--state-dir",
+            directory.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let error = run_cli(cli).await.unwrap_err();
+
+        assert!(error.contains("Controller URL is invalid"), "{error}");
+        assert!(directory.is_dir());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn absent_executable_adjacent_config_uses_defaults_without_creating_a_file() {
+        let _config_guard = CONFIG_FILE_TEST_LOCK.lock().unwrap();
+        let path = get_config_path().unwrap();
+        if path.exists() {
+            return;
+        }
+
+        assert_eq!(load_config().unwrap(), ScannerConfigs::default());
+        assert!(!path.exists());
     }
 }

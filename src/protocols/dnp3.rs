@@ -701,6 +701,43 @@ mod tests {
         result
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn records_an_exchange_timeout_after_a_partial_transport_segment() {
+        let (mut client, mut server) = duplex(1024);
+        let responder = tokio::spawn(async move {
+            let mut request_frame = vec![0; request().len()];
+            server.read_exact(&mut request_frame).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            server
+                .write_all(&frame(
+                    USER_DATA,
+                    MASTER,
+                    OUTSTATION,
+                    &[TL_FIN | TL_FIR, AL_FIR | AL_FIN, UNSOLICITED],
+                ))
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            server
+                .write_all(&frame(
+                    USER_DATA,
+                    MASTER,
+                    OUTSTATION,
+                    &[TL_FIN | TL_FIR | 1, AL_FIR | AL_FIN | 1, UNSOLICITED],
+                ))
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let reply = exchange(&mut client).await.unwrap();
+
+        assert!(reply.link);
+        assert!(reply.response.is_none());
+        assert_eq!(reply.warnings, ["DNP3 exchange timed out"]);
+        responder.abort();
+    }
+
     async fn reads(bytes: &[u8]) -> Result<Option<Frame>, String> {
         let (mut client, mut server) = duplex(4096);
         let bytes = bytes.to_vec();
@@ -792,6 +829,26 @@ mod tests {
         assert_eq!(typed_attribute(2, b"AB"), Some(json!(16961)));
         assert_eq!(typed_attribute(3, &[0xff]), Some(json!(-1)));
         assert_eq!(typed_attribute(254, b"Pump 7"), None);
+        assert_eq!(
+            typed_attribute(3, &(-258_i16).to_le_bytes()),
+            Some(json!(-258))
+        );
+        assert_eq!(
+            typed_attribute(3, &(-65_538_i32).to_le_bytes()),
+            Some(json!(-65_538))
+        );
+        assert_eq!(typed_attribute(3, &[1, 2, 3]), None);
+        assert_eq!(typed_attribute(2, &[1, 2, 3]), None);
+        assert_eq!(typed_attribute(4, &1.5_f32.to_le_bytes()), Some(json!(1.5)));
+        assert_eq!(typed_attribute(4, &f32::NAN.to_le_bytes()), None);
+        assert_eq!(typed_attribute(4, &2.5_f64.to_le_bytes()), Some(json!(2.5)));
+        assert_eq!(typed_attribute(4, &f64::INFINITY.to_le_bytes()), None);
+        assert_eq!(typed_attribute(6, &[0, 255]), Some(json!({"hex":"00FF"})));
+        assert_eq!(
+            typed_attribute(7, &[1, 0, 0, 0, 0, 0]),
+            Some(json!({"millisecondsSinceEpoch": 1}))
+        );
+        assert_eq!(typed_attribute(7, &[1]), None);
     }
 
     #[test]

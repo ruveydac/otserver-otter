@@ -246,4 +246,17 @@ mod tests {
         assert!(super::super::timed_out(&error), "{error}");
         assert!(error.contains(&format!("TCP port {number}")), "{error}");
     }
+
+    #[tokio::test]
+    async fn malformed_http_response_is_reported_without_a_finding() {
+        let (number, responder) = serve(b"not an HTTP response\r\n\r\n".to_vec()).await;
+
+        let error = probe(Ipv4Addr::LOCALHOST, number, false)
+            .await
+            .err()
+            .expect("malformed response must be rejected");
+
+        assert!(error.contains("failed before an HTTP response"), "{error}");
+        responder.await.unwrap();
+    }
 }
