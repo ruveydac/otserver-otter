@@ -74,6 +74,7 @@ step controller-https python3 -I "$ROOT/lab/controller_verify.py" "$OTTER_CLIENT
 
 # Always create our own database. Never use DATABASE_URL/TEST_DATABASE_URL from the caller or .env.
 CONTAINER=$("$RUNTIME" run --detach --name "$MONGO" \
+  --env GLIBC_TUNABLES=glibc.pthread.rseq=1 \
   --publish 127.0.0.1::27017 docker.io/library/mongo:8 --replSet rs0 --bind_ip_all)
 wait_for_mongo() {
   local expression=$1
