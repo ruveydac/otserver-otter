@@ -8,6 +8,7 @@ pub(crate) mod profinet_database;
 pub mod protocols;
 pub mod snmp;
 pub mod traffic;
+pub mod update;
 
 pub const VERSION: &str = env!("OTTER_BUILD_VERSION");
 

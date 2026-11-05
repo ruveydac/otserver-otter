@@ -11,3 +11,5 @@ pki/
 agent-state.json
 agent.lock
 .opencode
+otter-update-private.pem
+/release-artifacts/

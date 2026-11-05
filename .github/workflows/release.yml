@@ -81,41 +81,130 @@ jobs:
           name: otserver-otter-windows-x86_64
           path: target/release/otserver-otter.exe
 
-  provenance-subjects:
+  sign-release:
     needs: [build-linux, build-linux-arm64, build-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release-signing
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build release signer before accessing the signing secret
+        run: cargo build --locked --no-default-features --example sign-update
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: otserver-otter-*
+          merge-multiple: true
+          path: release-artifacts
+      - name: Unpack executables for embedded signing
+        run: |
+          mkdir -p release-artifacts/linux-x86_64 release-artifacts/linux-aarch64
+          tar xzf release-artifacts/otserver-otter-linux-x86_64.tar.gz -C release-artifacts/linux-x86_64
+          tar xzf release-artifacts/otserver-otter-linux-aarch64.tar.gz -C release-artifacts/linux-aarch64
+      - name: Embed and verify executable signatures
+        env:
+          OTTER_UPDATE_SIGNING_PRIVATE_KEY: ${{ secrets.OTTER_UPDATE_SIGNING_PRIVATE_KEY }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          ./target/debug/examples/sign-update "$RELEASE_VERSION" x86_64-unknown-linux-gnu release-artifacts/linux-x86_64/otserver-otter
+          ./target/debug/examples/sign-update "$RELEASE_VERSION" aarch64-unknown-linux-gnu release-artifacts/linux-aarch64/otserver-otter
+          ./target/debug/examples/sign-update "$RELEASE_VERSION" x86_64-pc-windows-msvc release-artifacts/otserver-otter.exe
+      - name: Package signed Linux executables
+        run: |
+          tar czf release-artifacts/otserver-otter-linux-x86_64.tar.gz -C release-artifacts/linux-x86_64 otserver-otter
+          tar czf release-artifacts/otserver-otter-linux-aarch64.tar.gz -C release-artifacts/linux-aarch64 otserver-otter
+      - uses: actions/upload-artifact@v7
+        with:
+          name: otter-signed-release
+          if-no-files-found: error
+          path: |
+            release-artifacts/otserver-otter-linux-x86_64.tar.gz
+            release-artifacts/otserver-otter-linux-aarch64.tar.gz
+            release-artifacts/otserver-otter.exe
+
+  verify-signed-binaries:
+    needs: sign-release
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: otserver-otter-linux-x86_64
+            archive: otserver-otter-linux-x86_64.tar.gz
+            executable: otserver-otter
+          - os: ubuntu-24.04-arm
+            artifact: otserver-otter-linux-aarch64
+            archive: otserver-otter-linux-aarch64.tar.gz
+            executable: otserver-otter
+          - os: windows-latest
+            artifact: otserver-otter-windows-x86_64
+            archive: ''
+            executable: otserver-otter.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: ${{ matrix.artifact }}
+          path: unsigned
+      - uses: actions/download-artifact@v5
+        with:
+          name: otter-signed-release
+          path: signed
+      - name: Verify with the original build and smoke-test the signed executable
+        shell: bash
+        env:
+          ARCHIVE: ${{ matrix.archive }}
+          EXECUTABLE: ${{ matrix.executable }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir trusted candidate
+          if [[ -n "$ARCHIVE" ]]; then
+            tar xzf "unsigned/$ARCHIVE" -C trusted
+            tar xzf "signed/$ARCHIVE" -C candidate
+            chmod +x "trusted/$EXECUTABLE" "candidate/$EXECUTABLE"
+          else
+            cp "unsigned/$EXECUTABLE" "trusted/$EXECUTABLE"
+            cp "signed/$EXECUTABLE" "candidate/$EXECUTABLE"
+          fi
+          "trusted/$EXECUTABLE" verify-binary "candidate/$EXECUTABLE"
+          actual=$("candidate/$EXECUTABLE" --version)
+          test "$actual" = "otserver-otter $RELEASE_VERSION"
+
+  provenance-subjects:
+    needs: verify-signed-binaries
     runs-on: ubuntu-latest
     outputs:
       hashes: ${{ steps.hashes.outputs.hashes }}
     steps:
       - uses: actions/download-artifact@v5
         with:
-          path: artifacts
+          name: otter-signed-release
       - name: Hash release artifacts
         id: hashes
         run: |
           set -euo pipefail
-          mv artifacts/otserver-otter-linux-x86_64/otserver-otter-linux-x86_64.tar.gz .
-          mv artifacts/otserver-otter-linux-aarch64/otserver-otter-linux-aarch64.tar.gz .
-          mv artifacts/otserver-otter-windows-x86_64/otserver-otter.exe .
           echo "hashes=$(sha256sum otserver-otter-linux-x86_64.tar.gz otserver-otter-linux-aarch64.tar.gz otserver-otter.exe | base64 -w0)" >> "$GITHUB_OUTPUT"
 
   release:
-    needs: [build-linux, build-linux-arm64, build-windows]
+    needs: verify-signed-binaries
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v5
         with:
-          path: artifacts
-      - run: |
-          mv artifacts/otserver-otter-linux-x86_64/otserver-otter-linux-x86_64.tar.gz .
-          mv artifacts/otserver-otter-linux-aarch64/otserver-otter-linux-aarch64.tar.gz .
-          mv artifacts/otserver-otter-windows-x86_64/otserver-otter.exe .
+          name: otter-signed-release
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             otserver-otter-linux-x86_64.tar.gz
             otserver-otter-linux-aarch64.tar.gz
             otserver-otter.exe
+          fail_on_unmatched_files: true
           generate_release_notes: true
 
   provenance:
