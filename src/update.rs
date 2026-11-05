@@ -53,11 +53,20 @@ impl VerifiedBinary {
 /// The caller must keep the verified staging file private and unchanged until installation.
 pub fn verify_binary(path: &Path, target: &str) -> Result<VerifiedBinary, String> {
     let mut file = File::open(path).map_err(|error| error.to_string())?;
-    verify_with_key(&mut file, target, &release_key()?)
+    verify_with_key(&mut file, target, &public_key(PUBLIC_KEY_PEM)?)
 }
 
 fn verify_with_key(
     file: &mut File,
+    target: &str,
+    key: &VerifyingKey,
+) -> Result<VerifiedBinary, String> {
+    verify_reader(&*file, file, target, key)
+}
+
+fn verify_reader(
+    mut reader: impl Read + Seek,
+    file: &File,
     target: &str,
     key: &VerifyingKey,
 ) -> Result<VerifiedBinary, String> {
@@ -66,16 +75,19 @@ fn verify_with_key(
         return Err("Executable has no embedded Otter signature.".into());
     }
     let payload_size = file_size - TRAILER_LEN as u64;
-    file.seek(SeekFrom::Start(payload_size))
+    reader
+        .seek(SeekFrom::Start(payload_size))
         .map_err(|error| error.to_string())?;
     let mut trailer = [0; TRAILER_LEN];
-    file.read_exact(&mut trailer)
+    reader
+        .read_exact(&mut trailer)
         .map_err(|error| error.to_string())?;
     if &trailer[..16] != MAGIC {
         return Err("Executable has no supported embedded Otter signature.".into());
     }
-    let signature = Signature::from_slice(&trailer[MESSAGE_LEN..])
-        .map_err(|_| "Invalid embedded signature length.")?;
+    let mut signature = [0; 64];
+    signature.copy_from_slice(&trailer[MESSAGE_LEN..]);
+    let signature = Signature::from_bytes(&signature);
     key.verify_strict(&trailer[..MESSAGE_LEN], &signature)
         .map_err(|_| "Embedded executable signature is invalid.")?;
     if trailer[16..24] != payload_size.to_le_bytes() {
@@ -87,8 +99,8 @@ fn verify_with_key(
     if signed_target != target || !supported_target(target) {
         return Err("Executable signature does not match the required target.".into());
     }
-    file.rewind().map_err(|error| error.to_string())?;
-    let (size, digest) = digest_reader((&mut *file).take(payload_size))?;
+    reader.rewind().map_err(|error| error.to_string())?;
+    let (size, digest) = digest_reader(reader.take(payload_size))?;
     if size != payload_size || digest[..] != trailer[216..MESSAGE_LEN] {
         return Err("Executable SHA-256 does not match its embedded signature.".into());
     }
@@ -109,10 +121,7 @@ pub fn embed_binary_signature(
     target: &str,
     key: &SigningKey,
 ) -> Result<(), String> {
-    if key.verifying_key() != release_key()? {
-        return Err("The signing secret does not match otter-update-public.pem.".into());
-    }
-    embed_with_key(path, version, target, key)
+    embed_with_key(path, version, target, key, &public_key(PUBLIC_KEY_PEM)?)
 }
 
 fn embed_with_key(
@@ -120,7 +129,11 @@ fn embed_with_key(
     version: &str,
     target: &str,
     key: &SigningKey,
+    expected_key: &VerifyingKey,
 ) -> Result<(), String> {
+    if key.verifying_key() != *expected_key {
+        return Err("The signing secret does not match otter-update-public.pem.".into());
+    }
     release_version(version)?;
     if !supported_target(target) {
         return Err("Unsupported executable signing target.".into());
@@ -182,8 +195,8 @@ fn padded_text(bytes: &[u8]) -> Result<&str, String> {
         .map_err(|_| "Invalid text in executable signature.".into())
 }
 
-fn release_key() -> Result<VerifyingKey, String> {
-    VerifyingKey::from_public_key_pem(PUBLIC_KEY_PEM)
+fn public_key(pem: &str) -> Result<VerifyingKey, String> {
+    VerifyingKey::from_public_key_pem(pem)
         .map_err(|_| "The embedded update public key is invalid.".into())
 }
 

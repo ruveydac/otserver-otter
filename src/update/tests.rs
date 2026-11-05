@@ -21,7 +21,14 @@ impl Fixture {
     }
 
     fn sign(&self, target: &str) {
-        embed_with_key(&self.path, "v0.14", target, &self.key).unwrap();
+        embed_with_key(
+            &self.path,
+            "v0.14",
+            target,
+            &self.key,
+            &self.key.verifying_key(),
+        )
+        .unwrap();
     }
 
     fn verify(&self, target: &str) -> Result<VerifiedBinary, String> {
@@ -103,9 +110,15 @@ fn embedded_signatures_reject_wrong_keys_targets_and_unsigned_files() {
     assert!(fixture.verify("unknown").is_err());
     let signed = std::fs::read(&fixture.path).unwrap();
     assert!(
-        embed_with_key(&fixture.path, "v0.15", target, &fixture.key)
-            .unwrap_err()
-            .contains("already has")
+        embed_with_key(
+            &fixture.path,
+            "v0.15",
+            target,
+            &fixture.key,
+            &fixture.key.verifying_key()
+        )
+        .unwrap_err()
+        .contains("already has")
     );
     assert_eq!(std::fs::read(&fixture.path).unwrap(), signed);
 }
@@ -198,15 +211,51 @@ fn signing_and_verification_bound_files_and_validate_inputs_before_modification(
     let target = RELEASE_TARGETS[0];
     let original = std::fs::read(&fixture.path).unwrap();
     for version in ["latest", "", &format!("1.0.0+{}", "x".repeat(128))] {
-        assert!(embed_with_key(&fixture.path, version, target, &fixture.key).is_err());
+        assert!(
+            embed_with_key(
+                &fixture.path,
+                version,
+                target,
+                &fixture.key,
+                &fixture.key.verifying_key()
+            )
+            .is_err()
+        );
     }
-    assert!(embed_with_key(&fixture.path, "v0.14", "unknown", &fixture.key).is_err());
+    assert!(
+        embed_with_key(
+            &fixture.path,
+            "v0.14",
+            "unknown",
+            &fixture.key,
+            &fixture.key.verifying_key()
+        )
+        .is_err()
+    );
     assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
     assert!(verify_binary(&fixture.directory, target).is_err());
-    assert!(embed_with_key(&fixture.directory, "v0.14", target, &fixture.key).is_err());
+    assert!(
+        embed_with_key(
+            &fixture.directory,
+            "v0.14",
+            target,
+            &fixture.key,
+            &fixture.key.verifying_key()
+        )
+        .is_err()
+    );
     let missing = fixture.directory.join("missing");
     assert!(verify_binary(&missing, target).is_err());
-    assert!(embed_with_key(&missing, "v0.14", target, &fixture.key).is_err());
+    assert!(
+        embed_with_key(
+            &missing,
+            "v0.14",
+            target,
+            &fixture.key,
+            &fixture.key.verifying_key()
+        )
+        .is_err()
+    );
     let file = File::create(&fixture.path).unwrap();
     for size in [
         0,
@@ -214,14 +263,30 @@ fn signing_and_verification_bound_files_and_validate_inputs_before_modification(
         MAX_PAYLOAD_BYTES - TRAILER_LEN as u64 + 1,
     ] {
         file.set_len(size).unwrap();
-        assert!(embed_with_key(&fixture.path, "v0.14", target, &fixture.key).is_err());
+        assert!(
+            embed_with_key(
+                &fixture.path,
+                "v0.14",
+                target,
+                &fixture.key,
+                &fixture.key.verifying_key()
+            )
+            .is_err()
+        );
         assert!(fixture.verify(target).is_err());
     }
     drop(file);
     std::fs::write(&fixture.path, [1]).unwrap();
     let version = format!("1.0.0+{}", "x".repeat(122));
     assert_eq!(version.len(), 128);
-    embed_with_key(&fixture.path, &version, target, &fixture.key).unwrap();
+    embed_with_key(
+        &fixture.path,
+        &version,
+        target,
+        &fixture.key,
+        &fixture.key.verifying_key(),
+    )
+    .unwrap();
     assert_eq!(fixture.verify(target).unwrap().version(), version);
 }
 
@@ -246,7 +311,14 @@ fn signed_native_executable_still_runs_after_appending_the_trailer() {
         "signed"
     });
     std::fs::copy(executable, &path).unwrap();
-    embed_with_key(&path, "v0.14", target, &fixture.key).unwrap();
+    embed_with_key(
+        &path,
+        "v0.14",
+        target,
+        &fixture.key,
+        &fixture.key.verifying_key(),
+    )
+    .unwrap();
     let mut command = std::process::Command::new(path);
     if cfg!(windows) {
         command.args(["/d", "/c", "exit", "0"]);
@@ -273,10 +345,153 @@ fn version_checks_preserve_semver_rules_short_tags_and_prerelease_ordering() {
     }
     let fixture = Fixture::new();
     let target = RELEASE_TARGETS[0];
-    embed_with_key(&fixture.path, "v0.14.0-rc.2+new", target, &fixture.key).unwrap();
+    embed_with_key(
+        &fixture.path,
+        "v0.14.0-rc.2+new",
+        target,
+        &fixture.key,
+        &fixture.key.verifying_key(),
+    )
+    .unwrap();
     let verified = fixture.verify(target).unwrap();
     verified.require_newer_than("v0.14-rc.1").unwrap();
     assert!(verified.require_newer_than("v0.14").is_err());
     assert!(verified.require_newer_than("v0.14-rc.2+old").is_err());
-    assert!(!release_key().unwrap().is_weak());
+    assert!(!public_key(PUBLIC_KEY_PEM).unwrap().is_weak());
+}
+
+#[test]
+fn unreadable_executable_fails_verification_instead_of_accepting_its_metadata() {
+    let fixture = Fixture::new();
+    let target = RELEASE_TARGETS[0];
+    fixture.sign(target);
+    let mut file = File::options().write(true).open(&fixture.path).unwrap();
+    let error = verify_with_key(&mut file, target, &fixture.key.verifying_key()).unwrap_err();
+    let mut byte = [0];
+    assert_eq!(error, file.read(&mut byte).unwrap_err().to_string());
+}
+
+struct VerificationReader<'a> {
+    file: &'a File,
+    fail_read: usize,
+    fail_seek: usize,
+    resize_on_rewind: Option<u64>,
+    reads: usize,
+    seeks: usize,
+}
+
+impl Read for VerificationReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.reads += 1;
+        if self.reads == self.fail_read {
+            return Err(std::io::Error::other("injected read failure"));
+        }
+        self.file.read(buffer)
+    }
+}
+
+impl Seek for VerificationReader<'_> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.seeks += 1;
+        if self.seeks == self.fail_seek {
+            return Err(std::io::Error::other("injected seek failure"));
+        }
+        if position == SeekFrom::Start(0)
+            && let Some(size) = self.resize_on_rewind.take()
+        {
+            self.file.set_len(size)?;
+        }
+        self.file.seek(position)
+    }
+}
+
+#[test]
+fn verification_propagates_io_failures_before_and_after_authenticating_the_trailer() {
+    let fixture = Fixture::new();
+    let target = RELEASE_TARGETS[0];
+    fixture.sign(target);
+    let file = File::open(&fixture.path).unwrap();
+    for (fail_read, fail_seek, expected) in [
+        (0, 1, "injected seek failure"),
+        (1, 0, "injected read failure"),
+        (0, 2, "injected seek failure"),
+        (2, 0, "injected read failure"),
+        (3, 0, "injected read failure"),
+    ] {
+        let reader = VerificationReader {
+            file: &file,
+            fail_read,
+            fail_seek,
+            resize_on_rewind: None,
+            reads: 0,
+            seeks: 0,
+        };
+        assert_eq!(
+            verify_reader(reader, &file, target, &fixture.key.verifying_key()).unwrap_err(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn verification_rejects_size_changes_after_reading_a_valid_trailer() {
+    let fixture = Fixture::new();
+    let target = RELEASE_TARGETS[0];
+    fixture.sign(target);
+    let signed = std::fs::read(&fixture.path).unwrap();
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .open(&fixture.path)
+        .unwrap();
+    let size = signed.len() as u64;
+    for (new_size, expected) in [
+        (size + 1, "Executable changed size while being verified."),
+        (size - 1, "Executable changed size while being verified."),
+        (
+            1,
+            "Executable SHA-256 does not match its embedded signature.",
+        ),
+    ] {
+        std::fs::write(&fixture.path, &signed).unwrap();
+        let reader = VerificationReader {
+            file: &file,
+            fail_read: 0,
+            fail_seek: 0,
+            resize_on_rewind: Some(new_size),
+            reads: 0,
+            seeks: 0,
+        };
+        assert_eq!(
+            verify_reader(reader, &file, target, &fixture.key.verifying_key()).unwrap_err(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn digest_read_failure_never_returns_a_partial_digest() {
+    struct FailingReader;
+    impl Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("injected read failure"))
+        }
+    }
+    let reader = std::io::Cursor::new(b"partial payload").chain(FailingReader);
+    assert_eq!(digest_reader(reader).unwrap_err(), "injected read failure");
+}
+
+#[test]
+fn public_key_errors_are_fixed_and_do_not_echo_invalid_key_material() {
+    for pem in [
+        "",
+        "not a key",
+        "-----BEGIN PRIVATE KEY-----\nprivate material\n-----END PRIVATE KEY-----",
+    ] {
+        assert_eq!(
+            public_key(pem).unwrap_err(),
+            "The embedded update public key is invalid."
+        );
+    }
+    assert!(!public_key(PUBLIC_KEY_PEM).unwrap().is_weak());
 }

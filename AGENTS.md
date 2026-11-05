@@ -187,6 +187,8 @@ instructions are in `README.md`; detailed operator and development guidance foll
   a verified signed bundle. Keep private keys out of the repository and artifacts.
   Sign executables before building the final Linux archives; publish no update JSON or detached
   signature files.
+  Container builds must allowlist `otter-update-public.pem` in their Dockerfile-specific ignore file
+  and copy it beside `Cargo.toml`; `include_str!` needs it while compiling the library.
   `verify-binary FILE [--newer-than VERSION]` authenticates the entire preceding executable plus
   signed version/target metadata without sidecars or executing the candidate. Never accept a key
   supplied by the candidate. Treat missing, malformed, truncated or appended signature records as
