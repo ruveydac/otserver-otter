@@ -61,6 +61,13 @@ pub enum Commands {
     Validate {
         file: PathBuf,
     },
+    /// Verify an executable's embedded release signature without sidecar files or executing it.
+    VerifyBinary {
+        file: PathBuf,
+        /// Also require a version strictly newer than this locally trusted version.
+        #[arg(long)]
+        newer_than: Option<String>,
+    },
     #[cfg(feature = "gui")]
     Gui,
 }
@@ -442,6 +449,19 @@ async fn run_cli_with_configs(
     match cli.command {
         Some(Commands::Controller(args)) => controller::run(args).await,
         Some(Commands::Doctor) => doctor(),
+        Some(Commands::VerifyBinary { file, newer_than }) => {
+            let verified =
+                otserver_otter::update::verify_binary(&file, otserver_otter::update::BUILD_TARGET)?;
+            if let Some(version) = newer_than {
+                verified.require_newer_than(&version)?;
+            }
+            println!(
+                "Verified OTserver Otter executable {} for {}.",
+                verified.version(),
+                verified.target()
+            );
+            Ok(())
+        }
         Some(Commands::Interfaces { json }) => {
             let devices = profinet::interfaces()?;
             if json {

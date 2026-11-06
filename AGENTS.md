@@ -179,6 +179,25 @@ instructions are in `README.md`; detailed operator and development guidance foll
 - Tagged releases publish signed SLSA provenance for the SHA-256 digest of each Linux archive and
   Windows executable. This is separate from Windows Authenticode signing, which requires a trusted
   code-signing certificate or managed signing service.
+- Every release executable carries the fixed 312-byte EOF Ed25519 signature record implemented in
+  `src/update.rs`; `docs/update-signing.md` documents the wire format. Embed the committed
+  `otter-update-public.pem`; never load a replacement key from management
+  or beside the executable. `examples/sign-update.rs` uses `OTTER_UPDATE_SIGNING_PRIVATE_KEY` only
+  in the `release-signing` CI job after builds/checks and refuses mismatched keys. Publishing requires
+  a verified signed bundle. Keep private keys out of the repository and artifacts.
+  Sign executables before building the final Linux archives; publish no update JSON or detached
+  signature files.
+  Container builds must allowlist `otter-update-public.pem` in their Dockerfile-specific ignore file
+  and copy it beside `Cargo.toml`; `include_str!` needs it while compiling the library.
+  `verify-binary FILE [--newer-than VERSION]` authenticates the entire preceding executable plus
+  signed version/target metadata without sidecars or executing the candidate. Never accept a key
+  supplied by the candidate. Treat missing, malformed, truncated or appended signature records as
+  failures; preserve the trailer when copying/installing. The native signed-executable verification
+  and startup matrix gates publication. This custom record does not provide Authenticode trust.
+  Verification requires the running build target, with optional strict version precedence; it performs
+  no installation or persistent rollback tracking. Future updaters must enforce locally trusted
+  version floors, private immutable staging and recoverable platform-specific installation. Key rotation needs an
+  old-key-authorized transition, not an untrusted replacement PEM.
 
 ## Local configuration and direct uploads
 

@@ -2,6 +2,10 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    println!(
+        "cargo:rustc-env=OTTER_BUILD_TARGET={}",
+        std::env::var("TARGET").expect("Cargo target")
+    );
     println!("cargo:rerun-if-env-changed=OTTER_BUILD_VERSION");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/packed-refs");

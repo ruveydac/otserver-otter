@@ -81,6 +81,44 @@ fn validate_command_returns_a_nonzero_exit_for_a_missing_file() {
 }
 
 #[test]
+fn verify_binary_cli_rejects_unsigned_and_untrusted_files_without_sidecars() {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let directory = temporary_directory("embedded-signature");
+    let candidate = directory.join("candidate.exe");
+    let payload = vec![0x42; 512];
+    std::fs::write(&candidate, &payload).unwrap();
+    let verify = || {
+        Command::new(BINARY)
+            .arg("verify-binary")
+            .arg(&candidate)
+            .args(["--newer-than", "v0.13"])
+            .output()
+            .unwrap()
+    };
+    let unsigned = verify();
+    assert_eq!(unsigned.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&unsigned.stderr).contains("no supported embedded"));
+
+    let mut trailer = [0; 312];
+    trailer[..16].copy_from_slice(b"OTTER-SIGNED-v1\0");
+    trailer[16..24].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+    trailer[24..29].copy_from_slice(b"v0.14");
+    let signature = SigningKey::from_bytes(&[1; 32]).sign(&trailer[..248]);
+    trailer[248..].copy_from_slice(&signature.to_bytes());
+    let mut signed = payload;
+    signed.extend_from_slice(&trailer);
+    std::fs::write(&candidate, &signed).unwrap();
+    let untrusted = verify();
+    assert_eq!(untrusted.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&untrusted.stderr).contains("signature is invalid"));
+    assert!(untrusted.stdout.is_empty());
+    assert_eq!(std::fs::read(&candidate).unwrap(), signed);
+    assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn scan_with_all_probes_disabled_writes_a_valid_export_without_using_local_config() {
     let directory = temporary_directory("no-probes");
     let executable = isolated_binary(&directory, b"{}");

@@ -78,6 +78,19 @@ Active PROFINET DCP and PNIO I&M reads also require Npcap. Without it, Otter use
 passive capture, which requires Administrator rights and cannot send DCP Identify or PNIO requests.
 Skipped targets and failed records appear in the scan warnings; successful records remain in the JSON.
 
+### Verify release downloads
+
+
+```bash
+otserver-otter verify-binary ./download/otserver-otter
+```
+
+On Windows, use `otserver-otter verify-binary .\download\otserver-otter.exe`. For Linux, check the
+executable extracted from the archive. Verification reads the candidate without running it and
+authenticates its bytes, version and platform using Otter's compiled-in public key.
+
+Use the executable for your platform. Add `--newer-than VERSION` to reject older/equal releases.
+
 ### Use the results
 
 Import `scan.otserver.json` into OTserver, selecting the site where the devices belong.

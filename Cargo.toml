@@ -13,12 +13,15 @@ gui = ["dep:eframe", "dep:rfd"]
 [dependencies]
 async-snmp = { version = "0.16", default-features = false, features = ["crypto-rustcrypto", "rt-multi-thread"] }
 clap = { version = "4.5", features = ["derive"] }
+ed25519-dalek = { version = "2.2", features = ["pem"] }
 native-tls = "0.2"
 oui-data = "0.2.1"
 reqwest = { version = "0.13", default-features = false, features = ["multipart", "native-tls"] }
 rfd = { version = "0.15", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
+sha2 = "0.10"
 scraper = { version = "0.29", default-features = false }
 time = { version = "0.3", features = ["formatting", "parsing", "local-offset"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
