@@ -1,4 +1,4 @@
-use super::{Credential, Error, State};
+use super::{Credential, Error, State, UpdateState};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -79,6 +79,126 @@ impl Store {
 
     pub(super) fn path(&self) -> &Path {
         &self.directory
+    }
+
+    pub(super) fn update_path(&self, id: &str, suffix: &str) -> Result<PathBuf, Error> {
+        if !super::valid_id(id) || !matches!(suffix, "bin" | "previous" | "updater.exe") {
+            return Err(Error::Invalid);
+        }
+        Ok(self.directory.join(format!("update-{id}.{suffix}")))
+    }
+
+    pub(super) fn load_update_state(&self) -> Result<UpdateState, Error> {
+        Self::read_update_state(&self.directory)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn read_update_state_for(
+        directory: &Path,
+        owner: u32,
+    ) -> Result<UpdateState, Error> {
+        let path = directory.join("update-state.json");
+        if !path.exists() {
+            return Ok(UpdateState::default());
+        }
+        check_private_for(directory, true, owner)?;
+        check_private_for(&path, false, owner)?;
+        decode_update_state(&read_update_state_bytes(&path)?)
+    }
+
+    pub(super) fn read_update_state(directory: &Path) -> Result<UpdateState, Error> {
+        let path = directory.join("update-state.json");
+        if !path.exists() {
+            return Ok(UpdateState::default());
+        }
+        check_private(directory, true)?;
+        check_private(&path, false)?;
+        decode_update_state(&read_update_state_bytes(&path)?)
+    }
+
+    pub(super) fn save_update_state(&self, state: &UpdateState) -> Result<(), Error> {
+        Self::write_update_state(&self.directory, state)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn save_update_state_for(
+        directory: &Path,
+        owner: u32,
+        state: &UpdateState,
+    ) -> Result<(), Error> {
+        check_private_for(directory, true, owner)?;
+        let data = serde_json::to_vec(state)
+            .map_err(|_| Error::Local("Could not encode private Otter update state."))?;
+        let temporary = directory.join(format!("update-{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&temporary)
+                .map_err(|_| Error::Local("Could not create private Otter update state."))?;
+            file.write_all(&data)
+                .and_then(|()| file.sync_all())
+                .map_err(|_| Error::Local("Could not persist private Otter update state."))?;
+            // SAFETY: this is a regular file descriptor created by this helper; owner is the
+            // authenticated real UID, and getgid() is that process's real primary group.
+            if unsafe {
+                libc::fchown(
+                    std::os::fd::AsRawFd::as_raw_fd(&file),
+                    owner,
+                    libc::getgid(),
+                )
+            } != 0
+            {
+                return Err(Error::Local(
+                    "Could not assign private update state to its owner.",
+                ));
+            }
+            replace(&temporary, &directory.join("update-state.json"))?;
+            File::open(directory)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|_| Error::Local("Could not synchronize private Otter update state."))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(temporary);
+        }
+        result
+    }
+
+    fn write_update_state(directory: &Path, state: &UpdateState) -> Result<(), Error> {
+        let data = serde_json::to_vec(state)
+            .map_err(|_| Error::Local("Could not encode private Otter update state."))?;
+        let temporary = directory.join(format!("update-{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&temporary)
+                .map_err(|_| Error::Local("Could not create private Otter update state."))?;
+            file.write_all(&data)
+                .and_then(|()| file.sync_all())
+                .map_err(|_| Error::Local("Could not persist private Otter update state."))?;
+            replace(&temporary, &directory.join("update-state.json"))?;
+            #[cfg(unix)]
+            File::open(directory)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|_| Error::Local("Could not synchronize private Otter update state."))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(temporary);
+        }
+        result
     }
 
     pub(super) fn read_state(directory: &Path) -> Result<State, Error> {
@@ -224,7 +344,56 @@ impl Store {
     }
 }
 
+fn decode_update_state(data: &[u8]) -> Result<UpdateState, Error> {
+    if data.len() > 64 * 1024 {
+        return Err(Error::Invalid);
+    }
+    let state: UpdateState =
+        serde_json::from_slice(data).map_err(|_| Error::Local("Otter update state is invalid."))?;
+    if state.pending.as_ref().is_some_and(|pending| {
+        !super::valid_id(&pending.id)
+            || pending.target != otserver_otter::update::BUILD_TARGET
+            || !is_digest(&pending.binary_digest)
+            || !is_digest(&pending.previous_digest)
+            || pending.binary_size == 0
+            || pending.binary_size > 512 * 1024 * 1024
+    }) || state
+        .rolled_back
+        .as_ref()
+        .is_some_and(|id| !super::valid_id(id))
+        || state.failed.as_ref().is_some_and(|id| !super::valid_id(id))
+        || (state.failed.is_none() && state.failed_reason.is_some())
+        || (state.rolled_back.is_some() && state.failed.is_some())
+    {
+        return Err(Error::Invalid);
+    }
+    Ok(state)
+}
+
+fn read_update_state_bytes(path: &Path) -> Result<Vec<u8>, Error> {
+    let mut data = Vec::new();
+    File::open(path)
+        .and_then(|file| file.take(64 * 1024 + 1).read_to_end(&mut data))
+        .map_err(|_| Error::Local("Could not read private Otter update state."))?;
+    if data.len() > 64 * 1024 {
+        return Err(Error::Invalid);
+    }
+    Ok(data)
+}
+
+fn is_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn check_private(path: &Path, directory: bool) -> Result<(), Error> {
+    #[cfg(unix)]
+    let owner = unsafe { libc::geteuid() };
+    #[cfg(windows)]
+    let owner = 0;
+    check_private_for(path, directory, owner)
+}
+
+fn check_private_for(path: &Path, directory: bool, owner: u32) -> Result<(), Error> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|_| Error::Local("Could not inspect private scanner state."))?;
     if metadata.file_type().is_symlink() || metadata.is_dir() != directory {
@@ -236,14 +405,17 @@ fn check_private(path: &Path, directory: bool) -> Result<(), Error> {
     {
         use std::os::unix::fs::MetadataExt;
         // SAFETY: geteuid has no arguments or memory preconditions.
-        if metadata.mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
+        if metadata.mode() & 0o077 != 0 || metadata.uid() != owner {
             return Err(Error::Local(
                 "Scanner state must belong to this user with directory mode 0700 and file mode 0600.",
             ));
         }
     }
     #[cfg(windows)]
-    restrict_windows(path)?;
+    {
+        let _ = owner;
+        restrict_windows(path)?;
+    }
     Ok(())
 }
 
@@ -363,6 +535,7 @@ fn replace(source: &Path, destination: &Path) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::controller::PendingUpdate;
 
     fn state_dir() -> PathBuf {
         std::env::temp_dir().join(format!("otter-store-{}", uuid::Uuid::new_v4()))
@@ -392,6 +565,53 @@ mod tests {
                 0o600
             );
         }
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pending_update_state_roundtrips_and_rejects_untrusted_identifiers() {
+        let directory = state_dir();
+        let store = Store::open(Some(directory.clone())).unwrap();
+        let update = UpdateState {
+            version_floor: Some("0.9.0".into()),
+            pending: Some(PendingUpdate {
+                id: "update-1".into(),
+                version: "0.9.1".into(),
+                target: otserver_otter::update::BUILD_TARGET.into(),
+                binary_digest: "a".repeat(64),
+                binary_size: 1024,
+                previous_version: "0.9.0".into(),
+                previous_digest: "b".repeat(64),
+            }),
+            rolled_back: None,
+            failed: None,
+            failed_reason: None,
+        };
+        store.save_update_state(&update).unwrap();
+        let loaded = store.load_update_state().unwrap();
+        assert_eq!(loaded.version_floor.as_deref(), Some("0.9.0"));
+        assert_eq!(
+            loaded.pending.as_ref().map(|pending| pending.id.as_str()),
+            Some("update-1")
+        );
+
+        let mut failed = loaded;
+        failed.pending = None;
+        failed.failed = Some("update-1".into());
+        failed.failed_reason = Some(crate::controller::UpdateFailureReason::SignatureRejected);
+        store.save_update_state(&failed).unwrap();
+        let loaded = store.load_update_state().unwrap();
+        assert_eq!(loaded.failed.as_deref(), Some("update-1"));
+        assert!(matches!(
+            loaded.failed_reason,
+            Some(crate::controller::UpdateFailureReason::SignatureRejected)
+        ));
+
+        let mut invalid = update;
+        invalid.pending.as_mut().unwrap().id = "../outside".into();
+        store.save_update_state(&invalid).unwrap();
+        assert!(matches!(store.load_update_state(), Err(Error::Invalid)));
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     }

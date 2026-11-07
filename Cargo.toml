@@ -66,3 +66,6 @@ iec61850-server = { version = "0.2", default-features = false, features = ["std"
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Security"] }
+
+[profile.dev.package.sha2]
+opt-level = 3

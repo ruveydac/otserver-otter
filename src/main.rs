@@ -446,6 +446,17 @@ async fn run_cli_with_configs(
     cli: Cli,
     scanner_configs: Option<ScannerConfigs>,
 ) -> Result<(), String> {
+    if controller::is_update_helper_executable()
+        && !matches!(
+            cli.command.as_ref(),
+            Some(Commands::Controller(args))
+                if args.is_apply_update() || args.is_check_update_helper()
+        )
+    {
+        return Err(
+            "The privileged Otter update helper only accepts verified update requests.".into(),
+        );
+    }
     match cli.command {
         Some(Commands::Controller(args)) => controller::run(args).await,
         Some(Commands::Doctor) => doctor(),

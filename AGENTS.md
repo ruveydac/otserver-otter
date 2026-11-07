@@ -195,8 +195,13 @@ instructions are in `README.md`; detailed operator and development guidance foll
   failures; preserve the trailer when copying/installing. The native signed-executable verification
   and startup matrix gates publication. This custom record does not provide Authenticode trust.
   Verification requires the running build target, with optional strict version precedence; it performs
-  no installation or persistent rollback tracking. Future updaters must enforce locally trusted
-  version floors, private immutable staging and recoverable platform-specific installation. Key rotation needs an
+  no installation or persistent rollback tracking. The managed updater enforces a locally stored
+  version floor, verifies private staging again during installation, and retains the previous signed
+  executable until startup confirmation. Linux uses the root-owned
+  `/usr/local/libexec/otserver-otter-update-helper` installed by `controller --install`; it must
+  accept only signed update requests and must verify its own ownership, mode, and signature. Never run
+  the controller itself as root. Windows replacement and recovery run as the scanner user. Keep failure
+  and rollback outcomes in private local state until OTserver acknowledges them. Key rotation needs an
   old-key-authorized transition, not an untrusted replacement PEM.
 
 ## Local configuration and direct uploads

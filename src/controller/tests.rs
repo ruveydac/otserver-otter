@@ -839,6 +839,61 @@ async fn recovered_scanning_assignment_is_failed_without_rescanning_or_uploading
 }
 
 #[tokio::test]
+async fn update_failure_reason_survives_network_errors_until_server_acknowledges_it() {
+    let (api, task) = server(vec![
+        (503, json!({})),
+        (200, json!({"id":"update1","status":"failed"})),
+    ])
+    .await;
+    let store = PrivateStore::new();
+    let mut update_state = UpdateState {
+        pending: Some(PendingUpdate {
+            id: "update1".into(),
+            version: "1.0.1".into(),
+            target: otserver_otter::update::BUILD_TARGET.into(),
+            binary_digest: "a".repeat(64),
+            binary_size: 313,
+            previous_version: "1.0.0".into(),
+            previous_digest: "b".repeat(64),
+        }),
+        ..UpdateState::default()
+    };
+
+    assert_eq!(
+        fail_update(
+            &api,
+            store.get(),
+            &mut update_state,
+            "update1",
+            UpdateFailureReason::SignatureRejected,
+            true,
+        )
+        .await,
+        Err(Error::Retry)
+    );
+    let mut recovered = store.get().load_update_state().unwrap();
+    assert!(recovered.pending.is_none());
+    assert_eq!(recovered.failed.as_deref(), Some("update1"));
+    assert!(matches!(
+        recovered.failed_reason,
+        Some(UpdateFailureReason::SignatureRejected)
+    ));
+
+    report_pending_update_failure(&api, store.get(), &mut recovered)
+        .await
+        .unwrap();
+    assert!(recovered.failed.is_none());
+    assert!(recovered.failed_reason.is_none());
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| {
+        request.starts_with("POST /api/otter/v1/updates/update1/status ")
+            && request.contains("\"status\":\"failed\"")
+            && request.contains("\"reason\":\"signatureRejected\"")
+    }));
+}
+
+#[tokio::test]
 async fn finish_rejects_a_nonterminal_status_response() {
     let (api, task) = server(vec![(200, json!({"status": "running"}))]).await;
     let store = PrivateStore::new();

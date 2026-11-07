@@ -9,6 +9,9 @@ use clap::Args;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -50,12 +53,30 @@ pub struct ControllerArgs {
     /// Disable TLS certificate and hostname validation for HTTP clients.
     #[arg(long)]
     ignore_self_signed: bool,
+    #[arg(long, hide = true, conflicts_with = "apply_update")]
+    check_update_helper: bool,
+    #[arg(long, hide = true, requires_all = ["update_id", "parent_pid"])]
+    apply_update: bool,
+    #[arg(long, hide = true, requires = "apply_update")]
+    update_id: Option<String>,
+    #[arg(long, hide = true, requires = "apply_update")]
+    parent_pid: Option<u32>,
     /// Proxy HTTP requests through URL. HTTPS requests remain direct unless --https-proxy is supplied.
     #[arg(long, value_name = "URL")]
     http_proxy: Option<String>,
     /// Proxy HTTPS requests through URL. HTTP requests remain direct unless --http-proxy is supplied.
     #[arg(long, value_name = "URL")]
     https_proxy: Option<String>,
+}
+
+impl ControllerArgs {
+    pub(super) fn is_apply_update(&self) -> bool {
+        self.apply_update
+    }
+
+    pub(super) fn is_check_update_helper(&self) -> bool {
+        self.check_update_helper
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -127,7 +148,9 @@ struct Enrollment {
 #[serde(rename_all = "camelCase")]
 struct ScannerReport {
     version: &'static str,
-    capabilities: [&'static str; 2],
+    build_target: &'static str,
+    binary_digest: String,
+    capabilities: [&'static str; 3],
     interfaces: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     computer_name: Option<String>,
@@ -184,11 +207,36 @@ fn scanner_report() -> Result<ScannerReport, Error> {
         .collect();
     Ok(ScannerReport {
         version: otserver_otter::VERSION,
-        capabilities: ["scan-v2", "controller-v1"],
+        build_target: otserver_otter::update::BUILD_TARGET,
+        binary_digest: current_binary_digest()?,
+        capabilities: ["scan-v2", "controller-v1", "update-v1"],
         interfaces,
         computer_name,
         network_adapters,
     })
+}
+
+fn current_binary_digest() -> Result<String, Error> {
+    let path = std::env::current_exe().map_err(|_| Error::Invalid)?;
+    file_digest(&path)
+}
+
+fn file_digest(path: &std::path::Path) -> Result<String, Error> {
+    let mut file = File::open(path).map_err(|_| Error::Invalid)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let length = file.read(&mut buffer).map_err(|_| Error::Invalid)?;
+        if length == 0 {
+            break;
+        }
+        digest.update(&buffer[..length]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 #[derive(Deserialize)]
@@ -201,10 +249,23 @@ enum Poll {
     Run {
         run: Assignment,
     },
+    Update {
+        update: UpdateAssignment,
+    },
     Cancel {
         #[serde(rename = "runID")]
         run_id: String,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateAssignment {
+    id: String,
+    version: String,
+    target: String,
+    binary_digest: String,
+    binary_size: u64,
 }
 
 #[derive(Deserialize)]
@@ -270,6 +331,49 @@ struct State {
     settings: Settings,
 }
 
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateState {
+    version_floor: Option<String>,
+    pending: Option<PendingUpdate>,
+    rolled_back: Option<String>,
+    failed: Option<String>,
+    #[serde(default)]
+    failed_reason: Option<UpdateFailureReason>,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum UpdateFailureReason {
+    DownloadFailed,
+    SignatureRejected,
+    InstallationFailed,
+    StartupFailed,
+}
+
+impl UpdateFailureReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DownloadFailed => "downloadFailed",
+            Self::SignatureRejected => "signatureRejected",
+            Self::InstallationFailed => "installationFailed",
+            Self::StartupFailed => "startupFailed",
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingUpdate {
+    id: String,
+    version: String,
+    target: String,
+    binary_digest: String,
+    binary_size: u64,
+    previous_version: String,
+    previous_digest: String,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Error {
     Retry,
@@ -277,6 +381,7 @@ enum Error {
     UploadRetriesExhausted,
     Auth,
     Terminal,
+    UpdateHandoff,
     Invalid,
     Local(&'static str),
 }
@@ -289,6 +394,7 @@ impl std::fmt::Display for Error {
             Self::UploadRetriesExhausted => "Scan result upload failed after the initial attempt and 5 retries. Local scan result retained.",
             Self::Auth => "Scanner credential is expired or not accepted. Verify --server-url, OS account, and --state-dir; re-enroll if the controller revoked it.",
             Self::Terminal => "Run is no longer active; local results retained.",
+            Self::UpdateHandoff => "The verified update helper is applying this release; the controller will restart.",
             Self::Invalid => "Controller response or configuration is invalid.",
             Self::Local(message) => message,
         })
@@ -419,6 +525,108 @@ impl Api {
             .await
             .map_err(|_| Error::Retry)?;
         decode(response).await
+    }
+
+    async fn update_status(
+        &self,
+        id: &str,
+        status: &str,
+        reason: Option<&str>,
+    ) -> Result<(), Error> {
+        if !valid_id(id) {
+            return Err(Error::Invalid);
+        }
+        let mut value = json!({"status": status});
+        if let Some(reason) = reason {
+            value["reason"] = json!(reason);
+        }
+        let _: Value = self
+            .post(&format!("api/otter/v1/updates/{id}/status"), value)
+            .await?;
+        Ok(())
+    }
+
+    async fn download_update(
+        &self,
+        id: &str,
+        size: u64,
+        expected_digest: &str,
+        path: &std::path::Path,
+    ) -> Result<(), Error> {
+        if !valid_id(id)
+            || !(313..=512 * 1024 * 1024).contains(&size)
+            || expected_digest.len() != 64
+            || !expected_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(Error::Invalid);
+        }
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                &format!("api/otter/v1/updates/{id}/binary"),
+            )?
+            .timeout(Duration::from_secs(300))
+            .send()
+            .await
+            .map_err(|_| Error::Retry)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(match status.as_u16() {
+                401 | 403 => Error::Auth,
+                404 | 409 | 410 => Error::Terminal,
+                408 | 425 | 429 | 500..=599 => Error::Retry,
+                _ => Error::Invalid,
+            });
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length != size)
+        {
+            return Err(Error::Invalid);
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(path)
+            .map_err(|_| Error::Local("Could not stage signed Otter update."))?;
+        let mut digest = Sha256::new();
+        let mut response = response;
+        let result = async {
+            let mut received = 0_u64;
+            while let Some(chunk) = response.chunk().await.map_err(|_| Error::Retry)? {
+                received = received
+                    .checked_add(chunk.len() as u64)
+                    .ok_or(Error::Invalid)?;
+                if received > size {
+                    return Err(Error::Invalid);
+                }
+                digest.update(&chunk);
+                file.write_all(&chunk)
+                    .map_err(|_| Error::Local("Could not stage signed Otter update."))?;
+            }
+            file.sync_all()
+                .map_err(|_| Error::Local("Could not synchronize signed Otter update."))?;
+            let actual_digest = digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            if received != size || actual_digest != expected_digest.to_ascii_lowercase() {
+                return Err(Error::Invalid);
+            }
+            Ok(())
+        }
+        .await;
+        drop(file);
+        if result.is_err() {
+            let _ = std::fs::remove_file(path);
+        }
+        result
     }
 
     async fn heartbeat(&self, id: &str, progress: u8) -> Result<Instant, Error> {
@@ -1083,8 +1291,291 @@ async fn imports(api: &Api, store: &store::Store, state: &mut State) -> Result<(
     save(store, state)
 }
 
+async fn report_pending_update_failure(
+    api: &Api,
+    store: &store::Store,
+    update_state: &mut UpdateState,
+) -> Result<(), Error> {
+    let Some(id) = update_state.failed.as_deref() else {
+        return Ok(());
+    };
+    let reason = update_state
+        .failed_reason
+        .unwrap_or(UpdateFailureReason::InstallationFailed);
+    if update_state.failed_reason.is_none() {
+        update_state.failed_reason = Some(reason);
+        store.save_update_state(update_state)?;
+    }
+    match api.update_status(id, "failed", Some(reason.as_str())).await {
+        Ok(()) | Err(Error::Terminal) => {
+            update_state.failed = None;
+            update_state.failed_reason = None;
+            store.save_update_state(update_state)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn fail_update(
+    api: &Api,
+    store: &store::Store,
+    update_state: &mut UpdateState,
+    id: &str,
+    reason: UpdateFailureReason,
+    clear_pending: bool,
+) -> Result<(), Error> {
+    if !valid_id(id) {
+        return Err(Error::Invalid);
+    }
+    if clear_pending {
+        update_state.pending = None;
+    }
+    update_state.failed = Some(id.to_owned());
+    update_state.failed_reason = Some(reason);
+    store.save_update_state(update_state)?;
+    report_pending_update_failure(api, store, update_state).await
+}
+
+async fn handle_update(
+    api: &mut Api,
+    store: &store::Store,
+    update: UpdateAssignment,
+) -> Result<(), Error> {
+    if !valid_id(&update.id) {
+        return Err(Error::Invalid);
+    }
+    if update.target != otserver_otter::update::BUILD_TARGET
+        || !(313..=512 * 1024 * 1024).contains(&update.binary_size)
+        || update.binary_digest.len() != 64
+        || !update
+            .binary_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        let mut update_state = store.load_update_state()?;
+        fail_update(
+            api,
+            store,
+            &mut update_state,
+            &update.id,
+            UpdateFailureReason::SignatureRejected,
+            true,
+        )
+        .await?;
+        return Err(Error::Invalid);
+    }
+
+    let mut update_state = store.load_update_state()?;
+    if let Some(pending) = &update_state.pending {
+        if pending.id != update.id
+            || pending.version != update.version
+            || pending.target != update.target
+            || pending.binary_digest != update.binary_digest
+            || pending.binary_size != update.binary_size
+        {
+            fail_update(
+                api,
+                store,
+                &mut update_state,
+                &update.id,
+                UpdateFailureReason::SignatureRejected,
+                false,
+            )
+            .await?;
+            return Err(Error::Invalid);
+        }
+    } else {
+        let current_path = std::env::current_exe().map_err(|_| Error::Invalid)?;
+        let current = otserver_otter::update::verify_binary(
+            &current_path,
+            otserver_otter::update::BUILD_TARGET,
+        )
+        .map_err(|_| Error::Invalid)?;
+        let current_digest = current_binary_digest()?;
+        update_state
+            .version_floor
+            .get_or_insert_with(|| current.version().to_owned());
+        update_state.pending = Some(PendingUpdate {
+            id: update.id.clone(),
+            version: update.version.clone(),
+            target: update.target.clone(),
+            binary_digest: update.binary_digest.to_ascii_lowercase(),
+            binary_size: update.binary_size,
+            previous_version: current.version().to_owned(),
+            previous_digest: current_digest,
+        });
+        store.save_update_state(&update_state)?;
+    }
+
+    let candidate = store.update_path(&update.id, "bin")?;
+    if !candidate.exists()
+        && let Err(error) = api
+            .download_update(
+                &update.id,
+                update.binary_size,
+                &update.binary_digest,
+                &candidate,
+            )
+            .await
+    {
+        if error == Error::Retry {
+            return Err(error);
+        }
+        let reason = if error == Error::Invalid {
+            UpdateFailureReason::SignatureRejected
+        } else {
+            UpdateFailureReason::DownloadFailed
+        };
+        fail_update(api, store, &mut update_state, &update.id, reason, true).await?;
+        return Err(error);
+    }
+
+    let verified = match otserver_otter::update::verify_binary(
+        &candidate,
+        otserver_otter::update::BUILD_TARGET,
+    ) {
+        Ok(verified) => verified,
+        Err(_) => {
+            let result = fail_update(
+                api,
+                store,
+                &mut update_state,
+                &update.id,
+                UpdateFailureReason::SignatureRejected,
+                true,
+            )
+            .await;
+            let _ = std::fs::remove_file(&candidate);
+            result?;
+            return Err(Error::Invalid);
+        }
+    };
+    let current_path = std::env::current_exe().map_err(|_| Error::Invalid)?;
+    let current =
+        otserver_otter::update::verify_binary(&current_path, otserver_otter::update::BUILD_TARGET)
+            .map_err(|_| Error::Invalid)?;
+    let floor = update_state
+        .version_floor
+        .as_deref()
+        .unwrap_or(current.version());
+    if verified.version() != update.version || verified.target() != update.target {
+        fail_update(
+            api,
+            store,
+            &mut update_state,
+            &update.id,
+            UpdateFailureReason::SignatureRejected,
+            true,
+        )
+        .await?;
+        return Err(Error::Invalid);
+    }
+    if !matches!(
+        file_digest(&candidate),
+        Ok(digest) if digest == update.binary_digest.to_ascii_lowercase()
+    ) {
+        let result = fail_update(
+            api,
+            store,
+            &mut update_state,
+            &update.id,
+            UpdateFailureReason::SignatureRejected,
+            true,
+        )
+        .await;
+        let _ = std::fs::remove_file(&candidate);
+        result?;
+        return Err(Error::Invalid);
+    }
+    if verified.require_newer_than(floor).is_err() {
+        fail_update(
+            api,
+            store,
+            &mut update_state,
+            &update.id,
+            UpdateFailureReason::SignatureRejected,
+            true,
+        )
+        .await?;
+        return Err(Error::Invalid);
+    }
+    let pending = update_state.pending.as_ref().ok_or(Error::Invalid)?;
+    if current.version() != pending.previous_version
+        || current_binary_digest()? != pending.previous_digest
+    {
+        let result = fail_update(
+            api,
+            store,
+            &mut update_state,
+            &update.id,
+            UpdateFailureReason::InstallationFailed,
+            true,
+        )
+        .await;
+        let _ = std::fs::remove_file(candidate);
+        result?;
+        return Ok(());
+    }
+    api.update_status(&update.id, "verified", None).await?;
+    api.update_status(&update.id, "installing", None).await?;
+    if install::launch_update(store.path(), &update.id, std::process::id()).is_err() {
+        fail_update(
+            api,
+            store,
+            &mut update_state,
+            &update.id,
+            UpdateFailureReason::InstallationFailed,
+            true,
+        )
+        .await?;
+        return Err(Error::Local(
+            "Could not start the verified Otter update helper.",
+        ));
+    }
+    Err(Error::UpdateHandoff)
+}
+
+fn confirm_local_update(store: &store::Store) -> Result<(), Error> {
+    let mut state = store.load_update_state()?;
+    let Some(pending) = state.pending.as_ref() else {
+        return Ok(());
+    };
+    let executable = std::env::current_exe().map_err(|_| Error::Invalid)?;
+    let verified =
+        otserver_otter::update::verify_binary(&executable, otserver_otter::update::BUILD_TARGET)
+            .map_err(|_| Error::Invalid)?;
+    if verified.version() != pending.version
+        || verified.target() != pending.target
+        || current_binary_digest()? != pending.binary_digest
+    {
+        return Ok(());
+    }
+    state.version_floor = Some(pending.version.clone());
+    state.pending = None;
+    store.save_update_state(&state)?;
+    Ok(())
+}
+
 pub async fn run(args: ControllerArgs) -> Result<(), String> {
-    run_inner(args).await.map_err(|error| error.to_string())
+    if args.check_update_helper {
+        return install::check_update_helper();
+    }
+    if args.apply_update {
+        return install::apply_update(
+            args.state_dir,
+            args.update_id.as_deref().ok_or("Missing update ID.")?,
+            args.parent_pid.ok_or("Missing controller process ID.")?,
+        );
+    }
+    match run_inner(args).await {
+        Err(Error::UpdateHandoff) => Ok(()),
+        Err(error) => Err(error.to_string()),
+        Ok(()) => Ok(()),
+    }
+}
+
+pub(super) fn is_update_helper_executable() -> bool {
+    install::is_update_helper_executable()
 }
 
 async fn run_inner(args: ControllerArgs) -> Result<(), Error> {
@@ -1105,6 +1596,7 @@ async fn run_inner(args: ControllerArgs) -> Result<(), Error> {
         eprintln!("Scanner enrolled; credentials saved. Install or start the controller to poll.");
         return Ok(());
     }
+    confirm_local_update(&store)?;
     eprintln!("Polling controller.");
     let settings = state.settings.clone();
     loop {
@@ -1242,6 +1734,10 @@ pub(super) async fn enroll_from_gui(
         file_credentials: false,
         queued_imports: false,
         ignore_self_signed: http.ignore_self_signed,
+        check_update_helper: false,
+        apply_update: false,
+        update_id: None,
+        parent_pid: None,
         http_proxy: http.http_proxy,
         https_proxy: http.https_proxy,
     };
@@ -1264,6 +1760,17 @@ async fn poll_once(
     file_credentials: bool,
 ) -> Result<Duration, Error> {
     let result = async {
+        let mut update_state = store.load_update_state()?;
+        if let Some(id) = update_state.rolled_back.clone() {
+            match api.update_status(&id, "rolled-back", None).await {
+                Ok(()) | Err(Error::Terminal) => {
+                    update_state.rolled_back = None;
+                    store.save_update_state(&update_state)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        report_pending_update_failure(api, store, &mut update_state).await?;
         let expiry = expires_at(&state.credential_expires_at)?;
         if expiry <= OffsetDateTime::now_utc() {
             return Err(Error::Auth);
@@ -1285,6 +1792,15 @@ async fn poll_once(
             } => {
                 if let Some(run) = &mut state.assignment {
                     run.phase = Phase::Terminal;
+                }
+                let mut update_state = store.load_update_state()?;
+                if let Some(pending) = update_state.pending.take() {
+                    for suffix in ["bin", "updater.exe"] {
+                        if let Ok(path) = store.update_path(&pending.id, suffix) {
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
+                    store.save_update_state(&update_state)?;
                 }
                 imports(api, store, state).await?;
                 Ok(retry_after_seconds.clamp(poll_seconds, 300))
@@ -1326,6 +1842,10 @@ async fn poll_once(
                     }
                     other => other?,
                 }
+                Ok(poll_seconds)
+            }
+            Poll::Update { update } => {
+                handle_update(api, store, update).await?;
                 Ok(poll_seconds)
             }
         }
