@@ -131,6 +131,24 @@ and single-use token. After enrollment, select **Install controller** and comple
 You can close the GUI afterward. The GUI's local scan controls save local JSON only; API-key direct
 uploads remain available through CLI/configuration.
 
+### Managed self-updates
+
+Administrators upload signed executables under **Otter → Otter Releases** in OTserver.
+Installations without the `update-v1` capability need one manual upgrade before OTserver can update
+them. Stop the current controller, verify the downloaded executable, and install it using the
+existing enrollment:
+
+```bash
+./otserver-otter verify-binary ./otserver-otter
+./otserver-otter controller --install --ack-authorized
+```
+
+Run this as the enrolled user, not as root. On Linux, the one-time installation asks for
+administrator authorization to install a root-owned helper at
+`/usr/local/libexec/otserver-otter-update-helper`. The helper accepts only signed Otter update
+requests and is checked before each use. Future Linux updates use it to replace the installed binary
+and roll back if the new controller does not confirm startup.
+
 Stop the current controller before changing its installation or re-enrolling, so an active scan is
 not interrupted. On Linux, use `systemctl --user stop otserver-otter-controller.service`; inspect
 logs with `journalctl --user -u otserver-otter-controller.service`. On Windows, select the task in
