@@ -149,12 +149,66 @@ struct Enrollment {
 struct ScannerReport {
     version: &'static str,
     build_target: &'static str,
+    os_version: String,
     binary_digest: String,
     capabilities: [&'static str; 3],
     interfaces: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     computer_name: Option<String>,
     network_adapters: Vec<NetworkAdapterReport>,
+}
+
+#[cfg(target_os = "linux")]
+fn os_version() -> String {
+    std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .map(|release| linux_os_version(&release))
+        .unwrap_or_else(|| "Linux".into())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_os_version(release: &str) -> String {
+    release
+        .lines()
+        .find_map(|line| line.strip_prefix("PRETTY_NAME="))
+        .map(|value| value.trim().trim_matches(['"', '\'']))
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+        })
+        .unwrap_or("Linux")
+        .to_owned()
+}
+
+#[cfg(windows)]
+fn os_version() -> String {
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn RtlGetVersion(version: *mut OSVERSIONINFOW) -> i32;
+    }
+
+    let mut version = OSVERSIONINFOW {
+        dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+        dwMajorVersion: 0,
+        dwMinorVersion: 0,
+        dwBuildNumber: 0,
+        dwPlatformId: 0,
+        szCSDVersion: [0; 128],
+    };
+    if unsafe { RtlGetVersion(&mut version) } == 0 {
+        format!(
+            "Windows {}.{}.{}",
+            version.dwMajorVersion, version.dwMinorVersion, version.dwBuildNumber
+        )
+    } else {
+        "Windows".into()
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn os_version() -> String {
+    std::env::consts::OS.into()
 }
 
 #[derive(Serialize)]
@@ -208,6 +262,7 @@ fn scanner_report() -> Result<ScannerReport, Error> {
     Ok(ScannerReport {
         version: otserver_otter::VERSION,
         build_target: otserver_otter::update::BUILD_TARGET,
+        os_version: os_version(),
         binary_digest: current_binary_digest()?,
         capabilities: ["scan-v2", "controller-v1", "update-v1"],
         interfaces,

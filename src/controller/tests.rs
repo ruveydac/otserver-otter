@@ -83,7 +83,11 @@ fn gui_enrollment_info_distinguishes_unenrolled_and_saved_state() {
 #[test]
 fn scanner_report_bounds_adapter_and_address_inventory() {
     let report = scanner_report().unwrap();
+    let json = serde_json::to_value(&report).unwrap();
 
+    assert!(!report.os_version.is_empty());
+    assert!(report.os_version.len() <= 256);
+    assert_eq!(json["osVersion"].as_str(), Some(report.os_version.as_str()));
     assert!(report.interfaces.len() <= 32);
     assert_eq!(report.interfaces.len(), report.network_adapters.len());
     assert!(report.network_adapters.iter().all(|adapter| {
@@ -98,6 +102,20 @@ fn scanner_report_bounds_adapter_and_address_inventory() {
             .computer_name
             .as_ref()
             .is_none_or(|name| name.len() <= 256)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_os_version_uses_bounded_pretty_name() {
+    assert_eq!(
+        linux_os_version("NAME=Debian\nPRETTY_NAME=\"Debian GNU/Linux 13\"\n"),
+        "Debian GNU/Linux 13"
+    );
+    assert_eq!(linux_os_version("NAME=Linux\n"), "Linux");
+    assert_eq!(
+        linux_os_version(&format!("PRETTY_NAME={}\n", "x".repeat(257))),
+        "Linux"
     );
 }
 
