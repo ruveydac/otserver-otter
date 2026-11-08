@@ -111,8 +111,8 @@ instructions are in `README.md`; detailed operator and development guidance foll
   Require local `--ack-authorized`; apply snapshots through the shared scan path.
   Keep machine credentials in Secret Service/Windows Credential Manager where available, with an
   atomic permission-restricted file fallback. Unattended installations explicitly use that file store
-  to operate without an interactive login. Report the computer name and at most 32 available
-  adapters (technical/friendly names, description, MAC, and up to 16 IPv4/IPv6 addresses) at
+  to operate without an interactive login. Report the host OS version and computer name, plus at
+  most 32 adapters (technical/friendly names, description, MAC, and up to 16 IPv4/IPv6 addresses) at
   enrollment and during polling; never include credentials in this report or persist protocol
   credential snapshots.
 - Persist managed assignment state before starting probes; uncertain interrupted discovery must not
