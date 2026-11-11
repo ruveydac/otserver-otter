@@ -392,7 +392,7 @@ pub(super) fn apply_update(
 
 #[cfg(target_os = "linux")]
 fn apply_linux_update(directory: Option<PathBuf>, id: &str, parent_pid: u32) -> Result<(), String> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let uid = unsafe { libc::getuid() };
     if !is_update_helper_executable()
@@ -538,13 +538,12 @@ fn apply_linux_update(directory: Option<PathBuf>, id: &str, parent_pid: u32) -> 
         .map_err(
             |_| "Could not copy the verified Otter executable into its installation directory.",
         )?;
-    otserver_otter::update::verify_binary(&staged, otserver_otter::update::BUILD_TARGET)?;
-    if digest_file(&staged)? != pending.binary_digest {
+    verify_open_file(&file)?;
+    if digest_open_file(&file)? != pending.binary_digest {
         let _ = std::fs::remove_file(&staged);
         return Err("The installed Otter staging file failed its digest check.".into());
     }
-    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
-        .map_err(|_| "Could not set executable permissions on the signed Otter update.")?;
+    set_executable_permissions(&file)?;
     set_raw_capability(&file)?;
     drop(file);
     std::fs::rename(&staged, &executable)
@@ -921,6 +920,52 @@ fn set_raw_capability(file: &File) -> Result<(), String> {
         Ok(())
     } else {
         Err("Could not grant CAP_NET_RAW to the verified Otter executable.".into())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_open_file(file: &File) -> Result<otserver_otter::update::VerifiedBinary, String> {
+    use std::os::fd::AsRawFd;
+    otserver_otter::update::verify_binary(
+        &PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())),
+        otserver_otter::update::BUILD_TARGET,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn digest_open_file(file: &File) -> Result<String, String> {
+    use std::io::Seek;
+    let mut file = file
+        .try_clone()
+        .map_err(|_| "Could not read the signed Otter executable.")?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|_| "Could not read the signed Otter executable.")?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let length = file
+            .read(&mut buffer)
+            .map_err(|_| "Could not hash the signed Otter executable.")?;
+        if length == 0 {
+            break;
+        }
+        digest.update(&buffer[..length]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+#[cfg(target_os = "linux")]
+fn set_executable_permissions(file: &File) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: this changes only the mode of the already-open staged executable, not a pathname.
+    if unsafe { libc::fchmod(file.as_raw_fd(), 0o755) } == 0 {
+        Ok(())
+    } else {
+        Err("Could not set executable permissions on the signed Otter update.".into())
     }
 }
 
@@ -1432,6 +1477,39 @@ fn start_installation(_: &Path, _: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privileged_staging_permissions_follow_the_open_file_not_a_replaced_path() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
+
+        let directory =
+            std::env::temp_dir().join(format!("otter-update-fd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let staged = directory.join("staged");
+        let victim = directory.join("victim");
+        std::fs::write(&victim, b"do not chmod this file").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true).mode(0o600);
+        let file = options.open(&staged).unwrap();
+        std::fs::remove_file(&staged).unwrap();
+        symlink(&victim, &staged).unwrap();
+
+        set_executable_permissions(&file).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert!(
+            std::fs::symlink_metadata(&staged)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn executable_installation_replaces_bytes_without_touching_local_configuration() {

@@ -123,6 +123,24 @@ impl Store {
         Self::write_update_state(&self.directory, state)
     }
 
+    pub(super) fn clear_update_state(&self) -> Result<(), Error> {
+        let state = self.load_update_state()?;
+        Self::write_update_state(&self.directory, &UpdateState::default())?;
+        for id in [
+            state.pending.map(|pending| pending.id),
+            state.failed,
+            state.rolled_back,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for suffix in ["bin", "updater.exe"] {
+                let _ = std::fs::remove_file(self.directory.join(format!("update-{id}.{suffix}")));
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     pub(super) fn save_update_state_for(
         directory: &Path,

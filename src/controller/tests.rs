@@ -1687,6 +1687,45 @@ async fn failed_queued_import_retries_by_id_once_without_reuploading() {
 }
 
 #[tokio::test]
+async fn missing_queued_import_does_not_block_later_status_checks() {
+    let (mut api, task) = server(vec![
+        (404, json!({})),
+        (200, json!({"id":"import2","status":"completed"})),
+    ])
+    .await;
+    let store = PrivateStore::new();
+    api.log = store.get().log.clone();
+    let mut state = State {
+        pending_imports: vec![
+            PendingImport {
+                id: "missing-import".into(),
+                status: "pending".into(),
+                retries: 0,
+            },
+            PendingImport {
+                id: "import2".into(),
+                status: "running".into(),
+                retries: 0,
+            },
+        ],
+        ..State::default()
+    };
+
+    imports(&api, store.get(), &mut state).await.unwrap();
+
+    assert!(state.pending_imports.is_empty());
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("GET /api/asset-imports/missing-import "));
+    assert!(requests[1].starts_with("GET /api/asset-imports/import2 "));
+    assert!(
+        store
+            .log()
+            .contains("remaining import statuses will still be checked")
+    );
+}
+
+#[tokio::test]
 async fn controller_url_mismatch_preserves_state_and_explains_the_overwrite_flag() {
     let mut store = PrivateStore::new();
     store
@@ -1868,6 +1907,73 @@ async fn failed_reenrollment_preserves_previous_machine_credential_and_settings(
     assert_eq!(state.server_url, "https://previous.example/");
     assert_eq!(state.settings.poll_seconds, 80);
     assert_eq!(store.credential(&state).unwrap(), old.credential);
+}
+
+#[tokio::test]
+async fn successful_controller_takeover_clears_old_update_state_and_staging() {
+    let issued = credential();
+    let (api, requests) = server(vec![(
+        201,
+        json!({
+            "credential": issued.credential,
+            "credentialExpiresAt": issued.credential_expires_at,
+            "scanner": {"id":"scanner-new", "name":"New controller", "site":"site1"}
+        }),
+    )])
+    .await;
+    let mut private = PrivateStore::new();
+    let old = credential();
+    let mut state = State {
+        server_url: "https://previous.example/".into(),
+        scanner: Some(scanner()),
+        ..State::default()
+    };
+    private
+        .get()
+        .persist_credential(&mut state, &old, true)
+        .unwrap();
+    let pending = PendingUpdate {
+        id: "old-update".into(),
+        version: "v0.15.0".into(),
+        target: otserver_otter::update::BUILD_TARGET.into(),
+        binary_digest: "a".repeat(64),
+        binary_size: 123,
+        previous_version: "v0.14.0".into(),
+        previous_digest: "b".repeat(64),
+    };
+    private
+        .get()
+        .save_update_state(&UpdateState {
+            version_floor: Some("v0.14.0".into()),
+            pending: Some(pending),
+            ..UpdateState::default()
+        })
+        .unwrap();
+    let candidate = private.path.join("update-old-update.bin");
+    let updater = private.path.join("update-old-update.updater.exe");
+    std::fs::write(&candidate, b"old update").unwrap();
+    std::fs::write(&updater, b"old updater").unwrap();
+    private.store.take();
+
+    let args = controller_args(&[
+        "--server-url",
+        api.base.as_str(),
+        "--state-dir",
+        private.path.to_str().unwrap(),
+        "--enroll",
+        "--enroll-only",
+        "--overwrite-state-dir",
+        "--file-credentials",
+    ]);
+    let (store, state, _) = initialize(&args, Some(&"t".repeat(43))).await.unwrap();
+
+    let updates = store.load_update_state().unwrap();
+    assert!(updates.pending.is_none());
+    assert!(updates.version_floor.is_none());
+    assert!(updates.failed.is_none() && updates.rolled_back.is_none());
+    assert!(!candidate.exists() && !updater.exists());
+    assert_eq!(state.server_url, api.base.as_str());
+    assert_eq!(requests.await.unwrap().len(), 1);
 }
 
 #[test]

@@ -28,10 +28,14 @@ jobs:
       - run: >-
           cargo llvm-cov --lib --fail-under-lines 90 --codecov
           --output-path target/codecov.json -- --test-threads=1
+      - name: Measure application coverage
+        run: >-
+          cargo llvm-cov --bin otserver-otter --codecov
+          --output-path target/application-codecov.json
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
-          files: target/codecov.json
+          files: target/codecov.json,target/application-codecov.json
           verbose: true
           fail_ci_if_error: true
         env:

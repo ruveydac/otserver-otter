@@ -20,6 +20,7 @@ pub struct GuiLogger {
 enum ScanMessage {
     Log(String),
     Devices(Vec<Device>),
+    Device(Device),
     Finished(BatchResult),
 }
 
@@ -47,6 +48,10 @@ impl LogOutput for GuiLogger {
 
     fn devices(&self, _configuration: &str, devices: &[Device]) {
         let _ = self.sender.send(ScanMessage::Devices(devices.to_vec()));
+    }
+
+    fn device(&self, _configuration: &str, device: &Device) {
+        let _ = self.sender.send(ScanMessage::Device(device.clone()));
     }
 }
 
@@ -816,15 +821,16 @@ impl GuiApp {
                 }
                 ScanMessage::Devices(devices) => {
                     merge_assets(&mut self.assets, devices);
-                    if let Some(selected) = &self.selected_asset
-                        && !self
+                    if self.selected_asset.as_ref().is_some_and(|selected| {
+                        !self
                             .assets
                             .iter()
                             .any(|device| device.mac_address == *selected)
-                    {
+                    }) {
                         self.selected_asset = None;
                     }
                 }
+                ScanMessage::Device(device) => merge_assets(&mut self.assets, [device]),
                 ScanMessage::Finished(result) => {
                     self.is_scanning = false;
                     self.cancellation = None;
@@ -1551,14 +1557,19 @@ fn asset_protocols(device: &Device) -> Vec<&'static str> {
     labels
 }
 
-fn merge_assets(assets: &mut Vec<Device>, incoming: Vec<Device>) {
+fn merge_assets(assets: &mut Vec<Device>, incoming: impl IntoIterator<Item = Device>) {
+    let mut indexes: std::collections::HashMap<_, _> = assets
+        .iter()
+        .enumerate()
+        .map(|(index, asset)| (asset.mac_address.clone(), index))
+        .collect();
     for device in incoming {
-        match assets
-            .iter_mut()
-            .find(|asset| asset.mac_address == device.mac_address)
-        {
-            Some(existing) => *existing = device,
-            None => assets.push(device),
+        if let Some(index) = indexes.get(&device.mac_address).copied() {
+            assets[index] = device;
+        } else {
+            let index = assets.len();
+            indexes.insert(device.mac_address.clone(), index);
+            assets.push(device);
         }
     }
 }

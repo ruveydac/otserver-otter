@@ -438,6 +438,7 @@ enum Error {
     UploadRetriesExhausted,
     Auth,
     Forbidden,
+    NotFound,
     Terminal,
     UpdateHandoff,
     Invalid,
@@ -452,6 +453,7 @@ impl std::fmt::Display for Error {
             Self::UploadRetriesExhausted => "Scan result upload failed after the initial attempt and 5 retries. Local scan result retained.",
             Self::Auth => "Scanner credential is expired or not accepted. Verify --server-url, OS account, and --state-dir; re-enroll if the controller revoked it.",
             Self::Forbidden => "Controller denied this operation (HTTP 403). The scanner credential may still be valid; check server-side permissions and logs.",
+            Self::NotFound => "Queued import no longer exists on the controller.",
             Self::Terminal => "Run is no longer active; local results retained.",
             Self::UpdateHandoff => "The verified update helper is applying this release; the controller will restart.",
             Self::Invalid => "Controller response or configuration is invalid.",
@@ -592,6 +594,25 @@ impl Api {
         path: &str,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, Error> {
+        self.send_with_missing(method, path, request, false).await
+    }
+
+    async fn send_import_status(
+        &self,
+        method: &str,
+        path: &str,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, Error> {
+        self.send_with_missing(method, path, request, true).await
+    }
+
+    async fn send_with_missing(
+        &self,
+        method: &str,
+        path: &str,
+        request: reqwest::RequestBuilder,
+        missing_import: bool,
+    ) -> Result<reqwest::Response, Error> {
         let response = request.send().await.map_err(|error| {
             let reason = if error.is_timeout() {
                 "Request timed out; check connectivity and controller load."
@@ -616,6 +637,10 @@ impl Api {
                 Error::Forbidden,
                 "Operation denied. The credential may still be valid; check server-side permissions and management logs.",
             ),
+            404 if missing_import => (
+                Error::NotFound,
+                "Queued import no longer exists; remaining import statuses will still be checked.",
+            ),
             404 | 409 | 410 => (
                 Error::Terminal,
                 "Assignment or resource is unavailable or no longer active; local results are retained.",
@@ -630,7 +655,7 @@ impl Api {
             ),
         };
         let message = format!("{method} /{path}: HTTP {}. {reason}", status.as_u16());
-        if matches!(error, Error::Retry | Error::Terminal) {
+        if matches!(error, Error::Retry | Error::NotFound | Error::Terminal) {
             self.log.warn(&message);
         } else {
             self.log.error(&message);
@@ -1372,10 +1397,19 @@ async fn execute(
 }
 
 async fn imports(api: &Api, store: &store::Store, state: &mut State) -> Result<(), Error> {
-    for index in 0..state.pending_imports.len() {
+    let mut index = 0;
+    while index < state.pending_imports.len() {
         let path = format!("api/asset-imports/{}", state.pending_imports[index].id);
         let request = api.request(reqwest::Method::GET, &path)?;
-        let response = api.send("GET", &path, request).await?;
+        let response = match api.send_import_status("GET", &path, request).await {
+            Ok(response) => response,
+            Err(Error::NotFound) => {
+                state.pending_imports.remove(index);
+                save(store, state)?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let mut document: crate::ImportDocument = api.decode("GET", &path, response).await?;
         if document.status == "failed" && state.pending_imports[index].retries == 0 {
             store.log.warn(&format!("Import {} failed processing; requesting its single queued retry without re-uploading.", state.pending_imports[index].id));
@@ -1406,6 +1440,7 @@ async fn imports(api: &Api, store: &store::Store, state: &mut State) -> Result<(
             store.log.error(&format!("Import {} failed processing after its queued retry. Check the import details in OTserver; no further automatic retry.", state.pending_imports[index].id));
         }
         state.pending_imports[index].status = document.status;
+        index += 1;
     }
     state
         .pending_imports
@@ -1789,10 +1824,8 @@ async fn initialize_in_store(
         Some(base) => base,
         None => base_url(&state.server_url)?,
     };
-    if !state.server_url.is_empty()
-        && state.server_url != base.as_str()
-        && !(args.enroll && args.overwrite_state_dir)
-    {
+    let taking_over = !state.server_url.is_empty() && state.server_url != base.as_str();
+    if !state.server_url.is_empty() && taking_over && !(args.enroll && args.overwrite_state_dir) {
         return Err(Error::Local(
             "State directory belongs to a different controller URL. To replace its saved enrollment and run state, re-enroll with --enroll --overwrite-state-dir. Retained scan exports will be kept.",
         ));
@@ -1851,6 +1884,9 @@ async fn initialize_in_store(
         validate_credential(&enrollment.credential)?;
         if !valid_id(&enrollment.scanner.id) || !valid_id(&enrollment.scanner.site) {
             return Err(Error::Invalid);
+        }
+        if taking_over {
+            store.clear_update_state()?;
         }
         state.server_url = api.base.to_string();
         state.scanner = Some(enrollment.scanner);
