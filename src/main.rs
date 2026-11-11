@@ -27,6 +27,9 @@ pub trait LogOutput: Send + Sync {
     }
 
     fn devices(&self, _configuration: &str, _devices: &[Device]) {}
+
+    // Managed logs use these credential-safe categories instead of arbitrary probe text.
+    fn diagnostic(&self, _protocol: &str, _status: &str, _code: &str) {}
 }
 
 pub struct StdoutLogger;
@@ -1211,6 +1214,11 @@ pub async fn scan(
                     "sweep",
                     &message,
                 );
+                logger.diagnostic(
+                    "arp",
+                    "FAIL",
+                    diagnostic_code(&message, protocols::ProbeStatus::Failure),
+                );
                 logger.log(diagnostic.clone());
                 errors.push(diagnostic);
             }
@@ -1295,6 +1303,11 @@ pub async fn scan(
                     &format!("Interface-scoped PNIO diagnostic: {warning}"),
                 )
             };
+            logger.diagnostic(
+                "profinet-pnio",
+                status.label(),
+                diagnostic_code(warning, status),
+            );
             logger.log(formatted.clone());
             if status == protocols::ProbeStatus::NoResponse {
                 continue;
@@ -1412,6 +1425,7 @@ pub async fn scan(
                         "capture",
                         &warning,
                     );
+                    logger.diagnostic("lldp-passive", status, code);
                     logger.log(diagnostic.clone());
                     warnings.push(diagnostic);
                 }
@@ -1429,6 +1443,11 @@ pub async fn scan(
                     "capture",
                     &error,
                 );
+                logger.diagnostic(
+                    "lldp-passive",
+                    "FAIL",
+                    diagnostic_code(&error, protocols::ProbeStatus::Failure),
+                );
                 logger.log(diagnostic.clone());
                 errors.push(diagnostic);
             }
@@ -1445,6 +1464,7 @@ pub async fn scan(
                     "capture",
                     &error.to_string(),
                 );
+                logger.diagnostic("lldp-passive", "FAIL", "capture-task-failed");
                 logger.log(diagnostic.clone());
                 errors.push(diagnostic);
             }
@@ -1781,15 +1801,22 @@ async fn discover_profinet(
                 &message,
             ));
         }
-        Err(error) => logger.log(format_mac_diagnostic(
-            "01:0e:cf:00:00:00",
-            "profinet-dcp",
-            "FAIL",
-            diagnostic_code(error, protocols::ProbeStatus::Failure),
-            "ethernet DCP multicast; response window 60s",
-            "capture",
-            error,
-        )),
+        Err(error) => {
+            logger.diagnostic(
+                "profinet-dcp",
+                "FAIL",
+                diagnostic_code(error, protocols::ProbeStatus::Failure),
+            );
+            logger.log(format_mac_diagnostic(
+                "01:0e:cf:00:00:00",
+                "profinet-dcp",
+                "FAIL",
+                diagnostic_code(error, protocols::ProbeStatus::Failure),
+                "ethernet DCP multicast; response window 60s",
+                "capture",
+                error,
+            ));
+        }
     }
     result.map_err(|error| {
         format_mac_diagnostic(
@@ -1840,6 +1867,7 @@ fn scan_source_mac(
         .and_then(profinet::interface_mac)
         .ok_or_else(|| format!("Could not determine the current MAC of interface {selected}."))?;
     if otserver_otter::contract::normalize_mac(configured).as_deref() != Some(&actual) {
+        logger.diagnostic("interface", "PARTIAL", "source-mac-refreshed");
         logger.log(format!(
             "Using current interface MAC {actual}; configured source MAC {configured} differs."
         ));
@@ -2076,6 +2104,7 @@ fn apply_snmp_probe(
 ) -> bool {
     let Some(result) = result else { return false };
     let Ok((ip, attempts, result)) = result else {
+        logger.diagnostic("snmp", "FAIL", "probe-task-failed");
         warnings.push("An SNMP probe task failed.".into());
         return true;
     };
@@ -2129,6 +2158,11 @@ fn apply_snmp_probe(
                     snmp_endpoint,
                     stage,
                     &message,
+                );
+                logger.diagnostic(
+                    protocol,
+                    if failed { "FAIL" } else { "NO_RESPONSE" },
+                    diagnostic_code(&message, protocols::ProbeStatus::Failure),
                 );
                 logger.log(diagnostic.clone());
                 if failed {
@@ -2188,6 +2222,12 @@ fn apply_snmp_probe(
     }
     let mut incomplete = selection.inventory && !result.inventory_complete
         || selection.lldp && !result.lldp_complete;
+    if selection.inventory && !result.inventory_complete {
+        logger.diagnostic("snmp", "PARTIAL", "inventory-partial");
+    }
+    if selection.lldp && !result.lldp_complete {
+        logger.diagnostic("lldp-snmp", "PARTIAL", "neighbor-inventory-partial");
+    }
     for warning in result.warnings.drain(..) {
         let protocol = if warning.contains("LLDP") || warning.contains("lldp") {
             "lldp-snmp"
@@ -2203,6 +2243,11 @@ fn apply_snmp_probe(
             snmp_endpoint,
             "collection",
             &warning,
+        );
+        logger.diagnostic(
+            protocol,
+            "PARTIAL",
+            diagnostic_code(&warning, protocols::ProbeStatus::Partial),
         );
         logger.log(formatted.clone());
         warnings.push(formatted);
@@ -2250,6 +2295,7 @@ fn apply_probe(
 ) -> bool {
     let Some(result) = result else { return false };
     let Ok((ip, mac, mut result)) = result else {
+        logger.diagnostic("native-protocol", "FAIL", "probe-task-failed");
         warnings.push("A native protocol probe task failed.".into());
         return true;
     };
@@ -2286,6 +2332,11 @@ fn apply_probe(
                 &endpoint,
                 outcome.stage,
                 &message,
+            );
+            logger.diagnostic(
+                outcome.protocol,
+                status,
+                diagnostic_code(&message, outcome.status),
             );
             logger.log(formatted.clone());
             failed |= matches!(

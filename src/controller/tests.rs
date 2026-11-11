@@ -1,4 +1,5 @@
 use super::*;
+use crate::LogOutput;
 use clap::Parser;
 use std::future::ready;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,6 +22,10 @@ impl PrivateStore {
     fn get(&self) -> &store::Store {
         self.store.as_ref().unwrap()
     }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.path.join("controller.log")).unwrap()
+    }
 }
 
 impl Drop for PrivateStore {
@@ -36,6 +41,304 @@ fn scanner() -> Scanner {
         name: "Test".into(),
         site: "site1".into(),
     }
+}
+
+#[test]
+fn warning_log_appends_across_restarts_and_escapes_multiline_messages() {
+    let mut private = PrivateStore::new();
+    private
+        .get()
+        .log
+        .warn("Upload retry scheduled.\nNot a new entry.");
+    private.store.take();
+    let store = store::Store::open(Some(private.path.clone())).unwrap();
+    store.log.error("Controller stopped.");
+    let log = private.log();
+    let lines: Vec<_> = log.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains(" WARN Upload retry scheduled. Not a new entry."));
+    assert!(lines[1].contains(" ERROR Controller stopped."));
+    for line in lines {
+        assert!(OffsetDateTime::parse(line.split_once(' ').unwrap().0, &Rfc3339).is_ok());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(private.path.join("controller.log"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
+fn disabled_logging_never_creates_a_file() {
+    let mut private = PrivateStore::new();
+    private.store.take();
+    std::fs::remove_file(private.path.join("controller.log")).unwrap();
+    let log = log::Log::open(None).unwrap();
+    log.warn("This must not be persisted.");
+    log.error("Nor this.");
+    assert!(!private.path.join("controller.log").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn warning_log_rejects_symlinks_and_public_files() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let mut private = PrivateStore::new();
+    private.store.take();
+    let path = private.path.join("controller.log");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(store::Store::open(Some(private.path.clone())).is_err());
+    std::fs::remove_file(&path).unwrap();
+    let target = private.path.join("unrelated-file");
+    std::fs::write(&target, "preserve this").unwrap();
+    symlink(&target, &path).unwrap();
+    assert!(store::Store::open(Some(private.path.clone())).is_err());
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "preserve this");
+}
+
+#[test]
+fn scan_log_keeps_failure_categories_but_discards_info_and_protocol_secret_text() {
+    use otserver_otter::protocols::{ProbeOutcome, ProbeResult, ProbeStatus};
+    let private = PrivateStore::new();
+    let logger = log::ScanLog {
+        log: &private.get().log,
+        run_id: "run-test",
+    };
+    logger.log("Starting discovery; informational-secret".into());
+    for status in [
+        ProbeStatus::Success,
+        ProbeStatus::NoResponse,
+        ProbeStatus::Partial,
+        ProbeStatus::Failure,
+    ] {
+        crate::apply_probe(
+            "test",
+            &mut [],
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &logger,
+            Some(Ok((
+                "192.0.2.10".parse().unwrap(),
+                None,
+                ProbeResult {
+                    observations: vec![],
+                    ports: vec![],
+                    warnings: vec![],
+                    outcomes: vec![ProbeOutcome {
+                        source: otserver_otter::contract::Source::OpcUa,
+                        protocol: "opcua",
+                        status,
+                        endpoint: "secret-endpoint".into(),
+                        timeout: "2s",
+                        stage: "read",
+                        messages: vec![
+                            "authentication failed with protocol-secret\nfake entry".into(),
+                        ],
+                    }],
+                },
+            ))),
+        );
+    }
+    let log = private.log();
+    assert_eq!(log.lines().count(), 2);
+    assert!(log.contains("WARN Run run-test: opcua PARTIAL code=authentication-failed"));
+    assert!(log.contains("ERROR Run run-test: opcua FAIL code=authentication-failed"));
+    assert!(log.contains("Verify the configured credentials"));
+    assert!(!log.contains("secret"));
+    assert!(!log.contains("fake entry"));
+}
+
+#[tokio::test]
+async fn http_failures_log_operations_and_statuses_without_credentials_or_bodies() {
+    let private = PrivateStore::new();
+    let (mut api, task) = server(vec![
+        (401, json!({"token":"response-secret"})),
+        (403, json!({"error":"response-secret"})),
+        (409, json!({})),
+        (429, json!({})),
+        (503, json!({})),
+        (400, json!({})),
+        (200, json!({"id":"import1","status":"completed"})),
+    ])
+    .await;
+    api.log = private.get().log.clone();
+    for (status, expected) in [
+        (401, Error::Auth),
+        (403, Error::Forbidden),
+        (409, Error::Terminal),
+        (429, Error::Retry),
+        (503, Error::Retry),
+        (400, Error::Invalid),
+    ] {
+        assert_eq!(
+            api.post::<Value>("api/otter/v1/poll", json!({"token":"request-secret"}))
+                .await
+                .unwrap_err(),
+            expected
+        );
+        assert!(
+            private
+                .log()
+                .contains(&format!("POST /api/otter/v1/poll: HTTP {status}"))
+        );
+    }
+    let before = private.log();
+    api.post::<Value>("api/otter/v1/poll", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(private.log(), before);
+    assert!(!before.contains("secret"));
+    assert!(!before.contains(&api.credential));
+    assert!(before.contains("credential may still be valid"));
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn upload_status_get_and_update_download_failures_are_logged() {
+    let private = PrivateStore::new();
+    let (mut api, task) = server(vec![(403, json!({})), (503, json!({})), (401, json!({}))]).await;
+    api.log = private.get().log.clone();
+    let mut state = ready_upload(private.get(), 0);
+    assert!(matches!(
+        api.upload("run1", &private.get().result_path("run1"), false)
+            .await,
+        Err(Error::Forbidden)
+    ));
+    state.pending_imports.push(PendingImport {
+        id: "import1".into(),
+        status: "pending".into(),
+        retries: 0,
+    });
+    assert_eq!(
+        imports(&api, private.get(), &mut state).await,
+        Err(Error::Retry)
+    );
+    assert_eq!(
+        api.download_update(
+            "update1",
+            313,
+            &"a".repeat(64),
+            &private.path.join("update.bin")
+        )
+        .await,
+        Err(Error::Auth)
+    );
+    let log = private.log();
+    assert!(log.contains("POST /api/asset-imports: HTTP 403"));
+    assert!(log.contains("GET /api/asset-imports/import1: HTTP 503"));
+    assert!(log.contains("GET /api/otter/v1/updates/update1/binary: HTTP 401"));
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_and_interrupted_http_bodies_are_logged_without_content() {
+    let private = PrivateStore::new();
+    for (body, length, expected, detail) in [
+        ("body-secret", 11, Error::Invalid, "oversized or invalid"),
+        ("body-secret", 50, Error::Retry, "body transfer failed"),
+    ] {
+        let (mut api, task) = raw_server(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}"
+            )
+            .into_bytes(),
+        )
+        .await;
+        api.log = private.get().log.clone();
+        assert_eq!(
+            api.post::<Value>("api/otter/v1/poll", json!({}))
+                .await
+                .unwrap_err(),
+            expected
+        );
+        assert!(private.log().contains(detail));
+        task.await.unwrap();
+    }
+    assert!(!private.log().contains("body-secret"));
+}
+
+#[tokio::test]
+async fn connection_failures_are_logged_with_actionable_context() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut api = Api::new(
+        base_url(&format!("http://{}", listener.local_addr().unwrap())).unwrap(),
+        &HttpOptions::default(),
+    )
+    .unwrap();
+    let private = PrivateStore::new();
+    api.log = private.get().log.clone();
+    drop(listener);
+    assert_eq!(
+        api.post::<Value>("api/otter/v1/poll", json!({"token":"transport-secret"}))
+            .await
+            .unwrap_err(),
+        Error::Retry
+    );
+    assert!(
+        private
+            .log()
+            .contains("WARN POST /api/otter/v1/poll: Connection failed; check DNS")
+    );
+    assert!(!private.log().contains("transport-secret"));
+}
+
+#[tokio::test]
+async fn request_timeouts_are_logged_with_the_failed_operation() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut api = Api::new(
+        base_url(&format!("http://{}", listener.local_addr().unwrap())).unwrap(),
+        &HttpOptions::default(),
+    )
+    .unwrap();
+    let private = PrivateStore::new();
+    api.log = private.get().log.clone();
+    let request = api
+        .request(reqwest::Method::POST, "api/otter/v1/runs/run1/heartbeat")
+        .unwrap()
+        .timeout(Duration::from_millis(50));
+    assert!(matches!(
+        api.send("POST", "api/otter/v1/runs/run1/heartbeat", request)
+            .await,
+        Err(Error::Retry)
+    ));
+    assert!(
+        private
+            .log()
+            .contains("WARN POST /api/otter/v1/runs/run1/heartbeat: Request timed out")
+    );
+}
+
+#[tokio::test]
+async fn fatal_poll_errors_are_logged_before_the_controller_exits() {
+    let (api, task) = server(vec![(403, json!({"error":"body-secret"}))]).await;
+    let mut private = PrivateStore::new();
+    let mut state = State {
+        server_url: api.base.to_string(),
+        scanner: Some(scanner()),
+        ..State::default()
+    };
+    private
+        .get()
+        .persist_credential(&mut state, &credential(), true)
+        .unwrap();
+    private.store.take();
+    let args = controller_args(&["--state-dir", private.path.to_str().unwrap()]);
+    assert_eq!(run_inner(args).await, Err(Error::Forbidden));
+    assert!(private.log().contains("POST /api/otter/v1/poll: HTTP 403"));
+    assert!(
+        private
+            .log()
+            .contains("ERROR Controller stopped: Controller denied this operation")
+    );
+    assert!(!private.log().contains("body-secret"));
+    task.await.unwrap();
 }
 
 #[test]
@@ -452,6 +755,20 @@ async fn errors_redact_server_bodies_and_classify_auth_and_retry() {
 }
 
 #[tokio::test]
+async fn forbidden_operations_do_not_claim_the_machine_credential_expired() {
+    let (api, task) = server(vec![(403, json!({"password":"do-not-log"}))]).await;
+    let error = api
+        .post::<Value>("api/asset-imports", json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(error, Error::Forbidden);
+    assert!(error.to_string().contains("HTTP 403"));
+    assert!(!error.to_string().contains("expired"));
+    assert!(!error.to_string().contains("do-not-log"));
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn decode_rejects_announced_and_chunked_bodies_over_the_limit() {
     let oversized_length = crate::MAX_IMPORT_RESPONSE_BYTES + 1;
     let (api, task) = raw_server(
@@ -684,6 +1001,7 @@ async fn assigned_run_persists_a_protocol_disabled_scan_then_uploads_and_finishe
         serde_json::from_slice(&std::fs::read(store.get().result_path("run1")).unwrap()).unwrap();
     assert!(!export.scan.partial);
     assert!(export.devices.is_empty());
+    assert!(store.log().is_empty());
     let requests = task.await.unwrap();
     assert_eq!(requests.len(), 6);
     assert!(requests[0].starts_with("POST /api/otter/v1/runs/run1/start "));
@@ -763,7 +1081,11 @@ fn file_credentials_and_assignment_survive_atomic_state_replacement() {
         use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 
         let user = store::windows_token_user().unwrap();
-        for path in [&store.path, &store.path.join("agent-state.json")] {
+        for path in [
+            &store.path,
+            &store.path.join("agent-state.json"),
+            &store.path.join("controller.log"),
+        ] {
             let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
             let mut acl = null_mut();
             let mut descriptor = null_mut();
@@ -1162,6 +1484,7 @@ async fn interrupted_upload_retry_resumes_the_saved_budget_and_waits_two_minutes
 async fn upload_does_not_retry_auth_terminal_invalid_or_local_errors() {
     for error in [
         Error::Auth,
+        Error::Forbidden,
         Error::Terminal,
         Error::Invalid,
         Error::Local("Unreadable result"),
@@ -1649,6 +1972,9 @@ async fn initialization_fails_closed_for_missing_authorization_or_enrollment() {
     assert!(matches!(
         initialize(&args, None).await,
         Err(Error::Local("Managed scanning requires --ack-authorized."))
+    ));
+    assert!(private.log().contains(
+        "ERROR Controller initialization failed: Managed scanning requires --ack-authorized."
     ));
 
     let store = store::Store::open(Some(private.path.clone())).unwrap();

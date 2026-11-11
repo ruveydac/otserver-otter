@@ -6,10 +6,12 @@ use std::path::{Path, PathBuf};
 pub(super) struct Store {
     directory: PathBuf,
     _lock: File,
+    pub(super) log: super::log::Log,
 }
 
 impl Store {
     pub(super) fn open(directory: Option<PathBuf>) -> Result<Self, Error> {
+        let logging = directory.is_some();
         let directory = Self::directory(directory)?;
         if !directory.exists() {
             std::fs::create_dir_all(directory.parent().ok_or(Error::Invalid)?)
@@ -42,6 +44,7 @@ impl Store {
         lock.try_lock()
             .map_err(|_| Error::Local("Another managed scanner is using this state directory. Stop that controller before enrolling or changing its installation."))?;
         Ok(Self {
+            log: super::log::Log::open(logging.then_some(directory.as_path()))?,
             directory,
             _lock: lock,
         })
@@ -383,6 +386,29 @@ fn read_update_state_bytes(path: &Path) -> Result<Vec<u8>, Error> {
 
 fn is_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub(super) fn open_log(directory: &Path) -> Result<File, Error> {
+    let path = directory.join("controller.log");
+    if path.symlink_metadata().is_ok() {
+        check_private(&path, false)?;
+        if !path.is_file() {
+            return Err(Error::Local(
+                "controller.log must be a private regular file.",
+            ));
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(&path)
+        .map_err(|_| Error::Local("Could not open controller.log in the state directory. Check file permissions and disk space."))?;
+    check_private(&path, false)?;
+    Ok(file)
 }
 
 fn check_private(path: &Path, directory: bool) -> Result<(), Error> {

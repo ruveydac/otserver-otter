@@ -1,10 +1,11 @@
 //! Outbound controller v1 client. Local scans still use the shared safety/pacing path.
 mod install;
+mod log;
 mod store;
 #[cfg(test)]
 mod tests;
 
-use crate::{HttpOptions, LogOutput, ScanArgs, ScanOptions, ScannerConfig, resolve_scan, scan};
+use crate::{HttpOptions, ScanArgs, ScanOptions, ScannerConfig, resolve_scan, scan};
 use clap::Args;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,7 @@ pub struct ControllerArgs {
     /// Enroll and save credentials without polling (also used by the GUI).
     #[arg(long, requires = "enroll", conflicts_with = "install")]
     enroll_only: bool,
+    /// Private state directory; when supplied, append warnings/errors to controller.log here.
     #[arg(long)]
     state_dir: Option<PathBuf>,
     /// Replace saved enrollment and run state after enrolling with a new controller; retained exports are kept.
@@ -435,6 +437,7 @@ enum Error {
     InterfacesUnavailable,
     UploadRetriesExhausted,
     Auth,
+    Forbidden,
     Terminal,
     UpdateHandoff,
     Invalid,
@@ -448,6 +451,7 @@ impl std::fmt::Display for Error {
             Self::InterfacesUnavailable => "Could not enumerate capture interfaces; retrying in 5 minutes.",
             Self::UploadRetriesExhausted => "Scan result upload failed after the initial attempt and 5 retries. Local scan result retained.",
             Self::Auth => "Scanner credential is expired or not accepted. Verify --server-url, OS account, and --state-dir; re-enroll if the controller revoked it.",
+            Self::Forbidden => "Controller denied this operation (HTTP 403). The scanner credential may still be valid; check server-side permissions and logs.",
             Self::Terminal => "Run is no longer active; local results retained.",
             Self::UpdateHandoff => "The verified update helper is applying this release; the controller will restart.",
             Self::Invalid => "Controller response or configuration is invalid.",
@@ -461,6 +465,7 @@ struct Api {
     client: Client,
     credential: String,
     queued_imports: bool,
+    log: log::Log,
 }
 
 fn base_url(input: &str) -> Result<Url, Error> {
@@ -543,6 +548,7 @@ impl Api {
             base,
             credential: String::new(),
             queued_imports: false,
+            log: log::Log::default(),
             client,
         })
     }
@@ -572,14 +578,81 @@ impl Api {
         path: &str,
         body: Value,
     ) -> Result<T, Error> {
-        let response = self
+        let request = self
             .request(reqwest::Method::POST, path)?
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body.to_string())
-            .send()
-            .await
-            .map_err(|_| Error::Retry)?;
-        decode(response).await
+            .body(body.to_string());
+        let response = self.send("POST", path, request).await?;
+        self.decode("POST", path, response).await
+    }
+
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, Error> {
+        let response = request.send().await.map_err(|error| {
+            let reason = if error.is_timeout() {
+                "Request timed out; check connectivity and controller load."
+            } else if error.is_connect() {
+                "Connection failed; check DNS, routing, proxy settings, and TLS certificates."
+            } else {
+                "Request transport failed before a usable response was received; check the controller connection."
+            };
+            self.log.warn(&format!("{method} /{path}: {reason}"));
+            Error::Retry
+        })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let (error, reason) = match status.as_u16() {
+            401 => (
+                Error::Auth,
+                "Authentication was rejected. Check enrollment and credential expiry or revocation.",
+            ),
+            403 => (
+                Error::Forbidden,
+                "Operation denied. The credential may still be valid; check server-side permissions and management logs.",
+            ),
+            404 | 409 | 410 => (
+                Error::Terminal,
+                "Assignment or resource is unavailable or no longer active; local results are retained.",
+            ),
+            408 | 425 | 429 | 500..=599 => (
+                Error::Retry,
+                "Controller could not accept the request; the operation may be retried within its retry/lease limits.",
+            ),
+            _ => (
+                Error::Invalid,
+                "Unexpected HTTP response; check the controller URL, configuration, and management logs.",
+            ),
+        };
+        let message = format!("{method} /{path}: HTTP {}. {reason}", status.as_u16());
+        if matches!(error, Error::Retry | Error::Terminal) {
+            self.log.warn(&message);
+        } else {
+            self.log.error(&message);
+        }
+        Err(error)
+    }
+
+    async fn decode<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        path: &str,
+        response: reqwest::Response,
+    ) -> Result<T, Error> {
+        let status = response.status().as_u16();
+        decode(response).await.inspect_err(|error| {
+            let message = format!("{method} /{path}: HTTP {status}, {}", if *error == Error::Retry {
+                "response body transfer failed; check the controller connection."
+            } else {
+                "response body was oversized or invalid for this operation; check management compatibility and logs."
+            });
+            if *error == Error::Retry { self.log.warn(&message); } else { self.log.error(&message); }
+        })
     }
 
     async fn update_status(
@@ -615,28 +688,17 @@ impl Api {
         {
             return Err(Error::Invalid);
         }
-        let response = self
-            .request(
-                reqwest::Method::GET,
-                &format!("api/otter/v1/updates/{id}/binary"),
-            )?
-            .timeout(Duration::from_secs(300))
-            .send()
-            .await
-            .map_err(|_| Error::Retry)?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(match status.as_u16() {
-                401 | 403 => Error::Auth,
-                404 | 409 | 410 => Error::Terminal,
-                408 | 425 | 429 | 500..=599 => Error::Retry,
-                _ => Error::Invalid,
-            });
-        }
+        let endpoint = format!("api/otter/v1/updates/{id}/binary");
+        let request = self
+            .request(reqwest::Method::GET, &endpoint)?
+            .timeout(Duration::from_secs(300));
+        let response = self.send("GET", &endpoint, request).await?;
+        let status = response.status().as_u16();
         if response
             .content_length()
             .is_some_and(|length| length != size)
         {
+            self.log.error(&format!("GET /{endpoint}: HTTP {status}, update size differs from the assigned size; download rejected."));
             return Err(Error::Invalid);
         }
         let mut options = std::fs::OpenOptions::new();
@@ -679,6 +741,7 @@ impl Api {
         .await;
         drop(file);
         if result.is_err() {
+            self.log.error(&format!("GET /{endpoint}: HTTP {status}, update download, staging, or integrity verification failed; update will not be installed."));
             let _ = std::fs::remove_file(path);
         }
         result
@@ -716,14 +779,13 @@ impl Api {
                     .mime_str("application/json")
                     .map_err(|_| Error::Invalid)?,
             );
-        let response = self
+        let request = self
             .request(reqwest::Method::POST, "api/asset-imports")?
             .timeout(Duration::from_secs(300))
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|_| Error::Retry)?;
-        let response: crate::CreateImportResponse = decode(response).await?;
+            .multipart(form);
+        let response = self.send("POST", "api/asset-imports", request).await?;
+        let response: crate::CreateImportResponse =
+            self.decode("POST", "api/asset-imports", response).await?;
         Ok(response.doc)
     }
 }
@@ -736,15 +798,6 @@ fn import_metadata(id: &str, queued: bool) -> Value {
 async fn decode<T: serde::de::DeserializeOwned>(
     mut response: reqwest::Response,
 ) -> Result<T, Error> {
-    let status = response.status();
-    if !status.is_success() {
-        return Err(match status.as_u16() {
-            401 | 403 => Error::Auth,
-            404 | 409 | 410 => Error::Terminal,
-            408 | 425 | 429 | 500..=599 => Error::Retry,
-            _ => Error::Invalid,
-        });
-    }
     let max = crate::MAX_IMPORT_RESPONSE_BYTES;
     if response
         .content_length()
@@ -761,12 +814,6 @@ async fn decode<T: serde::de::DeserializeOwned>(
     }
     serde_json::from_slice(body.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&body))
         .map_err(|_| Error::Invalid)
-}
-
-// Managed scans deliberately suppress scan/probe output: even protocol errors may contain secrets.
-struct Quiet;
-impl LogOutput for Quiet {
-    fn write(&self, _msg: String) {}
 }
 
 fn mapped_config(
@@ -1046,6 +1093,19 @@ async fn finish(
         && let Some(message) = &run.message
     {
         eprintln!("Managed scan failed: {message}");
+        store
+            .log
+            .error(&format!("Run {} failed: {message}", run.id));
+    } else if run.status == "partial" {
+        store.log.warn(&format!(
+            "Run {} completed with incomplete discovery; review the retained scan export.",
+            run.id
+        ));
+    } else if run.status == "cancelled" {
+        store.log.warn(&format!(
+            "Run {} cancelled; further uploads stopped.",
+            run.id
+        ));
     }
     let response: Value = api
         .post(
@@ -1121,6 +1181,7 @@ where
         }
         if attempts > 0 {
             eprintln!("Retrying scan result upload in 2 minutes (retry {attempts} of 5).");
+            store.log.warn(&format!("Run {}: retrying scan result upload in 2 minutes (retry {attempts} of 5); local export retained.", run.id));
             tokio::time::sleep(Duration::from_secs(120)).await;
         }
         // Reserve the attempt before sending so restarts cannot reset the retry limit.
@@ -1202,7 +1263,11 @@ async fn execute(
             return Err(Error::Terminal);
         }
         let cancelled = Arc::new(AtomicBool::new(false));
-        let scan_future = scan(&name, &options, &Quiet, &cancelled);
+        let logger = log::ScanLog {
+            log: &store.log,
+            run_id: id,
+        };
+        let scan_future = scan(&name, &options, &logger, &cancelled);
         tokio::pin!(scan_future);
         let mut completed = false;
         let outcome = leased(api, id, deadline, 0, async {
@@ -1284,6 +1349,9 @@ async fn execute(
             "Scanner result uploaded; import status: {}.",
             imported.status
         );
+        if imported.status == "failed" {
+            store.log.error(&format!("Run {id}: import {import_id} was accepted but processing failed. Check the import details in OTserver; the local export is retained."));
+        }
         if api.queued_imports && imported.status != "completed" {
             state.pending_imports.push(PendingImport {
                 id: import_id,
@@ -1305,16 +1373,12 @@ async fn execute(
 
 async fn imports(api: &Api, store: &store::Store, state: &mut State) -> Result<(), Error> {
     for index in 0..state.pending_imports.len() {
-        let response = api
-            .request(
-                reqwest::Method::GET,
-                &format!("api/asset-imports/{}", state.pending_imports[index].id),
-            )?
-            .send()
-            .await
-            .map_err(|_| Error::Retry)?;
-        let mut document: crate::ImportDocument = decode(response).await?;
+        let path = format!("api/asset-imports/{}", state.pending_imports[index].id);
+        let request = api.request(reqwest::Method::GET, &path)?;
+        let response = api.send("GET", &path, request).await?;
+        let mut document: crate::ImportDocument = api.decode("GET", &path, response).await?;
         if document.status == "failed" && state.pending_imports[index].retries == 0 {
+            store.log.warn(&format!("Import {} failed processing; requesting its single queued retry without re-uploading.", state.pending_imports[index].id));
             // One bounded queued retry using the known ID; never re-upload a terminal run.
             state.pending_imports[index].retries = 1;
             save(store, state)?;
@@ -1337,6 +1401,9 @@ async fn imports(api: &Api, store: &store::Store, state: &mut State) -> Result<(
         }
         if document.status != state.pending_imports[index].status {
             eprintln!("Import processing status: {}.", document.status);
+        }
+        if document.status == "failed" {
+            store.log.error(&format!("Import {} failed processing after its queued retry. Check the import details in OTserver; no further automatic retry.", state.pending_imports[index].id));
         }
         state.pending_imports[index].status = document.status;
     }
@@ -1387,6 +1454,10 @@ async fn fail_update(
     }
     update_state.failed = Some(id.to_owned());
     update_state.failed_reason = Some(reason);
+    store.log.error(&format!(
+        "Update {id} failed: {}. Previous executable and local failure state are retained.",
+        reason.as_str()
+    ));
     store.save_update_state(update_state)?;
     report_pending_update_failure(api, store, update_state).await
 }
@@ -1634,12 +1705,30 @@ pub(super) fn is_update_helper_executable() -> bool {
 }
 
 async fn run_inner(args: ControllerArgs) -> Result<(), Error> {
-    let (store, mut state, mut api) = initialize(&args, None).await?;
+    let (store, state, api) = initialize(&args, None).await?;
+    let log = store.log.clone();
+    run_initialized(args, store, state, api)
+        .await
+        .inspect_err(|error| {
+            if *error != Error::UpdateHandoff {
+                log.error(&format!("Controller stopped: {error}"));
+            }
+        })
+}
+
+async fn run_initialized(
+    args: ControllerArgs,
+    store: store::Store,
+    mut state: State,
+    mut api: Api,
+) -> Result<(), Error> {
     if args.install {
         let directory = store.path().to_owned();
         drop(store);
         let message = install::install(Some(directory), false).map_err(|message| {
             eprintln!("{message}");
+            api.log
+                .error(&format!("Controller installation failed: {message}"));
             Error::Local(
                 "Controller installation failed; enrollment and retained exports are kept.",
             )
@@ -1671,6 +1760,22 @@ async fn initialize(
     args: &ControllerArgs,
     supplied_token: Option<&str>,
 ) -> Result<(store::Store, State, Api), Error> {
+    let store = store::Store::open(args.state_dir.clone())?;
+    let (state, api) = initialize_in_store(args, supplied_token, &store)
+        .await
+        .inspect_err(|error| {
+            store
+                .log
+                .error(&format!("Controller initialization failed: {error}"))
+        })?;
+    Ok((store, state, api))
+}
+
+async fn initialize_in_store(
+    args: &ControllerArgs,
+    supplied_token: Option<&str>,
+    store: &store::Store,
+) -> Result<(State, Api), Error> {
     if !args.ack_authorized {
         return Err(Error::Local("Managed scanning requires --ack-authorized."));
     }
@@ -1679,7 +1784,6 @@ async fn initialize(
     } else {
         Some(base_url(&args.server_url)?)
     };
-    let store = store::Store::open(args.state_dir.clone())?;
     let mut state = store.load()?;
     let base = match requested_base {
         Some(base) => base,
@@ -1711,6 +1815,7 @@ async fn initialize(
         settings.http.https_proxy = Some(proxy.clone());
     }
     let mut api = Api::new(base, &settings.http)?;
+    api.log = store.log.clone();
     api.queued_imports = settings.queued_imports;
     if args.enroll {
         use std::io::{BufRead, Read};
@@ -1767,7 +1872,7 @@ async fn initialize(
     }
     state.settings = settings;
     store.save(&state)?;
-    Ok((store, state, api))
+    Ok((state, api))
 }
 
 #[cfg(feature = "gui")]
@@ -1817,6 +1922,7 @@ async fn poll_once(
     let result = async {
         let mut update_state = store.load_update_state()?;
         if let Some(id) = update_state.rolled_back.clone() {
+            store.log.warn(&format!("Update {id} was rolled back to the previous signed executable; reporting rollback to OTserver."));
             match api.update_status(&id, "rolled-back", None).await {
                 Ok(()) | Err(Error::Terminal) => {
                     update_state.rolled_back = None;
@@ -1910,9 +2016,11 @@ async fn poll_once(
         Ok(seconds) => Ok(Duration::from_secs(seconds)),
         Err(error @ (Error::Retry | Error::InterfacesUnavailable)) => {
             eprintln!("{error}");
+            store.log.warn(&error.to_string());
             Ok(Duration::from_secs(300))
         }
         Err(Error::Terminal) => {
+            store.log.warn("Run lease expired or assignment/resource is no longer active. Work stopped; local results retained. Polling will continue.");
             if let Some(run) = &mut state.assignment {
                 run.phase = Phase::Terminal;
             }

@@ -113,6 +113,18 @@ Enter the enrollment token at the prompt. On later starts, omit `--enroll` to re
 credential. Configure and schedule scans in OTserver. Remote controllers require HTTPS;
 HTTP is supported only for loopback addresses.
 
+If a scan stops with HTTP 403, check the management logs for the denied operation. An upload
+permission failure does not mean the scanner credential expired; re-enrollment will not fix it.
+
+Supply `--state-dir PATH` to keep a timestamped `PATH/controller.log` of warnings and errors.
+It includes failed HTTP methods/paths and status codes, connection/timeouts, upload retry delays,
+scan failure categories, import-processing failures, and the reason the controller stopped.
+Routine scan progress and successful requests are omitted. Protocol diagnostics use credential-safe
+categories and troubleshooting hints; credentials, response bodies, and raw probe errors are omitted.
+The private log appends across restarts. Stop the controller before archiving or removing it;
+retention is operator-managed. Without `--state-dir`, no log file is created. An inaccessible or
+unsafe state directory cannot receive logs; startup reports that failure on stderr.
+
 ### Install the controller in the background
 
 Run as your normal user. To enroll and install in one step:

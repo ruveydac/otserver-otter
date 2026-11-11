@@ -341,6 +341,12 @@ to HTTP. Other hosts require explicit HTTPS. No scanner-side listener is opened.
 - Default state lives at `$XDG_STATE_HOME/otserver-otter` or `~/.local/state/otserver-otter` on Linux,
   and `%LOCALAPPDATA%\otserver-otter` on Windows. `--state-dir PATH` overrides it. One process owns
   the directory; use the same OS account and directory across restarts.
+- An explicit `--state-dir` enables private, append-only `controller.log` with UTC timestamps and
+  warning/error entries. Record failed HTTP methods/paths/statuses (including uploads, import status,
+  and update downloads), transport failures, retries, and terminal errors. Keep successful requests
+  and scan info out. Shared scan diagnostics supply only caller-owned protocol/status/code categories
+  to this log; never persist raw probe text, HTTP bodies, headers, tokens, or credential snapshots.
+  Retention is operator-managed; stop the controller before archiving/removing the log.
 - `--file-credentials` explicitly selects the private file fallback instead of the OS credential
   store. Unix directories/files must belong to the current user with modes 0700/0600; Windows ACLs
   restrict state to the current user. Protocol credential snapshots remain memory-only.
@@ -356,7 +362,8 @@ to HTTP. Other hosts require explicit HTTPS. No scanner-side listener is opened.
   leases at 30 minutes and stop five seconds before expiry; preserve shorter server deadlines.
   Cancellation, lease loss, terminal responses, or authentication rejection stop work and prevent
   stale uploads.
-  Managed output omits probe details and controller bodies/credentials.
+  Managed stderr omits probe details; the optional state log keeps credential-safe warning/error
+  categories and hints. Both omit controller bodies/credentials.
 - Interrupted discovery becomes failed work, never an automatic rescan. Completed exports resume
   byte-identical upload retries; known import IDs resume finishing. Retain `RUN_ID.otserver.json`
   in the state directory, including on failure; operators manage export retention.
@@ -372,6 +379,8 @@ to HTTP. Other hosts require explicit HTTPS. No scanner-side listener is opened.
 - Rotate credentials when less than 30 days remain, durably saving the secret/reference first.
   Authentication failure or a lost enrollment/rotation response requires re-enrollment because the
   server consumes or revokes the prior token immediately.
+  Distinguish HTTP 403 operation denial from HTTP 401 authentication failure. Both stop work, but a
+  permission denial must not claim credential expiry or expose the server response body.
 
 ## Protocol evidence reference
 

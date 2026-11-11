@@ -1539,7 +1539,8 @@ mod tests {
             error,
             "Enroll this scanner before installing the controller."
         );
-        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        assert!(directory.join("controller.log").is_file());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1624,7 +1625,8 @@ mod tests {
         let error = install(Some(directory.clone()), false).unwrap_err();
 
         assert!(error.contains("requires HTTPS"), "{error}");
-        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+        assert!(directory.join("controller.log").is_file());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 3);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

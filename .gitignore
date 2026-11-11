@@ -10,6 +10,7 @@ coverage/
 pki/
 agent-state.json
 agent.lock
+controller.log
 .opencode
 otter-update-private.pem
 /release-artifacts/
