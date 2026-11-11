@@ -1,4 +1,4 @@
-FROM ubuntu:22.04 AS build
+FROM debian:bookworm-slim AS build
 ARG OPENER_COMMIT=150146e3058a493d5accf6d5f76ff450468d7bd7
 ARG OPENER_SHA256=d1af346a5eadfc35dc240f315f757ca48010d53c5f415ed3c4711fa7eea878c9
 RUN apt-get update \
@@ -18,7 +18,7 @@ RUN apt-get update \
       -DOpENer_Device_Config_Device_Name="OT Lab EtherNet-IP Adapter" \
     && cmake --build /build --parallel 2
 
-FROM ubuntu:22.04
+FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libcap2 \
     && rm -rf /var/lib/apt/lists/*

@@ -14,3 +14,4 @@ controller.log
 .opencode
 otter-update-private.pem
 /release-artifacts/
+graphify-out/

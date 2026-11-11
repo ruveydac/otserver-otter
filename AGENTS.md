@@ -19,6 +19,14 @@ The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
 Contract changes require coordinated updates in OTserver's importer. Product overview and first-scan
 instructions are in `README.md`; detailed operator and development guidance follows here.
 
+## Codebase Search
+
+- When `graphify-out/` contains a graph, use `graphify query "<question>"` for focused codebase
+  searches instead of grepping raw files. Read `graphify-out/GRAPH_REPORT.md` for broad architecture
+  context, and verify relevant findings in source files.
+- If no graph exists, use `grep` and file reads for focused lookups; build a graph only when broader
+  structural or cross-file exploration benefits from it.
+
 ## Safety Rules
 
 - Require `--ack-authorized` for every scan.
