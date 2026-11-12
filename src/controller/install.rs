@@ -1426,7 +1426,18 @@ fn start_installation(executable: &Path, directory: &Path) -> Result<String, Str
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         .filter(|path| path.is_absolute())
         .ok_or("Could not locate the user systemd configuration directory.")?;
-    start_installation_with(executable, directory, &config, || system_tool("systemctl"))
+    start_installation_with(
+        executable,
+        directory,
+        &config,
+        || system_tool("systemctl"),
+        |systemctl, arguments| {
+            Command::new(systemctl)
+                .args(arguments)
+                .status()
+                .map(|status| status.success())
+        },
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -1435,6 +1446,7 @@ fn start_installation_with(
     directory: &Path,
     config: &Path,
     find_systemctl: impl FnOnce() -> Result<PathBuf, String>,
+    mut run_systemctl: impl FnMut(&Path, &[&str]) -> std::io::Result<bool>,
 ) -> Result<String, String> {
     let units = config.join("systemd/user");
     std::fs::create_dir_all(&units)
@@ -1454,12 +1466,7 @@ fn start_installation_with(
             "otserver-otter-controller.service",
         ],
     ] {
-        if !Command::new(&systemctl)
-            .args(arguments)
-            .status()
-            .map_err(|_| "Could not run systemctl --user.")?
-            .success()
-        {
+        if !run_systemctl(&systemctl, &arguments).map_err(|_| "Could not run systemctl --user.")? {
             return Err("Could not enable/start the user controller service. Check systemctl --user status otserver-otter-controller.service and journalctl --user -u otserver-otter-controller.service, then retry installation.".into());
         }
     }
@@ -2044,21 +2051,28 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("otter-systemd-{}", uuid::Uuid::new_v4()));
         let config = directory.join("config");
-        let tools = directory.join("tools");
-        std::fs::create_dir_all(&tools).unwrap();
-        let log = directory.join("calls");
-        let systemctl = tools.join("systemctl");
-        executable_script(
-            &systemctl,
-            &format!("printf '%s\\n' \"$*\" >> '{}'", log.display()),
-            0o700,
-        );
+        let systemctl = directory.join("mock-systemctl");
         let executable = directory.join("otter executable");
         let state = directory.join("private state");
+        let mut calls = Vec::new();
 
-        let message =
-            start_installation_with(&executable, &state, &config, || Ok(systemctl.clone()))
-                .unwrap();
+        let message = start_installation_with(
+            &executable,
+            &state,
+            &config,
+            || Ok(systemctl.clone()),
+            |program, arguments| {
+                calls.push((
+                    program.to_path_buf(),
+                    arguments
+                        .iter()
+                        .map(|argument| argument.to_string())
+                        .collect::<Vec<_>>(),
+                ));
+                Ok(true)
+            },
+        )
+        .unwrap();
 
         let unit =
             std::fs::read_to_string(config.join("systemd/user/otserver-otter-controller.service"))
@@ -2067,13 +2081,27 @@ mod tests {
         assert!(unit.contains(&format!("--state-dir \"{}\"", state.display())));
         assert!(message.contains("enabled at boot and after logout"));
         assert_eq!(
-            std::fs::read_to_string(log)
-                .unwrap()
-                .lines()
-                .collect::<Vec<_>>(),
+            calls,
             [
-                "--user daemon-reload",
-                "--user enable --now otserver-otter-controller.service"
+                (
+                    systemctl.clone(),
+                    vec!["--user", "daemon-reload"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect()
+                ),
+                (
+                    systemctl,
+                    vec![
+                        "--user",
+                        "enable",
+                        "--now",
+                        "otserver-otter-controller.service"
+                    ]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+                )
             ]
         );
         std::fs::remove_dir_all(directory).unwrap();
@@ -2092,7 +2120,8 @@ mod tests {
                 Path::new("/bin/true"),
                 Path::new("/tmp/state"),
                 &blocked_config,
-                || { Ok(PathBuf::from("/bin/true")) }
+                || Ok(PathBuf::from("/bin/true")),
+                |_, _| Ok(true),
             )
             .unwrap_err(),
             "Could not create the user systemd unit directory."
@@ -2100,15 +2129,30 @@ mod tests {
 
         let config = directory.join("config");
         let systemctl = directory.join("systemctl");
-        executable_script(&systemctl, "exit 1", 0o700);
         let error = start_installation_with(
             Path::new("/bin/true"),
             Path::new("/tmp/state"),
             &config,
             || Ok(systemctl.clone()),
+            |_, _| Ok(false),
         )
         .unwrap_err();
         assert!(error.contains("Could not enable/start the user controller service"));
+
+        let error = start_installation_with(
+            Path::new("/bin/true"),
+            Path::new("/tmp/state"),
+            &config,
+            || Ok(systemctl.clone()),
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "mock spawn failure",
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "Could not run systemctl --user.");
 
         let config = directory.join("missing-tool-config");
         let error = start_installation_with(
@@ -2116,6 +2160,7 @@ mod tests {
             Path::new("/tmp/state"),
             &config,
             || Err("missing systemctl".into()),
+            |_, _| Ok(true),
         )
         .unwrap_err();
         assert_eq!(error, "missing systemctl");
