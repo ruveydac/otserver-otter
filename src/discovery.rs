@@ -1126,16 +1126,23 @@ mod tests {
     fn collection_excludes_ips_claimed_by_conflicting_arp_macs() {
         let ip = Ipv4Addr::new(192, 0, 2, 20);
         let cancelled = AtomicBool::new(false);
-        let mut replies = [Some((ip, 1_u8)), Some((ip, 2_u8))].into_iter();
+        let mut replies = [Some((ip, 1_u8)), Some((ip, 1_u8)), Some((ip, 2_u8)), None].into_iter();
+        let (sent, received) = std::sync::mpsc::channel();
+        let mut first = true;
         let result = collect_replies(
             &[ip],
             Duration::from_secs(3600),
             &cancelled,
-            |_, _, requested| {
-                *requested.lock().unwrap() = true;
+            |_, _, sent_flag| {
+                *sent_flag.lock().unwrap() = true;
+                sent.send(()).unwrap();
                 Ok(())
             },
             || {
+                if first {
+                    received.recv_timeout(Duration::from_secs(2)).unwrap();
+                    first = false;
+                }
                 let reply = replies.next().unwrap_or(None);
                 if reply.is_none() {
                     cancelled.store(true, Ordering::Relaxed);

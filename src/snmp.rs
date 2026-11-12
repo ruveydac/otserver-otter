@@ -3389,6 +3389,28 @@ mod tests {
     }
 
     #[test]
+    fn walk_and_system_rows_are_recorded_as_partial_evidence() {
+        let rows = Arc::new(Mutex::new(PartialResponses::default()));
+        let value = VarBind::new(
+            Oid::parse("1.3.6.1.2.1.1.1.0").unwrap(),
+            Value::OctetString("device description".into()),
+        );
+        let mut recorder = WalkOutcomes {
+            outcomes: vec![],
+            partial_rows: Arc::clone(&rows),
+        };
+
+        recorder.row(&value);
+        record_partial_rows(&rows, std::slice::from_ref(&value));
+        record_partial_rows(&rows, &[]);
+
+        let rows = rows.lock().unwrap();
+        assert_eq!(rows.rows.len(), 2);
+        assert_eq!(rows.rows[0]["value"], "device description");
+        assert_eq!(rows.rows[1]["oid"], "1.3.6.1.2.1.1.1.0");
+    }
+
+    #[test]
     fn converts_status_os_and_snmp_values() {
         assert_eq!(status(1), "up");
         assert_eq!(status(3), "testing");

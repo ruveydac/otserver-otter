@@ -1593,6 +1593,49 @@ mod tests {
         std::fs::remove_dir(directory).unwrap();
     }
 
+    #[test]
+    fn update_cleanup_reports_artifacts_that_cannot_be_removed() {
+        let id = format!("cleanup-{}", uuid::Uuid::new_v4());
+        let directory = std::env::temp_dir().join(format!(
+            "otter-update-cleanup-error-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let blocked = directory.join(format!("update-{id}.bin"));
+        std::fs::create_dir(&blocked).unwrap();
+
+        assert!(!cleanup_update_artifacts(&directory, &id));
+        assert!(blocked.is_dir());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_update_file_helpers_verify_hash_and_report_chmod_failure() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("otter-update-open-file-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("candidate");
+        std::fs::write(&path, b"unsigned candidate").unwrap();
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).mode(0o600);
+        let file = options.open(&path).unwrap();
+
+        assert!(verify_open_file(&file).is_err());
+        assert_eq!(
+            digest_open_file(&file).unwrap(),
+            format!("{:x}", Sha256::digest(b"unsigned candidate"))
+        );
+        let proc_file = File::open("/proc/self/status").unwrap();
+        assert!(set_executable_permissions(&proc_file).is_err());
+
+        drop(file);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_update_replacement_keeps_a_recoverable_previous_file() {

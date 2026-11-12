@@ -1593,6 +1593,47 @@ mod tests {
     }
 
     #[test]
+    fn adapter_enumeration_rejects_invalid_size_and_retry_responses() {
+        assert_eq!(
+            adapter_addresses_buffer(|_, size| {
+                *size = 0;
+                0
+            }),
+            Err(0)
+        );
+        assert_eq!(
+            adapter_addresses_buffer(|_, size| {
+                *size = 8;
+                5
+            }),
+            Err(5)
+        );
+        assert_eq!(
+            adapter_addresses_buffer(|buffer, size| {
+                if buffer.is_null() {
+                    *size = 8;
+                    111
+                } else {
+                    *size = 0;
+                    111
+                }
+            }),
+            Err(111)
+        );
+        assert_eq!(
+            adapter_addresses_buffer(|buffer, size| {
+                if buffer.is_null() {
+                    *size = 8;
+                    111
+                } else {
+                    5
+                }
+            }),
+            Err(5)
+        );
+    }
+
+    #[test]
     fn windows_adapter_lookup_accepts_case_insensitive_names_and_guids() {
         let interface = CaptureInterface {
             name: "{8D11417D-4D16-4D5B-9917-C30CF60DF212}".into(),

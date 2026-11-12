@@ -2628,6 +2628,125 @@ mod tests {
     }
 
     #[test]
+    fn rpc_fragment_collection_rejects_mismatches_and_bounded_overflow() {
+        let header = RpcHeader::new(
+            2,
+            0x04,
+            false,
+            endpoint(false).object_uuid,
+            endpoint(false).interface_uuid,
+            endpoint(false).activity_uuid,
+            1,
+            7,
+            5,
+            0,
+        )
+        .unwrap();
+        let mut fragments = vec![(header.clone(), vec![1])];
+        assert!(
+            push_rpc_fragment(
+                &mut fragments,
+                RpcHeader {
+                    operation: header.operation + 1,
+                    fragment_number: 1,
+                    ..header.clone()
+                },
+                vec![2],
+            )
+            .unwrap_err()
+            .contains("one request")
+        );
+        assert!(
+            push_rpc_fragment(
+                &mut Vec::new(),
+                header.clone(),
+                vec![0; MAX_RPC_BODY_LENGTH + 1],
+            )
+            .unwrap_err()
+            .contains("reassembly size")
+        );
+        assert!(
+            push_rpc_fragment(
+                &mut Vec::new(),
+                RpcHeader {
+                    packet_type: 3,
+                    ..header.clone()
+                },
+                vec![],
+            )
+            .is_err()
+        );
+
+        assert!(
+            reassemble_rpc_fragments(vec![(header, vec![]); MAX_RPC_FRAGMENTS + 1])
+                .unwrap_err()
+                .contains("fragment count")
+        );
+    }
+
+    #[test]
+    fn rpc_fragment_completion_rejects_empty_duplicate_and_inconsistent_sequences() {
+        assert!(!rpc_fragments_complete(&[]));
+        let fragmented = RpcHeader::new(
+            2,
+            0x04,
+            false,
+            endpoint(false).object_uuid,
+            endpoint(false).interface_uuid,
+            endpoint(false).activity_uuid,
+            1,
+            7,
+            5,
+            0,
+        )
+        .unwrap();
+        let plain = RpcHeader {
+            flags: 0,
+            ..fragmented.clone()
+        };
+        assert!(rpc_fragments_complete(&[(plain.clone(), vec![])]));
+        assert!(!rpc_fragments_complete(&[(
+            RpcHeader {
+                fragment_number: 1,
+                ..plain
+            },
+            vec![]
+        )]));
+        assert!(!rpc_fragments_complete(&[
+            (fragmented.clone(), vec![]),
+            (fragmented.clone(), vec![]),
+        ]));
+        assert!(!rpc_fragments_complete(&[
+            (fragmented.clone(), vec![]),
+            (
+                RpcHeader {
+                    flags: 0,
+                    fragment_number: 1,
+                    ..fragmented.clone()
+                },
+                vec![]
+            ),
+        ]));
+        assert!(!rpc_fragments_complete(&[
+            (
+                RpcHeader {
+                    flags: 0x06,
+                    ..fragmented.clone()
+                },
+                vec![]
+            ),
+            (
+                RpcHeader {
+                    flags: 0x06,
+                    fragment_number: 1,
+                    ..fragmented
+                },
+                vec![]
+            ),
+        ]));
+    }
+
+    #[test]
     fn epm_without_a_pnio_endpoint_uses_continuation_then_fails_closed() {
         let mut epm_calls = 0;
         let error = read_records(

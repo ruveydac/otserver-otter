@@ -765,7 +765,6 @@ fn output_path_key(path: &Path) -> Result<PathBuf, String> {
     let mut normalized = PathBuf::new();
     for component in absolute.components() {
         match component {
-            Component::CurDir => {}
             Component::ParentDir => {
                 if normalized.file_name().is_some() {
                     normalized.pop();
@@ -2919,6 +2918,14 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn output_path_keys_normalize_current_and_parent_components() {
+        assert_eq!(
+            output_path_key(Path::new("./nested/../same-output.json")).unwrap(),
+            output_path_key(Path::new("same-output.json")).unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn batch_continues_after_scan_failure() {
         let configs = vec![
@@ -5027,6 +5034,23 @@ mod tests {
             std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn atomic_config_save_cleans_staging_files_after_destination_errors() {
+        let directory = std::env::temp_dir().join(format!("otter-config-error-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let destination = directory.join("otter.json");
+        std::fs::create_dir(&destination).unwrap();
+
+        assert!(write_config_atomic(&destination, b"{\"targets\":[]}").is_err());
+        assert!(destination.is_dir());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+
+        let missing_parent = directory.join("missing/otter.json");
+        assert!(write_config_atomic(&missing_parent, b"{}").is_err());
+        assert!(!missing_parent.parent().unwrap().exists());
         std::fs::remove_dir_all(directory).unwrap();
     }
 

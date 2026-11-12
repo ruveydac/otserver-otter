@@ -1747,6 +1747,7 @@ mod tests {
 
         crate::LogOutput::write(&logger, "scan started".into());
         crate::LogOutput::devices(&logger, "Line A", std::slice::from_ref(&device));
+        crate::LogOutput::device(&logger, "Line A", &device);
 
         assert!(
             matches!(receiver.recv().unwrap(), ScanMessage::Log(message) if message == "scan started")
@@ -1758,6 +1759,10 @@ mod tests {
             }
             _ => panic!("expected device snapshot"),
         }
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ScanMessage::Device(snapshot) if snapshot.mac_address == device.mac_address
+        ));
     }
 
     #[test]
@@ -2294,6 +2299,13 @@ mod tests {
             }]))
             .unwrap();
         sender
+            .send(ScanMessage::Device(Device {
+                mac_address: "00:11:22:33:44:55".into(),
+                ip_addresses: vec!["192.0.2.11".into()],
+                ..Device::default()
+            }))
+            .unwrap();
+        sender
             .send(ScanMessage::Finished(crate::BatchResult {
                 completed: 1,
                 cancelled: true,
@@ -2306,6 +2318,7 @@ mod tests {
         let _ = context.run(eframe::egui::RawInput::default(), |ctx| app.update_ui(ctx));
 
         assert_eq!(app.assets.len(), 1);
+        assert_eq!(app.assets[0].ip_addresses, ["192.0.2.11"]);
         assert!(app.selected_asset.is_none());
         assert!(app.log_text.contains("capture started"));
         assert!(!app.is_scanning);

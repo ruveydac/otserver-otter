@@ -613,6 +613,49 @@ async fn polling_retries_connection_loss_every_five_minutes_and_recovers() {
 }
 
 #[tokio::test]
+async fn idle_poll_retries_failed_update_cleanup_and_clears_completed_ids() {
+    let (mut api, task) = server(vec![(
+        200,
+        json!({"action":"idle", "retryAfterSeconds":30}),
+    )])
+    .await;
+    let store = PrivateStore::new();
+    let mut state = State {
+        scanner: Some(scanner()),
+        credential_expires_at: credential().credential_expires_at,
+        ..State::default()
+    };
+    let blocked = store.get().path().join("update-update-blocked.bin");
+    std::fs::create_dir(&blocked).unwrap();
+    store
+        .get()
+        .save_update_state(&UpdateState {
+            pending: Some(PendingUpdate {
+                id: "update-blocked".into(),
+                version: "v0.15.0".into(),
+                target: otserver_otter::update::BUILD_TARGET.into(),
+                binary_digest: "a".repeat(64),
+                binary_size: 313,
+                previous_version: "v0.14.0".into(),
+                previous_digest: "b".repeat(64),
+            }),
+            cleanup_helpers: vec!["update-finished".into()],
+            ..UpdateState::default()
+        })
+        .unwrap();
+
+    assert_eq!(
+        poll_once(&mut api, store.get(), &mut state, 30, true).await,
+        Ok(Duration::from_secs(30))
+    );
+    let update_state = store.get().load_update_state().unwrap();
+    assert!(update_state.pending.is_none());
+    assert_eq!(update_state.cleanup_helpers, ["update-blocked"]);
+    assert!(blocked.is_dir());
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn polling_retries_an_offline_controller_without_losing_retained_work() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -1247,6 +1290,10 @@ fn update_launch_failure_includes_the_operating_system_cause() {
         error.to_string(),
         "Could not prepare or start the verified Otter update helper: Access is denied (os error 5)"
     );
+    assert_eq!(
+        Error::NotFound.to_string(),
+        "Queued import no longer exists on the controller."
+    );
 }
 
 #[cfg(unix)]
@@ -1353,7 +1400,7 @@ fn pending_update_confirmation_requires_version_target_and_digest_then_queues_cl
         previous_digest: "b".repeat(64),
     };
     let mut state = UpdateState {
-        pending: Some(pending),
+        pending: Some(pending.clone()),
         ..UpdateState::default()
     };
 
@@ -1372,6 +1419,20 @@ fn pending_update_confirmation_requires_version_target_and_digest_then_queues_cl
     ));
     assert!(state.pending.is_none());
     assert_eq!(state.version_floor.as_deref(), Some("v0.15.0"));
+    assert_eq!(state.cleanup_helpers, ["update-confirm"]);
+    assert!(!confirm_pending_update(
+        &mut UpdateState::default(),
+        "v0.15.0",
+        otserver_otter::update::BUILD_TARGET,
+        &"a".repeat(64),
+    ));
+    state.pending = Some(pending);
+    assert!(confirm_pending_update(
+        &mut state,
+        "v0.15.0",
+        otserver_otter::update::BUILD_TARGET,
+        &"a".repeat(64),
+    ));
     assert_eq!(state.cleanup_helpers, ["update-confirm"]);
 }
 
