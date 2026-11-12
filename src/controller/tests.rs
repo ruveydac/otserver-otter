@@ -725,6 +725,35 @@ async fn enrollment_decodes_credentials_without_logging_response_contents() {
 }
 
 #[tokio::test]
+async fn enrollment_connection_failure_explains_network_checks_and_token_reuse() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let mut private = PrivateStore::new();
+    private.store.take();
+    let args = controller_args(&[
+        "--server-url",
+        &server_url,
+        "--state-dir",
+        private.path.to_str().unwrap(),
+        "--enroll",
+        "--enroll-only",
+    ]);
+
+    let error = match initialize(&args, Some(&"t".repeat(43))).await {
+        Err(error) => error,
+        Ok(_) => panic!("enrollment unexpectedly succeeded"),
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "Enrollment could not complete because the controller connection or response failed. Check the controller URL, network, DNS, proxy, and TLS settings. If OTserver received the request, create a new single-use token before retrying."
+    );
+    assert!(private.log().contains("Connection failed; check DNS"));
+    assert!(!private.log().contains(&"t".repeat(43)));
+}
+
+#[tokio::test]
 async fn errors_redact_server_bodies_and_classify_auth_and_retry() {
     let (api, task) = server(vec![
         (401, json!({"password":"do-not-log"})),
@@ -1147,6 +1176,77 @@ fn file_credentials_and_assignment_survive_atomic_state_replacement() {
 fn state_lock_prevents_duplicate_agent_processes() {
     let store = PrivateStore::new();
     assert!(store::Store::open(Some(store.path.clone())).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "child process used by windows_lock_file_is_removed_after_its_holder_is_killed"]
+fn lock_holder_child_process() {
+    let Some(directory) = std::env::var_os("OTTER_LOCK_HOLDER_DIRECTORY") else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    let _store = store::Store::open(Some(directory.clone())).unwrap();
+    std::fs::write(directory.join("lock-holder-ready"), b"ready").unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_lock_file_is_removed_after_its_holder_is_killed() {
+    use std::process::{Command, Stdio};
+
+    let directory = std::env::temp_dir().join(format!("otter-lock-kill-{}", uuid::Uuid::new_v4()));
+    let store = store::Store::open(Some(directory.clone())).unwrap();
+    drop(store);
+    let ready = directory.join("lock-holder-ready");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "controller::tests::lock_holder_child_process",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("OTTER_LOCK_HOLDER_DIRECTORY", &directory)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let ready_in_time = (0..200).any(|_| {
+        if ready.exists() {
+            return true;
+        }
+        if child.try_wait().unwrap().is_some() {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+        false
+    });
+    if !ready_in_time {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("lock-holder process did not acquire the state lock");
+    }
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(!directory.join("agent.lock").exists());
+    let reopened = store::Store::open(Some(directory.clone())).unwrap();
+    drop(reopened);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn update_launch_failure_includes_the_operating_system_cause() {
+    let error = Error::UpdateLaunch("Access is denied (os error 5)".into());
+
+    assert_eq!(
+        error.to_string(),
+        "Could not prepare or start the verified Otter update helper: Access is denied (os error 5)"
+    );
 }
 
 #[cfg(unix)]

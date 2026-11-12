@@ -443,6 +443,7 @@ enum Error {
     NotFound,
     Terminal,
     UpdateHandoff,
+    UpdateLaunch(String),
     Invalid,
     Local(&'static str),
 }
@@ -460,6 +461,7 @@ impl std::fmt::Display for Error {
             Self::UpdateHandoff => "The verified update helper is applying this release; the controller will restart.",
             Self::Invalid => "Controller response or configuration is invalid.",
             Self::Local(message) => message,
+            Self::UpdateLaunch(message) => return write!(f, "Could not prepare or start the verified Otter update helper: {message}"),
         })
     }
 }
@@ -1681,7 +1683,11 @@ async fn handle_update(
     }
     api.update_status(&update.id, "verified", None).await?;
     api.update_status(&update.id, "installing", None).await?;
-    if install::launch_update(store.path(), &update.id, std::process::id()).is_err() {
+    if let Err(error) = install::launch_update(store.path(), &update.id, std::process::id()) {
+        store.log.error(&format!(
+            "Update {} helper launch failed: {error}",
+            update.id
+        ));
         fail_update(
             api,
             store,
@@ -1691,9 +1697,7 @@ async fn handle_update(
             true,
         )
         .await?;
-        return Err(Error::Local(
-            "Could not start the verified Otter update helper.",
-        ));
+        return Err(Error::UpdateLaunch(error));
     }
     Err(Error::UpdateHandoff)
 }
@@ -1908,7 +1912,7 @@ async fn initialize_in_store(
         enrollment_request["token"] = json!(token);
         let enrollment: Enrollment = api.post("api/otter/v1/enroll", enrollment_request).await
             .map_err(|error| if error == Error::Retry {
-                Error::Local("Could not complete enrollment. Check the controller connection and retry; request a new token if the server already consumed it.")
+                Error::Local("Enrollment could not complete because the controller connection or response failed. Check the controller URL, network, DNS, proxy, and TLS settings. If OTserver received the request, create a new single-use token before retrying.")
             } else { error })?;
         validate_credential(&enrollment.credential)?;
         if !valid_id(&enrollment.scanner.id) || !valid_id(&enrollment.scanner.site) {

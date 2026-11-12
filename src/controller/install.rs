@@ -43,6 +43,12 @@ pub(super) fn cleanup_update_artifacts(directory: &Path, id: &str) -> bool {
                 complete = false;
             }
         }
+        let helper = windows_update_helper_path(&executable, id);
+        if let Err(error) = std::fs::remove_file(helper)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            complete = false;
+        }
     }
     complete
 }
@@ -369,22 +375,36 @@ pub(super) fn launch_update(directory: &Path, id: &str, parent_pid: u32) -> Resu
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
 pub(super) fn launch_update(directory: &Path, id: &str, parent_pid: u32) -> Result<(), String> {
     launch_windows_update(directory, id, parent_pid)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
+pub(super) fn launch_update(_: &Path, _: &str, _: u32) -> Result<(), String> {
+    Err("Managed Otter updates support Linux and Windows.".into())
+}
+
+#[cfg(windows)]
+fn windows_update_helper_path(executable: &Path, id: &str) -> PathBuf {
+    executable.with_file_name(format!("otserver-otter-update-{id}.helper.exe"))
+}
+
+#[cfg(windows)]
 fn launch_windows_update(directory: &Path, id: &str, parent_pid: u32) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
     if !super::valid_id(id) {
         return Err("Invalid update identifier.".into());
     }
     let source = std::env::current_exe().map_err(|_| "Could not locate the running executable.")?;
-    if std::fs::canonicalize(&source).ok() != std::fs::canonicalize(installed_executable()?).ok() {
+    let executable = installed_executable()?;
+    if std::fs::canonicalize(&source).ok() != std::fs::canonicalize(&executable).ok() {
         return Err("Managed updates require the installed Otter controller; run controller --install first.".into());
     }
     otserver_otter::update::verify_binary(&source, otserver_otter::update::BUILD_TARGET)?;
-    let helper = directory.join(format!("update-{id}.updater.exe"));
+    // Windows may forbid executing files from some operator-selected state directories.
+    let helper = windows_update_helper_path(&executable, id);
     copy_executable(&source, &helper)?;
     Command::new(helper)
         .args([
@@ -399,9 +419,10 @@ fn launch_windows_update(directory: &Path, id: &str, parent_pid: u32) -> Result<
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
         .spawn()
         .map(|_| ())
-        .map_err(|_| "Could not start the verified Windows update helper.".to_owned())
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -1663,6 +1684,19 @@ mod tests {
         }
         copy_executable(&std::fs::canonicalize(&destination).unwrap(), &destination).unwrap();
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn update_helper_is_staged_beside_the_installed_executable() {
+        let executable = Path::new("C:/Users/scanner/Programs/OTserver Otter/otserver-otter.exe");
+        let helper = windows_update_helper_path(executable, "id1");
+
+        assert_eq!(helper.parent(), executable.parent());
+        assert_eq!(
+            helper.file_name().and_then(|name| name.to_str()),
+            Some("otserver-otter-update-id1.helper.exe")
+        );
     }
 
     #[test]

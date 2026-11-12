@@ -38,6 +38,16 @@ impl Store {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                DELETE, FILE_FLAG_DELETE_ON_CLOSE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+            };
+            options
+                .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE)
+                .custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+        }
         let lock = options
             .open(directory.join("agent.lock"))
             .map_err(|_| Error::Local("Could not open managed scanner lock."))?;
