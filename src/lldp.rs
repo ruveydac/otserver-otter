@@ -267,7 +267,8 @@ fn capture(
     cancelled: &AtomicBool,
     mut on_frame: impl FnMut(&[u8]),
 ) -> Result<(), String> {
-    crate::profinet::npcap::capture_passive(interface, wait, cancelled, |frame| {
+    let selected = crate::profinet::windows_scan_interface(interface)?;
+    crate::profinet::npcap::capture_passive(&selected.name, wait, cancelled, |frame| {
         on_frame(frame);
         Ok(())
     })

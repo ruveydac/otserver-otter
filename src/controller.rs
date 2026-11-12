@@ -1,7 +1,7 @@
 //! Outbound controller v1 client. Local scans still use the shared safety/pacing path.
 mod install;
 mod log;
-mod store;
+pub(crate) mod store;
 #[cfg(test)]
 mod tests;
 
@@ -397,6 +397,8 @@ struct UpdateState {
     failed: Option<String>,
     #[serde(default)]
     failed_reason: Option<UpdateFailureReason>,
+    #[serde(default)]
+    cleanup_helpers: Vec<String>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -438,8 +440,10 @@ enum Error {
     UploadRetriesExhausted,
     Auth,
     Forbidden,
+    NotFound,
     Terminal,
     UpdateHandoff,
+    UpdateLaunch(String),
     Invalid,
     Local(&'static str),
 }
@@ -452,10 +456,12 @@ impl std::fmt::Display for Error {
             Self::UploadRetriesExhausted => "Scan result upload failed after the initial attempt and 5 retries. Local scan result retained.",
             Self::Auth => "Scanner credential is expired or not accepted. Verify --server-url, OS account, and --state-dir; re-enroll if the controller revoked it.",
             Self::Forbidden => "Controller denied this operation (HTTP 403). The scanner credential may still be valid; check server-side permissions and logs.",
+            Self::NotFound => "Queued import no longer exists on the controller.",
             Self::Terminal => "Run is no longer active; local results retained.",
             Self::UpdateHandoff => "The verified update helper is applying this release; the controller will restart.",
             Self::Invalid => "Controller response or configuration is invalid.",
             Self::Local(message) => message,
+            Self::UpdateLaunch(message) => return write!(f, "Could not prepare or start the verified Otter update helper: {message}"),
         })
     }
 }
@@ -592,6 +598,25 @@ impl Api {
         path: &str,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, Error> {
+        self.send_with_missing(method, path, request, false).await
+    }
+
+    async fn send_import_status(
+        &self,
+        method: &str,
+        path: &str,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, Error> {
+        self.send_with_missing(method, path, request, true).await
+    }
+
+    async fn send_with_missing(
+        &self,
+        method: &str,
+        path: &str,
+        request: reqwest::RequestBuilder,
+        missing_import: bool,
+    ) -> Result<reqwest::Response, Error> {
         let response = request.send().await.map_err(|error| {
             let reason = if error.is_timeout() {
                 "Request timed out; check connectivity and controller load."
@@ -616,6 +641,10 @@ impl Api {
                 Error::Forbidden,
                 "Operation denied. The credential may still be valid; check server-side permissions and management logs.",
             ),
+            404 if missing_import => (
+                Error::NotFound,
+                "Queued import no longer exists; remaining import statuses will still be checked.",
+            ),
             404 | 409 | 410 => (
                 Error::Terminal,
                 "Assignment or resource is unavailable or no longer active; local results are retained.",
@@ -630,7 +659,7 @@ impl Api {
             ),
         };
         let message = format!("{method} /{path}: HTTP {}. {reason}", status.as_u16());
-        if matches!(error, Error::Retry | Error::Terminal) {
+        if matches!(error, Error::Retry | Error::NotFound | Error::Terminal) {
             self.log.warn(&message);
         } else {
             self.log.error(&message);
@@ -1372,10 +1401,19 @@ async fn execute(
 }
 
 async fn imports(api: &Api, store: &store::Store, state: &mut State) -> Result<(), Error> {
-    for index in 0..state.pending_imports.len() {
+    let mut index = 0;
+    while index < state.pending_imports.len() {
         let path = format!("api/asset-imports/{}", state.pending_imports[index].id);
         let request = api.request(reqwest::Method::GET, &path)?;
-        let response = api.send("GET", &path, request).await?;
+        let response = match api.send_import_status("GET", &path, request).await {
+            Ok(response) => response,
+            Err(Error::NotFound) => {
+                state.pending_imports.remove(index);
+                save(store, state)?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let mut document: crate::ImportDocument = api.decode("GET", &path, response).await?;
         if document.status == "failed" && state.pending_imports[index].retries == 0 {
             store.log.warn(&format!("Import {} failed processing; requesting its single queued retry without re-uploading.", state.pending_imports[index].id));
@@ -1406,6 +1444,7 @@ async fn imports(api: &Api, store: &store::Store, state: &mut State) -> Result<(
             store.log.error(&format!("Import {} failed processing after its queued retry. Check the import details in OTserver; no further automatic retry.", state.pending_imports[index].id));
         }
         state.pending_imports[index].status = document.status;
+        index += 1;
     }
     state
         .pending_imports
@@ -1644,7 +1683,11 @@ async fn handle_update(
     }
     api.update_status(&update.id, "verified", None).await?;
     api.update_status(&update.id, "installing", None).await?;
-    if install::launch_update(store.path(), &update.id, std::process::id()).is_err() {
+    if let Err(error) = install::launch_update(store.path(), &update.id, std::process::id()) {
+        store.log.error(&format!(
+            "Update {} helper launch failed: {error}",
+            update.id
+        ));
         fail_update(
             api,
             store,
@@ -1654,32 +1697,46 @@ async fn handle_update(
             true,
         )
         .await?;
-        return Err(Error::Local(
-            "Could not start the verified Otter update helper.",
-        ));
+        return Err(Error::UpdateLaunch(error));
     }
     Err(Error::UpdateHandoff)
 }
 
 fn confirm_local_update(store: &store::Store) -> Result<(), Error> {
     let mut state = store.load_update_state()?;
-    let Some(pending) = state.pending.as_ref() else {
+    if state.pending.is_none() {
         return Ok(());
-    };
+    }
     let executable = std::env::current_exe().map_err(|_| Error::Invalid)?;
     let verified =
         otserver_otter::update::verify_binary(&executable, otserver_otter::update::BUILD_TARGET)
             .map_err(|_| Error::Invalid)?;
-    if verified.version() != pending.version
-        || verified.target() != pending.target
-        || current_binary_digest()? != pending.binary_digest
-    {
+    let digest = current_binary_digest()?;
+    if !confirm_pending_update(&mut state, verified.version(), verified.target(), &digest) {
         return Ok(());
+    }
+    store.save_update_state(&state)?;
+    Ok(())
+}
+
+fn confirm_pending_update(
+    state: &mut UpdateState,
+    version: &str,
+    target: &str,
+    digest: &str,
+) -> bool {
+    let Some(pending) = state.pending.as_ref() else {
+        return false;
+    };
+    if version != pending.version || target != pending.target || digest != pending.binary_digest {
+        return false;
+    }
+    if !state.cleanup_helpers.contains(&pending.id) {
+        state.cleanup_helpers.push(pending.id.clone());
     }
     state.version_floor = Some(pending.version.clone());
     state.pending = None;
-    store.save_update_state(&state)?;
-    Ok(())
+    true
 }
 
 pub async fn run(args: ControllerArgs) -> Result<(), String> {
@@ -1693,9 +1750,20 @@ pub async fn run(args: ControllerArgs) -> Result<(), String> {
             args.parent_pid.ok_or("Missing controller process ID.")?,
         );
     }
+    #[cfg(windows)]
+    let state_directory = args.state_dir.clone();
     match run_inner(args).await {
         Err(Error::UpdateHandoff) => Ok(()),
-        Err(error) => Err(error.to_string()),
+        Err(error) => {
+            #[cfg(windows)]
+            if let Ok(directory) = store::Store::directory(state_directory)
+                && let Ok(state) = store::Store::read_update_state(&directory)
+                && let Some(pending) = state.pending
+            {
+                let _ = install::recover_windows_update(&directory, &pending.id);
+            }
+            Err(error.to_string())
+        }
         Ok(()) => Ok(()),
     }
 }
@@ -1789,10 +1857,8 @@ async fn initialize_in_store(
         Some(base) => base,
         None => base_url(&state.server_url)?,
     };
-    if !state.server_url.is_empty()
-        && state.server_url != base.as_str()
-        && !(args.enroll && args.overwrite_state_dir)
-    {
+    let taking_over = !state.server_url.is_empty() && state.server_url != base.as_str();
+    if !state.server_url.is_empty() && taking_over && !(args.enroll && args.overwrite_state_dir) {
         return Err(Error::Local(
             "State directory belongs to a different controller URL. To replace its saved enrollment and run state, re-enroll with --enroll --overwrite-state-dir. Retained scan exports will be kept.",
         ));
@@ -1846,11 +1912,14 @@ async fn initialize_in_store(
         enrollment_request["token"] = json!(token);
         let enrollment: Enrollment = api.post("api/otter/v1/enroll", enrollment_request).await
             .map_err(|error| if error == Error::Retry {
-                Error::Local("Could not complete enrollment. Check the controller connection and retry; request a new token if the server already consumed it.")
+                Error::Local("Enrollment could not complete because the controller connection or response failed. Check the controller URL, network, DNS, proxy, and TLS settings. If OTserver received the request, create a new single-use token before retrying.")
             } else { error })?;
         validate_credential(&enrollment.credential)?;
         if !valid_id(&enrollment.scanner.id) || !valid_id(&enrollment.scanner.site) {
             return Err(Error::Invalid);
+        }
+        if taking_over {
+            store.clear_update_state()?;
         }
         state.server_url = api.base.to_string();
         state.scanner = Some(enrollment.scanner);
@@ -1955,12 +2024,21 @@ async fn poll_once(
                     run.phase = Phase::Terminal;
                 }
                 let mut update_state = store.load_update_state()?;
+                let mut update_state_changed = false;
                 if let Some(pending) = update_state.pending.take() {
-                    for suffix in ["bin", "updater.exe"] {
-                        if let Ok(path) = store.update_path(&pending.id, suffix) {
-                            let _ = std::fs::remove_file(path);
-                        }
+                    if !install::cleanup_update_artifacts(store.path(), &pending.id) {
+                        update_state.cleanup_helpers.push(pending.id);
                     }
+                    update_state_changed = true;
+                }
+                for id in std::mem::take(&mut update_state.cleanup_helpers) {
+                    if !install::cleanup_update_artifacts(store.path(), &id) {
+                        update_state.cleanup_helpers.push(id);
+                    } else {
+                        update_state_changed = true;
+                    }
+                }
+                if update_state_changed {
                     store.save_update_state(&update_state)?;
                 }
                 imports(api, store, state).await?;

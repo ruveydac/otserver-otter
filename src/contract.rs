@@ -315,6 +315,10 @@ pub fn validate(scan: &ScanExport) -> Result<(), String> {
         }
     }
     let value = serde_json::to_value(scan).map_err(|error| error.to_string())?;
+    validate_json(&value)
+}
+
+pub fn validate_json(value: &Value) -> Result<(), String> {
     let schema: Value =
         serde_json::from_str(include_str!("../contracts/otserver-scan-v2.schema.json"))
             .map_err(|error| format!("Invalid canonical scan schema: {error}"))?;
@@ -323,9 +327,9 @@ pub fn validate(scan: &ScanExport) -> Result<(), String> {
         .build(&schema)
         .map_err(|error| format!("Invalid canonical scan schema: {error}"))?;
     validator
-        .validate(&value)
+        .validate(value)
         .map_err(|error| format!("Scan export does not match the canonical schema: {error}"))?;
-    reject_secrets(&value, "")
+    reject_secrets(value, "")
 }
 
 fn reject_secrets(value: &Value, path: &str) -> Result<(), String> {
@@ -492,6 +496,21 @@ mod tests {
                 .unwrap();
         let error = validate(&invalid).unwrap_err();
         assert!(error.contains("canonical schema") && error.contains("uuid"));
+    }
+
+    #[test]
+    fn validates_original_json_before_deserialization_can_drop_unknown_fields() {
+        let mut raw: Value =
+            serde_json::from_str(include_str!("../contracts/otserver-scan-v2-valid.json")).unwrap();
+        raw["unexpected"] = json!(true);
+        let lossy: ScanExport = serde_json::from_value(raw.clone()).unwrap();
+
+        assert!(validate(&lossy).is_ok());
+        assert!(
+            validate_json(&raw)
+                .unwrap_err()
+                .contains("canonical schema")
+        );
     }
 
     #[test]

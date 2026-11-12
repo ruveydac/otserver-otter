@@ -4,16 +4,18 @@ pub mod gui;
 use clap::{ArgAction, Args, Parser, Subcommand};
 use otserver_otter::contract::{
     Device, InterfaceRef, ScanExport, ScanInfo, ScannerInfo, Source, merge_devices,
-    unique_ip_identities, validate,
+    unique_ip_identities, validate, validate_json,
 };
 use otserver_otter::{discovery, profinet, protocols, snmp};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -27,6 +29,8 @@ pub trait LogOutput: Send + Sync {
     }
 
     fn devices(&self, _configuration: &str, _devices: &[Device]) {}
+
+    fn device(&self, _configuration: &str, _device: &Device) {}
 
     // Managed logs use these credential-safe categories instead of arbitrary probe text.
     fn diagnostic(&self, _protocol: &str, _status: &str, _code: &str) {}
@@ -504,6 +508,7 @@ async fn run_cli_with_configs(
                         .into(),
                 );
             }
+            validate_json(&value)?;
             let scan: ScanExport =
                 serde_json::from_value(value).map_err(|error| error.to_string())?;
             validate(&scan)?;
@@ -584,11 +589,129 @@ pub fn save_config_sync(configs: &ScannerConfigs) -> Result<(), String> {
     let path = get_config_path()?;
     let data = serde_json::to_vec_pretty(configs)
         .map_err(|error| format!("Could not serialize config: {error}"))?;
-    std::fs::write(&path, data)
-        .map_err(|error| format!("Could not write {}: {error}", path.display()))
+    write_config_atomic(&path, &data)
+}
+
+fn write_config_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let temporary = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("otter.json"),
+        Uuid::new_v4()
+    ));
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
+        #[cfg(windows)]
+        crate::controller::store::restrict_windows_file(&temporary)
+            .map_err(|error| format!("Could not secure {}: {error}", path.display()))?;
+        file.write_all(data)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
+        drop(file);
+        replace_config_file(&temporary, path)
+            .map_err(|error| format!("Could not write {}: {error}", path.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: both arguments are valid, nul-terminated UTF-16 paths.
+    let status = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if status == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_config_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    replace_file(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_config_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    match destination.symlink_metadata() {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            crate::controller::store::restrict_windows_file(destination).map_err(|message| {
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, message)
+            })?;
+            let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+            let destination: Vec<u16> = destination
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            // SAFETY: both paths are valid, nul-terminated UTF-16; ReplaceFileW preserves the
+            // destination security descriptor while replacing its contents.
+            let status = unsafe {
+                ReplaceFileW(
+                    destination.as_ptr(),
+                    source.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            };
+            if status == 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "configuration destination must be a regular file",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            replace_file(source, destination)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub fn parse_config(data: &[u8]) -> Result<ScannerConfigs, String> {
+    let data = data.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(data);
     let configs: ScannerConfigs =
         serde_json::from_slice(data).map_err(|error| error.to_string())?;
     configs.validate()?;
@@ -607,7 +730,8 @@ pub fn prepare_scans(
     for (name, config) in configs {
         match resolve_scan(args.clone(), config, environment_api_key.clone()) {
             Ok(options) => {
-                if let Some(existing) = outputs.insert(options.output.clone(), name.clone()) {
+                let output_key = output_path_key(&options.output)?;
+                if let Some(existing) = outputs.insert(output_key, name.clone()) {
                     return Err(format!(
                         "Configurations {existing:?} and {name:?} resolve to the same output path {}.",
                         options.output.display()
@@ -627,6 +751,54 @@ pub fn prepare_scans(
         });
     }
     Ok((scans, failures))
+}
+
+fn output_path_key(path: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("Could not resolve output path: {error}"))?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::ParentDir => {
+                if normalized.file_name().is_some() {
+                    normalized.pop();
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    if let Ok(canonical) = std::fs::canonicalize(&normalized) {
+        #[cfg(windows)]
+        return Ok(PathBuf::from(canonical.to_string_lossy().to_lowercase()));
+        #[cfg(not(windows))]
+        return Ok(canonical);
+    }
+    let mut existing = normalized.as_path();
+    let mut suffix = Vec::<OsString>::new();
+    while !existing.exists() {
+        let name = existing
+            .file_name()
+            .ok_or_else(|| format!("Could not resolve output path {}.", path.display()))?;
+        suffix.push(name.to_owned());
+        existing = existing
+            .parent()
+            .ok_or_else(|| format!("Could not resolve output path {}.", path.display()))?;
+    }
+    let mut key = std::fs::canonicalize(existing)
+        .map_err(|error| format!("Could not resolve output path: {error}"))?;
+    for name in suffix.into_iter().rev() {
+        key.push(name);
+    }
+    #[cfg(windows)]
+    return Ok(PathBuf::from(key.to_string_lossy().to_lowercase()));
+    #[cfg(not(windows))]
+    Ok(key)
 }
 
 pub fn resolve_scan(
@@ -2254,6 +2426,7 @@ fn apply_snmp_probe(
         incomplete = true;
     }
     links.append(&mut result.links);
+    let updated_mac = result.identity_mac.clone();
     if let Some(mac) = result.identity_mac {
         if let Some(device) = devices.iter_mut().find(|device| device.mac_address == mac) {
             device.ip_addresses.push(ip);
@@ -2275,7 +2448,11 @@ fn apply_snmp_probe(
     } else if let Some(observation) = result.observation {
         unresolved.push(observation);
     }
-    logger.devices(configuration, devices);
+    if let Some(mac) = updated_mac
+        && let Some(device) = devices.iter().find(|device| device.mac_address == mac)
+    {
+        logger.device(configuration, device);
+    }
     incomplete
 }
 
@@ -2359,26 +2536,44 @@ fn apply_probe(
     {
         device.observations.append(&mut result.observations);
         device.ports.append(&mut result.ports);
+        logger.device(configuration, device);
     } else {
         unresolved.append(&mut result.observations);
     }
-    logger.devices(configuration, devices);
     failed
 }
 
 async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let temporary = path.with_extension(format!(
-        "{}.tmp",
-        path.extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("json")
+    let filename = path
+        .file_name()
+        .ok_or_else(|| "Could not write export: invalid output path.".to_owned())?;
+    let temporary = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        filename.to_string_lossy(),
+        Uuid::new_v4()
     ));
-    tokio::fs::write(&temporary, bytes)
-        .await
-        .map_err(|error| format!("Could not write export: {error}"))?;
-    tokio::fs::rename(&temporary, path)
-        .await
-        .map_err(|error| format!("Could not finalize export: {error}"))
+    let result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await
+            .map_err(|error| format!("Could not write export: {error}"))?;
+        file.write_all(bytes)
+            .await
+            .map_err(|error| format!("Could not write export: {error}"))?;
+        file.sync_all()
+            .await
+            .map_err(|error| format!("Could not write export: {error}"))?;
+        drop(file);
+        replace_file(&temporary, path)
+            .map_err(|error| format!("Could not finalize export: {error}"))
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(temporary).await;
+    }
+    result
 }
 
 #[cfg(test)]
@@ -2400,6 +2595,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((configuration.to_string(), devices.len()));
+        }
+
+        fn device(&self, configuration: &str, _device: &Device) {
+            self.snapshots
+                .lock()
+                .unwrap()
+                .push((configuration.to_string(), 1));
         }
     }
 
@@ -2621,6 +2823,18 @@ mod tests {
         assert!(parse_config(br#"[{"name":"Line A"},{"name":"Line A"}]"#).is_err());
     }
 
+    #[test]
+    fn configuration_parser_accepts_a_utf8_bom() {
+        let parsed = parse_config(
+            b"\xef\xbb\xbf{\"targets\":[\"192.0.2.1\"],\"interface\":\"test\",\"sourceMac\":\"00:11:22:33:44:55\"}",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.configs()[0].targets.as_ref().unwrap()[0],
+            "192.0.2.1"
+        );
+    }
+
     fn complete_config(name: &str, target: &str, output: &str) -> ScannerConfig {
         ScannerConfig {
             name: Some(name.into()),
@@ -2682,6 +2896,34 @@ mod tests {
         cli.output = Some("same.json".into());
 
         assert!(prepare_scans(cli, configs, None).is_err());
+    }
+
+    #[test]
+    fn rejects_relative_and_absolute_batch_output_aliases() {
+        let absolute = std::env::current_dir().unwrap().join("same-output.json");
+        let configs = vec![
+            (
+                "Relative".into(),
+                complete_config("Relative", "192.0.2.1", "same-output.json"),
+            ),
+            (
+                "Absolute".into(),
+                complete_config("Absolute", "192.0.2.2", absolute.to_str().unwrap()),
+            ),
+        ];
+
+        assert!(matches!(
+            prepare_scans(args(), configs, None),
+            Err(error) if error.contains("same output path")
+        ));
+    }
+
+    #[test]
+    fn output_path_keys_normalize_current_and_parent_components() {
+        assert_eq!(
+            output_path_key(Path::new("./nested/../same-output.json")).unwrap(),
+            output_path_key(Path::new("same-output.json")).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -4018,6 +4260,32 @@ mod tests {
         assert!(!directory.exists());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn atomic_export_does_not_follow_a_predictable_temporary_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = std::env::temp_dir().join(format!("otter-export-link-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let target = directory.join("keep.txt");
+        let export = directory.join("scan.json");
+        let predictable = directory.join("scan.json.tmp");
+        std::fs::write(&target, b"keep this file").unwrap();
+        symlink(&target, &predictable).unwrap();
+
+        write_atomic(&export, b"export").await.unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep this file");
+        assert!(std::fs::symlink_metadata(&export).unwrap().is_file());
+        assert!(
+            std::fs::symlink_metadata(&predictable)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[tokio::test]
     async fn scan_reports_device_snapshots_with_the_configuration_name() {
         let output = std::env::temp_dir().join(format!("{}.json", Uuid::new_v4()));
@@ -4742,6 +5010,148 @@ mod tests {
                 .unwrap_err()
                 .starts_with("Could not write export:")
         );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_config_save_replaces_symlinks_without_overwriting_their_targets() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = std::env::temp_dir().join(format!("otter-config-link-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("otter.json");
+        let target = directory.join("credentials.json");
+        std::fs::write(&target, b"retain").unwrap();
+        symlink(&target, &path).unwrap();
+
+        write_config_atomic(&path, b"{\"targets\":[]}").unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"retain");
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"targets\":[]}");
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn atomic_config_save_cleans_staging_files_after_destination_errors() {
+        let directory = std::env::temp_dir().join(format!("otter-config-error-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let destination = directory.join("otter.json");
+        std::fs::create_dir(&destination).unwrap();
+
+        assert!(write_config_atomic(&destination, b"{\"targets\":[]}").is_err());
+        assert!(destination.is_dir());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+
+        let missing_parent = directory.join("missing/otter.json");
+        assert!(write_config_atomic(&missing_parent, b"{}").is_err());
+        assert!(!missing_parent.parent().unwrap().exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_config_save_keeps_the_current_users_private_acl() {
+        let directory = std::env::temp_dir().join(format!("otter-config-acl-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("otter.json");
+
+        write_config_atomic(&path, b"{\"apiKey\":\"first\"}").unwrap();
+        assert!(windows_file_is_private(&path));
+        write_config_atomic(&path, b"{\"apiKey\":\"second\"}").unwrap();
+
+        assert!(windows_file_is_private(&path));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"apiKey\":\"second\"}");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn windows_file_is_private(path: &Path) -> bool {
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr::{addr_of, null_mut};
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+            GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+            TOKEN_OWNER, TOKEN_USER,
+        };
+        use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+        let user = crate::controller::store::current_windows_user().unwrap();
+        let default_owner = crate::controller::store::current_windows_default_owner().unwrap();
+        let default_owner_sid = unsafe { (*default_owner.as_ptr().cast::<TOKEN_OWNER>()).Owner };
+        let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut owner = null_mut();
+        let mut acl = null_mut();
+        let mut descriptor = null_mut();
+        // SAFETY: path is NUL-terminated; output pointers are valid through LocalFree.
+        if unsafe {
+            GetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                &mut acl,
+                null_mut(),
+                &mut descriptor,
+            )
+        } != 0
+        {
+            return false;
+        }
+        let mut ace = null_mut();
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: descriptor owns the ACL/ACE; GetAce is checked before reading the ACE SID.
+        let private = unsafe {
+            !owner.is_null()
+                && (EqualSid(owner, (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid) != 0
+                    || (!default_owner_sid.is_null() && EqualSid(owner, default_owner_sid) != 0))
+                && !acl.is_null()
+                && (*acl).AceCount == 1
+                && GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) != 0
+                && control & SE_DACL_PROTECTED != 0
+                && GetAce(acl, 0, &mut ace) != 0
+                && (*ace.cast::<ACCESS_ALLOWED_ACE>()).Header.AceType == 0
+                && (*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask == FILE_ALL_ACCESS
+                && EqualSid(
+                    addr_of!((*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart)
+                        .cast_mut()
+                        .cast(),
+                    (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid,
+                ) != 0
+        };
+        // SAFETY: GetNamedSecurityInfoW allocated the descriptor for this call.
+        unsafe { LocalFree(descriptor.cast()) };
+        private
+    }
+
+    #[tokio::test]
+    async fn validate_command_rejects_fields_hidden_by_typed_deserialization() {
+        let directory = std::env::temp_dir().join(format!("otter-validate-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("scan.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../contracts/otserver-scan-v2-valid.json")).unwrap();
+        value["unexpected"] = serde_json::json!(true);
+        tokio::fs::write(&path, serde_json::to_vec(&value).unwrap())
+            .await
+            .unwrap();
+
+        let error = run_cli(Cli {
+            command: Some(Commands::Validate { file: path.clone() }),
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("canonical schema"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 

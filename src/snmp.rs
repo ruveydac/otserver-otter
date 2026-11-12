@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[cfg(not(test))]
@@ -24,6 +25,8 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(6);
 const MAX_TABLE_ROWS: usize = 512;
 const MAX_FDB_ROWS: usize = 4000;
 const MAX_V1_FDB_ROWS: usize = 128;
+const MAX_PARTIAL_RESPONSE_ROWS: usize = 512;
+const MAX_PARTIAL_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
@@ -289,7 +292,9 @@ pub async fn query_with_attempts(
     let mut attempts = Vec::with_capacity(settings.len());
     let deadline = tokio::time::Instant::now() + QUERY_TIMEOUT;
     let responded = AtomicBool::new(false);
+    let partial_rows = Arc::new(Mutex::new(PartialResponses::default()));
     let mut network_attempted = false;
+    let mut failure_outcome = "query-failed";
     let result = match tokio::time::timeout(QUERY_TIMEOUT, async {
         let mut last_error = None;
         for (index, settings) in settings.into_iter().enumerate() {
@@ -325,6 +330,7 @@ pub async fn query_with_attempts(
                     selection,
                     authentication,
                     &responded,
+                    &partial_rows,
                 ),
             )
             .await
@@ -336,12 +342,14 @@ pub async fn query_with_attempts(
                     return Ok(result);
                 }
                 Ok(Err(error)) => {
+                    failure_outcome = "query-failed";
                     if let Some(attempt) = attempts.last_mut() {
                         attempt.failure = Some(error.clone());
                     }
                     last_error = Some(error);
                 }
                 Err(_) => {
+                    failure_outcome = "query-timeout";
                     let error = format!(
                         "SNMP {target}: query exceeded its {} second version budget.",
                         attempt_timeout.as_secs()
@@ -358,17 +366,25 @@ pub async fn query_with_attempts(
     .await
     {
         Ok(Ok(result)) => Ok(result),
-        Ok(Err(message)) => Err(QueryError {
+        Ok(Err(message)) => partial_or_error(
+            target,
+            selection,
+            &partial_rows,
             message,
-            no_response: network_attempted && !responded.load(Ordering::Relaxed),
-        }),
-        Err(_) => Err(QueryError {
-            message: format!(
+            network_attempted && !responded.load(Ordering::Relaxed),
+            failure_outcome,
+        ),
+        Err(_) => partial_or_error(
+            target,
+            selection,
+            &partial_rows,
+            format!(
                 "SNMP {target}: query exceeded {} seconds.",
                 QUERY_TIMEOUT.as_secs()
             ),
-            no_response: network_attempted && !responded.load(Ordering::Relaxed),
-        }),
+            network_attempted && !responded.load(Ordering::Relaxed),
+            "query-timeout",
+        ),
     };
     (attempts, result)
 }
@@ -380,6 +396,7 @@ async fn query_inner(
     selection: QuerySelection,
     authentication: Auth,
     responded: &AtomicBool,
+    partial_rows: &Arc<Mutex<PartialResponses>>,
 ) -> Result<ResultData, String> {
     crate::traffic::wait().await;
     let client = Client::builder((target, SNMP_PORT), authentication)
@@ -397,7 +414,10 @@ async fn query_inner(
     let mut warnings = vec![];
     let mut inventory_complete = true;
     let mut lldp_complete = true;
-    let mut walks = Vec::new();
+    let mut walks = WalkOutcomes {
+        outcomes: Vec::new(),
+        partial_rows: Arc::clone(partial_rows),
+    };
     let mut bridge_mac = None;
     let mut siemens = false;
     if selection.inventory {
@@ -414,6 +434,7 @@ async fn query_inner(
                 mark_response(&error, responded);
                 format!("SNMP {target}: {error}")
             })?;
+        record_partial_rows(partial_rows, &system);
         responded.store(true, Ordering::Relaxed);
         fields.insert("ipAddress".into(), json!(target));
         fields.insert("status".into(), json!("online"));
@@ -797,7 +818,7 @@ async fn query_inner(
         raw.insert("physicalEntities".into(), physical_entities_json(&entities));
         raw.insert("entityInterfaceMappings".into(), interface_mappings.into());
         if let Some((index, entity)) = preferred_entity(&entities).filter(|_| {
-            !walks.iter().any(|walk| {
+            !walks.outcomes.iter().any(|walk| {
                 walk["oid"].as_str().is_some_and(|oid| {
                     oid == format!("{entity_root}.4") || oid == format!("{entity_root}.5")
                 }) && walk["outcome"] != "success"
@@ -1384,7 +1405,7 @@ async fn query_inner(
     let unresolved_neighbors: Vec<_> = neighbors.iter().filter(|(_, neighbor)| neighbor.chassis_mac().is_none()).map(|(index, neighbor)| json!({"index": index, "chassisSubtype": neighbor.chassis_subtype, "chassisIdHex": neighbor.chassis_id.as_deref().map(hex), "localPort": neighbor.local_port, "portSubtype": neighbor.port_subtype, "portId": neighbor.port, "name": neighbor.name, "inventory": neighbor.med})).collect();
     let has_unresolved_neighbors = !unresolved_neighbors.is_empty();
     raw.insert("unresolvedNeighbors".into(), json!(unresolved_neighbors));
-    for walk in &walks {
+    for walk in &walks.outcomes {
         if walk["outcome"] != "success" {
             if walk["oid"]
                 .as_str()
@@ -1400,7 +1421,7 @@ async fn query_inner(
             ));
         }
     }
-    raw.insert("collectionOutcomes".into(), json!(walks));
+    raw.insert("collectionOutcomes".into(), json!(walks.outcomes));
     raw.insert(
         "acquisition".into(),
         json!({"mechanism": "management-table-read"}),
@@ -1542,11 +1563,132 @@ async fn query_inner(
     })
 }
 
-async fn collect_walk<T: Transport + 'static>(
+trait WalkRecorder {
+    fn row(&mut self, value: &VarBind);
+    fn outcome(&mut self, value: serde_json::Value);
+}
+
+impl WalkRecorder for Vec<serde_json::Value> {
+    fn row(&mut self, _value: &VarBind) {}
+
+    fn outcome(&mut self, value: serde_json::Value) {
+        self.push(value);
+    }
+}
+
+struct WalkOutcomes {
+    outcomes: Vec<serde_json::Value>,
+    partial_rows: Arc<Mutex<PartialResponses>>,
+}
+
+#[derive(Default)]
+struct PartialResponses {
+    rows: Vec<serde_json::Value>,
+    bytes: usize,
+    truncated: bool,
+}
+
+impl PartialResponses {
+    fn push(&mut self, row: serde_json::Value) {
+        if self.truncated || self.rows.len() == MAX_PARTIAL_RESPONSE_ROWS {
+            self.truncated = true;
+            return;
+        }
+        let size = serde_json::to_vec(&row).map_or(usize::MAX, |encoded| encoded.len());
+        if self.bytes.saturating_add(size) > MAX_PARTIAL_RESPONSE_BYTES {
+            self.truncated = true;
+            return;
+        }
+        self.bytes += size;
+        self.rows.push(row);
+    }
+}
+
+impl WalkRecorder for WalkOutcomes {
+    fn row(&mut self, value: &VarBind) {
+        if let Ok(mut rows) = self.partial_rows.lock() {
+            rows.push(json!({"oid": value.oid.to_string(), "value": value_json(&value.value)}));
+        }
+    }
+
+    fn outcome(&mut self, value: serde_json::Value) {
+        self.outcomes.push(value);
+    }
+}
+
+fn record_partial_rows(rows: &Arc<Mutex<PartialResponses>>, values: &[VarBind]) {
+    if let Ok(mut rows) = rows.lock() {
+        for value in values {
+            rows.push(json!({
+                "oid": value.oid.to_string(),
+                "value": value_json(&value.value),
+            }));
+        }
+    }
+}
+
+fn partial_or_error(
+    target: &str,
+    selection: QuerySelection,
+    partial_rows: &Arc<Mutex<PartialResponses>>,
+    message: String,
+    no_response: bool,
+    outcome: &'static str,
+) -> Result<ResultData, QueryError> {
+    let partial = partial_rows
+        .lock()
+        .map(|rows| (rows.rows.clone(), rows.truncated))
+        .unwrap_or_default();
+    let (rows, truncated) = partial;
+    if rows.is_empty() {
+        return Err(QueryError {
+            message,
+            no_response,
+        });
+    }
+    let row_count = rows.len();
+    let warning = format!("{message} Retained {row_count} successful response row(s).");
+    let observed_at = crate::now();
+    Ok(ResultData {
+        identity_mac: None,
+        observation: Some(Observation {
+            source: if selection.inventory {
+                Source::Snmp
+            } else {
+                Source::Lldp
+            },
+            observed_at,
+            ip_address: Some(target.to_owned()),
+            mac_address: None,
+            fields: BTreeMap::from([
+                ("ipAddress".into(), json!(target)),
+                ("lastSeen".into(), json!(crate::now())),
+                ("status".into(), json!("online")),
+            ]),
+            raw: json!({
+                "observationId": uuid::Uuid::new_v4().to_string(),
+                "subject": {"kind": "endpoint", "ipAddress": target},
+                "acquisition": {"mechanism": "management-table-read"},
+                "partialResponses": rows,
+                "collectionOutcomes": [{"oid": "query", "outcome": outcome, "rows": row_count}],
+                "partialResponsesTruncated": truncated,
+            }),
+            warnings: vec![warning.clone()],
+        }),
+        interfaces: vec![],
+        ports: vec![],
+        links: vec![],
+        warnings: vec![warning],
+        inventory_complete: !selection.inventory,
+        lldp_complete: !selection.lldp,
+    })
+}
+
+async fn collect_walk<T: Transport + 'static, R: WalkRecorder>(
     client: &Client<T>,
     oid: &str,
     limit: usize,
-    outcomes: &mut Vec<serde_json::Value>,
+    outcomes: &mut R,
 ) -> Result<Vec<VarBind>, String> {
     let mut walk = client
         .walk(Oid::parse(oid).map_err(|error| error.to_string())?)
@@ -1562,7 +1704,8 @@ async fn collect_walk<T: Transport + 'static>(
         let value = match value {
             Ok(value) => value,
             Err(error) => {
-                outcomes.push(json!({"oid": oid, "outcome": "read-error", "rows": values.len()}));
+                outcomes
+                    .outcome(json!({"oid": oid, "outcome": "read-error", "rows": values.len()}));
                 if values.is_empty() {
                     return Err(error.to_string());
                 }
@@ -1570,12 +1713,13 @@ async fn collect_walk<T: Transport + 'static>(
             }
         };
         if values.len() == limit {
-            outcomes.push(json!({"oid": oid, "outcome": "limit-reached", "rows": values.len()}));
+            outcomes.outcome(json!({"oid": oid, "outcome": "limit-reached", "rows": values.len()}));
             return Ok(values);
         }
+        outcomes.row(&value);
         values.push(value);
     }
-    outcomes.push(json!({"oid": oid, "outcome": "success", "rows": values.len()}));
+    outcomes.outcome(json!({"oid": oid, "outcome": "success", "rows": values.len()}));
     Ok(values)
 }
 
@@ -2972,7 +3116,7 @@ mod tests {
         }
 
         *failed_oid.lock().unwrap() = Some("1.0.8802.1.1.2.1.4.1.1.4".into());
-        let failed_lldp = query(
+        let partial_lldp = query(
             "127.0.0.1",
             Some("00:11:22:33:44:55"),
             &settings("2c"),
@@ -2981,8 +3125,15 @@ mod tests {
                 lldp: true,
             },
         )
-        .await;
-        assert!(failed_lldp.is_err());
+        .await
+        .unwrap();
+        assert!(!partial_lldp.lldp_complete);
+        assert!(
+            !partial_lldp.observation.unwrap().raw["partialResponses"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
 
         task.abort();
     }
@@ -3122,6 +3273,141 @@ mod tests {
         assert!(error.to_string().contains("query exceeded"));
         assert!(error.is_no_response());
         assert_eq!(attempts.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn query_deadline_returns_evidence_received_before_later_reads_stalled() {
+        let target = "127.0.0.3";
+        let socket = UdpSocket::bind((target, SNMP_PORT)).await.unwrap();
+        let responder = tokio::spawn(async move {
+            let mut buffer = [0; 4096];
+            let (length, peer) = socket.recv_from(&mut buffer).await.unwrap();
+            let message = CommunityMessage::decode(buffer[..length].to_vec().into()).unwrap();
+            let request = message.pdu.standard().unwrap();
+            let varbinds = request
+                .varbinds
+                .iter()
+                .map(|varbind| {
+                    VarBind::new(
+                        varbind.oid.clone(),
+                        Value::OctetString("partial inventory".into()),
+                    )
+                })
+                .collect();
+            let response = CommunityMessage::new(
+                message.version,
+                message.community,
+                Pdu {
+                    pdu_type: PduType::Response,
+                    request_id: request.request_id,
+                    error_status: 0,
+                    error_index: 0,
+                    varbinds,
+                },
+            )
+            .encode();
+            socket.send_to(&response, peer).await.unwrap();
+        });
+
+        let (attempts, result) = tokio::time::timeout(
+            QUERY_TIMEOUT + Duration::from_millis(250),
+            query_with_attempts(
+                target,
+                None,
+                &[settings("2c")],
+                QuerySelection {
+                    inventory: true,
+                    lldp: false,
+                },
+            ),
+        )
+        .await
+        .expect("query exceeded its whole-query budget");
+        responder.abort();
+
+        let result = result.expect("successful earlier reads should be retained");
+        let observation = result.observation.unwrap();
+        assert!(!result.inventory_complete);
+        assert!(!attempts[0].success);
+        assert_eq!(
+            observation.raw["partialResponses"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(
+            observation.raw["collectionOutcomes"][0]["outcome"],
+            "query-timeout"
+        );
+        assert!(observation.warnings[0].contains("query exceeded"));
+    }
+
+    #[test]
+    fn partial_query_failures_keep_their_outcome_and_bound_retained_rows() {
+        let partial_rows = Arc::new(Mutex::new(PartialResponses::default()));
+        {
+            let mut rows = partial_rows.lock().unwrap();
+            for index in 0..=MAX_PARTIAL_RESPONSE_ROWS {
+                rows.push(json!({"oid": index, "value": "response"}));
+            }
+            assert_eq!(rows.rows.len(), MAX_PARTIAL_RESPONSE_ROWS);
+            assert!(rows.truncated);
+            assert!(rows.bytes <= MAX_PARTIAL_RESPONSE_BYTES);
+        }
+        let mut oversized = PartialResponses::default();
+        oversized.push(json!({"value": "x".repeat(MAX_PARTIAL_RESPONSE_BYTES)}));
+        oversized.push(json!({"value": "not retained after the byte limit"}));
+        assert!(oversized.rows.is_empty());
+        assert!(oversized.truncated);
+
+        let result = partial_or_error(
+            "192.0.2.1",
+            QuerySelection {
+                inventory: true,
+                lldp: false,
+            },
+            &partial_rows,
+            "SNMP request failed".into(),
+            false,
+            "query-failed",
+        )
+        .unwrap();
+        let observation = result.observation.unwrap();
+        assert_eq!(
+            observation.raw["collectionOutcomes"][0]["outcome"],
+            "query-failed"
+        );
+        assert_eq!(
+            observation.raw["partialResponses"]
+                .as_array()
+                .unwrap()
+                .len(),
+            MAX_PARTIAL_RESPONSE_ROWS
+        );
+        assert_eq!(observation.raw["partialResponsesTruncated"], true);
+    }
+
+    #[test]
+    fn walk_and_system_rows_are_recorded_as_partial_evidence() {
+        let rows = Arc::new(Mutex::new(PartialResponses::default()));
+        let value = VarBind::new(
+            Oid::parse("1.3.6.1.2.1.1.1.0").unwrap(),
+            Value::OctetString("device description".into()),
+        );
+        let mut recorder = WalkOutcomes {
+            outcomes: vec![],
+            partial_rows: Arc::clone(&rows),
+        };
+
+        recorder.row(&value);
+        record_partial_rows(&rows, std::slice::from_ref(&value));
+        record_partial_rows(&rows, &[]);
+
+        let rows = rows.lock().unwrap();
+        assert_eq!(rows.rows.len(), 2);
+        assert_eq!(rows.rows[0]["value"], "device description");
+        assert_eq!(rows.rows[1]["oid"], "1.3.6.1.2.1.1.1.0");
     }
 
     #[test]

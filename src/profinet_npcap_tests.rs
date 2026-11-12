@@ -242,6 +242,11 @@ fn failed_kernel_buffer_setup_stops_before_sending() {
 fn passive_capture_receives_without_transmitting_or_responding() {
     for respond in [false, true] {
         let mut adapter = MockAdapter::new(false);
+        let mut lldp = vec![0_u8; 60];
+        lldp[..6].copy_from_slice(&[1, 0x80, 0xc2, 0, 0, 0x0e]);
+        lldp[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 1]);
+        lldp[12..14].copy_from_slice(&[0x88, 0xcc]);
+        adapter.response = super::tests::bpf_record(&lldp);
         OPEN_ADAPTER.set((&mut adapter as *mut MockAdapter).cast());
         // SAFETY: the mock owns this live event until capture completes.
         unsafe { SetEvent(adapter.event) };
@@ -261,10 +266,43 @@ fn passive_capture_receives_without_transmitting_or_responding() {
             },
         );
         assert_eq!(received, 1);
+        assert_eq!(adapter.filter, PASSIVE_HW_FILTER);
         assert_eq!(adapter.sends, 0);
         assert_eq!(adapter.closes, 1);
         assert_eq!(result.is_err(), respond);
     }
+}
+
+#[test]
+fn raw_capture_stops_after_the_correlated_response_is_complete() {
+    let mut adapter = MockAdapter::new(false);
+    adapter.response.clear();
+    adapter.response = super::tests::bpf_record(&[0x88, 0xcc]);
+    OPEN_ADAPTER.set((&mut adapter as *mut MockAdapter).cast());
+    // SAFETY: the mock owns this live event until capture completes.
+    unsafe { SetEvent(adapter.event) };
+    let completed = Cell::new(false);
+    let started = Instant::now();
+
+    capture_with_api_until(
+        &mock_api(),
+        INTERFACE,
+        std::iter::once([0_u8; 60]),
+        Duration::from_secs(5),
+        &AtomicBool::new(false),
+        CaptureFilter::All,
+        || completed.get(),
+        |_| {
+            completed.set(true);
+            Ok(None)
+        },
+    )
+    .unwrap();
+
+    assert!(completed.get());
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(adapter.sends, 1);
+    assert_eq!(adapter.closes, 1);
 }
 
 #[test]

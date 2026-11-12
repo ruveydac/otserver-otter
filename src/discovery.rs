@@ -16,7 +16,7 @@ const ARP_ETHERTYPE: [u8; 2] = [0x08, 0x06];
 const BROADCAST: [u8; 6] = [0xff; 6];
 pub const MAX_TARGETS: usize = 65_536;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct Fingerprint {
     ttl: u8,
     dont_fragment: bool,
@@ -197,9 +197,11 @@ pub(crate) fn source_ipv4(interface: &str) -> Result<Ipv4Addr, String> {
 
 #[cfg(windows)]
 pub fn interface_ip_addresses(interface: &str) -> Result<Vec<IpAddr>, String> {
-    crate::profinet::interfaces()?
+    let interfaces = crate::profinet::interfaces()?;
+    let selected = interfaces
         .into_iter()
-        .find(|item| item.name == interface || item.friendly_name == interface)
+        .find(|item| crate::profinet::windows_interface_matches(item, interface));
+    selected
         .map(|item| {
             item.addresses
                 .iter()
@@ -296,7 +298,7 @@ fn platform_scan(
     if crate::profinet::npcap::interface_available(&selected.name) {
         crate::profinet::validate_source_mac(&selected, &format_mac(&source_mac))?;
         let requested = RefCell::new(BTreeSet::new());
-        let mut replies = BTreeMap::new();
+        let mut claims = BTreeMap::<Ipv4Addr, Option<[u8; 6]>>::new();
         crate::profinet::npcap::capture_arp(
             &selected.name,
             targets.iter().map(|&ip| {
@@ -308,12 +310,24 @@ fn platform_scan(
             cancelled,
             |frame| {
                 if let Some((ip, mac)) = reply(frame, &requested.borrow(), source_mac, source_ip) {
-                    replies.insert(ip, (mac, None));
+                    match claims.entry(ip) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(Some(mac));
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            if entry.get().as_ref() != Some(&mac) {
+                                entry.insert(None);
+                            }
+                        }
+                    }
                 }
                 Ok(())
             },
         )?;
-        return Ok(replies);
+        return Ok(claims
+            .into_iter()
+            .filter_map(|(ip, mac)| mac.map(|mac| (ip, (mac, None))))
+            .collect());
     }
 
     // pktmon is a capture-only facility. Use the supported IP Helper API to cause Windows to
@@ -560,7 +574,10 @@ fn collect_replies<T>(
     cancelled: &AtomicBool,
     mut send: impl FnMut(Ipv4Addr, &AtomicBool, &Mutex<bool>) -> Result<(), String> + Send,
     mut receive: impl FnMut() -> Result<Option<(Ipv4Addr, T)>, String>,
-) -> Result<BTreeMap<Ipv4Addr, T>, String> {
+) -> Result<BTreeMap<Ipv4Addr, T>, String>
+where
+    T: PartialEq,
+{
     if targets.is_empty() || cancelled.load(Ordering::Relaxed) {
         return Ok(BTreeMap::new());
     }
@@ -583,7 +600,7 @@ fn collect_replies<T>(
             Ok(())
         });
         let replies = (|| {
-            let mut replies = BTreeMap::new();
+            let mut replies = BTreeMap::<Ipv4Addr, Option<T>>::new();
             let mut finished = None;
             while !cancelled.load(Ordering::Relaxed) && !stopped.load(Ordering::Relaxed) {
                 // The grace period starts after the whole sweep, not after each target or when
@@ -599,10 +616,22 @@ fn collect_replies<T>(
                         .lock()
                         .map_err(|_| "Discovery request state was poisoned.".to_string())?
                 {
-                    replies.insert(ip, value);
+                    match replies.entry(ip) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(Some(value));
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            if entry.get().as_ref() != Some(&value) {
+                                entry.insert(None);
+                            }
+                        }
+                    }
                 }
             }
-            Ok(replies)
+            Ok(replies
+                .into_iter()
+                .filter_map(|(ip, value)| value.map(|value| (ip, value)))
+                .collect())
         })();
         stopped.store(true, Ordering::Relaxed);
         sender
@@ -1091,6 +1120,39 @@ mod tests {
         )
         .unwrap();
         assert!(fingerprints.contains_key(&target_ip));
+    }
+
+    #[test]
+    fn collection_excludes_ips_claimed_by_conflicting_arp_macs() {
+        let ip = Ipv4Addr::new(192, 0, 2, 20);
+        let cancelled = AtomicBool::new(false);
+        let mut replies = [Some((ip, 1_u8)), Some((ip, 1_u8)), Some((ip, 2_u8)), None].into_iter();
+        let (sent, received) = std::sync::mpsc::channel();
+        let mut first = true;
+        let result = collect_replies(
+            &[ip],
+            Duration::from_secs(3600),
+            &cancelled,
+            |_, _, sent_flag| {
+                *sent_flag.lock().unwrap() = true;
+                sent.send(()).unwrap();
+                Ok(())
+            },
+            || {
+                if first {
+                    received.recv_timeout(Duration::from_secs(2)).unwrap();
+                    first = false;
+                }
+                let reply = replies.next().unwrap_or(None);
+                if reply.is_none() {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+                Ok(reply)
+            },
+        )
+        .unwrap();
+
+        assert!(result.is_empty());
     }
 
     #[test]

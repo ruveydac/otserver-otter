@@ -49,39 +49,27 @@ pub fn interfaces() -> Result<Vec<CaptureInterface>, String> {
     };
     use windows_sys::Win32::Networking::WinSock::AF_UNSPEC;
 
-    let mut size = 0_u32;
-    // SAFETY: Initial call to get buffer size.
-    unsafe {
-        GetAdaptersAddresses(
-            AF_UNSPEC as u32,
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut size,
-        );
-    }
-    if size == 0 {
-        return Err("Could not query Windows network adapters.".into());
-    }
-
-    let mut buffer = vec![0_u8; size as usize];
+    let mut buffer = adapter_addresses_buffer(|buffer, size| {
+        // SAFETY: GetAdaptersAddresses receives either a null pointer for sizing or a writable
+        // buffer whose size is supplied by the caller.
+        unsafe {
+            GetAdaptersAddresses(
+                AF_UNSPEC as u32,
+                0,
+                std::ptr::null_mut(),
+                buffer.cast::<IP_ADAPTER_ADDRESSES_LH>(),
+                size,
+            )
+        }
+    })
+    .map_err(|status| {
+        if status == 0 {
+            "Could not query Windows network adapters.".into()
+        } else {
+            format!("Could not list Windows network interfaces (error code {status}).")
+        }
+    })?;
     let adapter_addresses = buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
-
-    // SAFETY: Buffer is allocated with size returned by GetAdaptersAddresses.
-    let status = unsafe {
-        GetAdaptersAddresses(
-            AF_UNSPEC as u32,
-            0,
-            std::ptr::null_mut(),
-            adapter_addresses,
-            &mut size,
-        )
-    };
-    if status != 0 {
-        return Err(format!(
-            "Could not list Windows network interfaces (error code {status})."
-        ));
-    }
 
     let mut result = Vec::new();
     let mut current = adapter_addresses;
@@ -158,6 +146,32 @@ pub fn interfaces() -> Result<Vec<CaptureInterface>, String> {
     }
 
     Ok(result)
+}
+
+#[cfg(any(windows, test))]
+fn adapter_addresses_buffer(
+    mut query: impl FnMut(*mut u8, &mut u32) -> u32,
+) -> Result<Vec<u8>, u32> {
+    const MAX_ATTEMPTS: usize = 3;
+    const ERROR_BUFFER_OVERFLOW: u32 = 111;
+
+    let mut size = 0;
+    let status = query(std::ptr::null_mut(), &mut size);
+    if size == 0 || (status != 0 && status != ERROR_BUFFER_OVERFLOW) {
+        return Err(status);
+    }
+    for _ in 0..MAX_ATTEMPTS {
+        let mut buffer = vec![0; size as usize];
+        match query(buffer.as_mut_ptr(), &mut size) {
+            0 => return Ok(buffer),
+            ERROR_BUFFER_OVERFLOW => {}
+            status => return Err(status),
+        }
+        if size == 0 {
+            return Err(ERROR_BUFFER_OVERFLOW);
+        }
+    }
+    Err(ERROR_BUFFER_OVERFLOW)
 }
 
 #[cfg(target_os = "linux")]
@@ -756,49 +770,70 @@ fn enrich_windows_pnio(
                 request,
             )?;
             let mut fragments = Vec::new();
-            npcap::capture_raw(interface, &raw_request, timeout, cancelled, |frame| {
-                let Some(udp) = pnio::parse_ipv4_udp_frame(frame) else {
-                    return Ok(None);
-                };
-                if udp.source_mac != target_mac
-                    || udp.destination_mac != source_mac
-                    || udp.source_ip != target_ip
-                    || udp.destination_ip != source_ip
-                    || !pnio::response_source_port_matches(target_port, udp.source_port)
-                    || udp.destination_port != pnio::rpc_port()
-                {
-                    return Ok(None);
-                }
-                let Ok((header, body)) = pnio::parse_rpc_fragment(udp.payload) else {
-                    return Ok(None);
-                };
-                if header.packet_type != 2
-                    || header.object_uuid != request_header.object_uuid
-                    || header.interface_uuid != request_header.interface_uuid
-                    || header.activity_uuid != request_header.activity_uuid
-                    || header.sequence != request_header.sequence
-                    || header.operation != request_header.operation
-                {
-                    return Ok(None);
-                }
-                let ack = if header.requires_fragment_ack() {
-                    let payload = pnio::build_fragment_ack(&header);
-                    Some(pnio::ethernet_ipv4_udp_frame(
-                        source_mac,
-                        target_mac,
-                        source_ip,
-                        target_ip,
-                        pnio::rpc_port(),
-                        target_port,
-                        &payload,
-                    )?)
+            let response_complete = AtomicBool::new(false);
+            let mut response = None;
+            npcap::capture_raw_until(
+                interface,
+                &raw_request,
+                timeout,
+                cancelled,
+                || response_complete.load(Ordering::Relaxed),
+                |frame| {
+                    let Some(udp) = pnio::parse_ipv4_udp_frame(frame) else {
+                        return Ok(None);
+                    };
+                    if udp.source_mac != target_mac
+                        || udp.destination_mac != source_mac
+                        || udp.source_ip != target_ip
+                        || udp.destination_ip != source_ip
+                        || !pnio::response_source_port_matches(target_port, udp.source_port)
+                        || udp.destination_port != pnio::rpc_port()
+                    {
+                        return Ok(None);
+                    }
+                    let Ok((header, body)) = pnio::parse_rpc_fragment(udp.payload) else {
+                        return Ok(None);
+                    };
+                    if header.packet_type != 2
+                        || header.object_uuid != request_header.object_uuid
+                        || header.interface_uuid != request_header.interface_uuid
+                        || header.activity_uuid != request_header.activity_uuid
+                        || header.sequence != request_header.sequence
+                        || header.operation != request_header.operation
+                    {
+                        return Ok(None);
+                    }
+                    let ack = if header.requires_fragment_ack() {
+                        let payload = pnio::build_fragment_ack(&header);
+                        Some(pnio::ethernet_ipv4_udp_frame(
+                            source_mac,
+                            target_mac,
+                            source_ip,
+                            target_ip,
+                            pnio::rpc_port(),
+                            target_port,
+                            &payload,
+                        )?)
+                    } else {
+                        None
+                    };
+                    pnio::push_rpc_fragment(&mut fragments, header, body)?;
+                    if pnio::rpc_fragments_complete(&fragments) {
+                        response = Some(pnio::reassemble_rpc_fragments(std::mem::take(
+                            &mut fragments,
+                        ))?);
+                        response_complete.store(true, Ordering::Relaxed);
+                    }
+                    Ok(ack)
+                },
+            )?;
+            response.ok_or_else(|| {
+                if cancelled.load(Ordering::Relaxed) {
+                    "PROFINET RPC read was cancelled.".into()
                 } else {
-                    None
-                };
-                fragments.push((header, body));
-                Ok(ack)
-            })?;
-            pnio::reassemble_rpc_fragments(fragments)
+                    format!("PROFINET RPC response from {target_ip}:{target_port} timed out.")
+                }
+            })
         },
     ))
 }
@@ -812,6 +847,44 @@ mod windows_capture {
 
     const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+    struct CaptureFiles {
+        pktmon: std::path::PathBuf,
+        etl: std::path::PathBuf,
+        pcap: std::path::PathBuf,
+        active: bool,
+    }
+
+    impl CaptureFiles {
+        fn stop(&mut self) -> Result<(), String> {
+            let stopped = Command::new(&self.pktmon)
+                .arg("stop")
+                .output()
+                .map_err(|error| format!("Could not stop pktmon: {error}"))?;
+            command_result("Could not stop pktmon capture", &stopped)?;
+            self.active = false;
+            Ok(())
+        }
+    }
+
+    impl Drop for CaptureFiles {
+        fn drop(&mut self) {
+            if self.active {
+                match Command::new(&self.pktmon).arg("stop").output() {
+                    Ok(output) if output.status.success() => {}
+                    Ok(output) => eprintln!(
+                        "warning: could not stop pktmon capture during cleanup: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ),
+                    Err(error) => {
+                        eprintln!("warning: could not stop pktmon during cleanup: {error}")
+                    }
+                }
+            }
+            remove_capture_file(&self.etl);
+            remove_capture_file(&self.pcap);
+        }
+    }
+
     pub fn capture(wait: Duration, cancelled: &AtomicBool) -> Result<Vec<Vec<u8>>, String> {
         let id = format!(
             "{}-{}",
@@ -821,13 +894,21 @@ mod windows_capture {
         let base = std::env::temp_dir();
         let etl = base.join(format!("otserver-{id}.etl"));
         let pcap = base.join(format!("otserver-{id}.pcapng"));
-        let started = Command::new("pktmon")
+        let pktmon = super::npcap::system_directory()?.join("pktmon.exe");
+        let mut files = CaptureFiles {
+            pktmon,
+            etl,
+            pcap,
+            active: false,
+        };
+        let started = Command::new(&files.pktmon)
             .args(["start", "--capture", "--comp", "nics", "--pkt-size", "0"])
             .arg("--file-name")
-            .arg(&etl)
+            .arg(&files.etl)
             .args(["--file-size", "32", "--log-mode", "circular"])
             .output()
             .map_err(|error| format!("Could not start pktmon: {error}"))?;
+        files.active = true;
         command_result("Could not start pktmon capture", &started)?;
         let started_at = Instant::now();
         while !cancelled.load(Ordering::Relaxed) {
@@ -837,24 +918,20 @@ mod windows_capture {
             }
             std::thread::sleep(remaining.min(CANCELLATION_POLL_INTERVAL));
         }
-        let stopped = Command::new("pktmon")
-            .arg("stop")
-            .output()
-            .map_err(|error| format!("Could not stop pktmon: {error}"))?;
-        command_result("Could not stop pktmon capture", &stopped)?;
-        let converted = Command::new("pktmon")
+        files.stop()?;
+        let converted = Command::new(&files.pktmon)
             .arg("etl2pcap")
-            .arg(&etl)
+            .arg(&files.etl)
             .arg("--out")
-            .arg(&pcap)
+            .arg(&files.pcap)
             .output()
             .map_err(|error| format!("Could not convert pktmon capture: {error}"))?;
         let conversion = command_result("Could not convert pktmon capture", &converted);
         let bytes = conversion.and_then(|()| {
-            std::fs::read(&pcap).map_err(|error| format!("Could not read pktmon capture: {error}"))
+            std::fs::read(&files.pcap)
+                .map_err(|error| format!("Could not read pktmon capture: {error}"))
         });
-        remove_capture_file(&etl);
-        remove_capture_file(&pcap);
+        drop(files);
         parse_pcapng(&bytes?)
     }
 
@@ -879,6 +956,28 @@ mod windows_capture {
         {
             eprintln!("warning: could not remove {}: {error}", path.display());
         }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn capture_files_are_removed_when_capture_exits_early() {
+        let directory =
+            std::env::temp_dir().join(format!("otter-pktmon-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let etl = directory.join("capture.etl");
+        let pcap = directory.join("capture.pcapng");
+        std::fs::write(&etl, b"etl").unwrap();
+        std::fs::write(&pcap, b"pcap").unwrap();
+
+        drop(CaptureFiles {
+            pktmon: directory.join("pktmon.exe"),
+            etl: etl.clone(),
+            pcap: pcap.clone(),
+            active: false,
+        });
+
+        assert!(!etl.exists() && !pcap.exists());
+        std::fs::remove_dir(directory).unwrap();
     }
 
     fn parse_pcapng(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
@@ -1378,10 +1477,7 @@ pub fn npcap_interface_available(interface: &str) -> bool {
 pub(crate) fn windows_scan_interface(interface: &str) -> Result<CaptureInterface, String> {
     let selected = interfaces()?
         .into_iter()
-        .find(|item| {
-            item.name.eq_ignore_ascii_case(interface)
-                || item.friendly_name.eq_ignore_ascii_case(interface)
-        })
+        .find(|item| windows_interface_matches(item, interface))
         .ok_or_else(|| format!("Windows network interface {interface} was not found."))?;
     if is_obsolete_bridge(&selected) {
         return Err(
@@ -1390,6 +1486,12 @@ pub(crate) fn windows_scan_interface(interface: &str) -> Result<CaptureInterface
         );
     }
     Ok(selected)
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn windows_interface_matches(interface: &CaptureInterface, requested: &str) -> bool {
+    interface.name.eq_ignore_ascii_case(requested)
+        || interface.friendly_name.eq_ignore_ascii_case(requested)
 }
 
 pub fn interface_mac(interface: &CaptureInterface) -> Option<String> {
@@ -1452,6 +1554,101 @@ fn uuid(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_enumeration_retries_buffer_overflow_with_the_updated_size() {
+        let mut calls = 0;
+        let buffer = adapter_addresses_buffer(|_, size| {
+            calls += 1;
+            match calls {
+                1 => {
+                    *size = 8;
+                    111
+                }
+                2 => {
+                    *size = 16;
+                    111
+                }
+                _ => 0,
+            }
+        })
+        .unwrap();
+
+        assert_eq!(buffer.len(), 16);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn adapter_enumeration_stops_after_bounded_buffer_retries() {
+        let mut calls = 0;
+        let error = adapter_addresses_buffer(|_, size| {
+            calls += 1;
+            *size = calls as u32 * 8;
+            111
+        })
+        .unwrap_err();
+
+        assert_eq!(error, 111);
+        assert_eq!(calls, 4);
+    }
+
+    #[test]
+    fn adapter_enumeration_rejects_invalid_size_and_retry_responses() {
+        assert_eq!(
+            adapter_addresses_buffer(|_, size| {
+                *size = 0;
+                0
+            }),
+            Err(0)
+        );
+        assert_eq!(
+            adapter_addresses_buffer(|_, size| {
+                *size = 8;
+                5
+            }),
+            Err(5)
+        );
+        assert_eq!(
+            adapter_addresses_buffer(|buffer, size| {
+                if buffer.is_null() {
+                    *size = 8;
+                    111
+                } else {
+                    *size = 0;
+                    111
+                }
+            }),
+            Err(111)
+        );
+        assert_eq!(
+            adapter_addresses_buffer(|buffer, size| {
+                if buffer.is_null() {
+                    *size = 8;
+                    111
+                } else {
+                    5
+                }
+            }),
+            Err(5)
+        );
+    }
+
+    #[test]
+    fn windows_adapter_lookup_accepts_case_insensitive_names_and_guids() {
+        let interface = CaptureInterface {
+            name: "{8D11417D-4D16-4D5B-9917-C30CF60DF212}".into(),
+            friendly_name: "Ethernet 2".into(),
+            description: "Physical adapter".into(),
+            addresses: vec![],
+        };
+
+        assert!(windows_interface_matches(&interface, "ethernet 2"));
+        assert!(windows_interface_matches(
+            &interface,
+            "{8d11417d-4d16-4d5b-9917-c30cf60df212}"
+        ));
+        assert!(!windows_interface_matches(&interface, "Ethernet"));
+    }
 
     #[test]
     fn enforces_a_one_minute_dcp_response_window() {

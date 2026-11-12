@@ -8,6 +8,51 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+pub(super) fn cleanup_update_artifacts(directory: &Path, id: &str) -> bool {
+    if !super::valid_id(id) {
+        return false;
+    }
+    let mut complete = true;
+    for suffix in ["bin", "updater.exe"] {
+        let path = directory.join(format!("update-{id}.{suffix}"));
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            complete = false;
+        }
+    }
+    #[cfg(windows)]
+    {
+        let Ok(executable) = installed_executable() else {
+            return false;
+        };
+        let Some(parent) = executable.parent() else {
+            return false;
+        };
+        let path = parent.join(format!("otserver-otter-update-{id}.previous.exe"));
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            complete = false;
+        }
+        for suffix in ["new", "failed"] {
+            let path = parent.join(format!("otserver-otter-update-{id}.{suffix}.exe"));
+            if let Err(error) = std::fs::remove_file(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                complete = false;
+            }
+        }
+        let helper = windows_update_helper_path(&executable, id);
+        if let Err(error) = std::fs::remove_file(helper)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            complete = false;
+        }
+    }
+    complete
+}
+
 pub(super) fn install(directory: Option<PathBuf>, graphical: bool) -> Result<String, String> {
     let store = Store::open(directory).map_err(|e| e.to_string())?;
     let mut state = store.load().map_err(|e| e.to_string())?;
@@ -330,22 +375,36 @@ pub(super) fn launch_update(directory: &Path, id: &str, parent_pid: u32) -> Resu
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
 pub(super) fn launch_update(directory: &Path, id: &str, parent_pid: u32) -> Result<(), String> {
     launch_windows_update(directory, id, parent_pid)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
+pub(super) fn launch_update(_: &Path, _: &str, _: u32) -> Result<(), String> {
+    Err("Managed Otter updates support Linux and Windows.".into())
+}
+
+#[cfg(windows)]
+fn windows_update_helper_path(executable: &Path, id: &str) -> PathBuf {
+    executable.with_file_name(format!("otserver-otter-update-{id}.helper.exe"))
+}
+
+#[cfg(windows)]
 fn launch_windows_update(directory: &Path, id: &str, parent_pid: u32) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
     if !super::valid_id(id) {
         return Err("Invalid update identifier.".into());
     }
     let source = std::env::current_exe().map_err(|_| "Could not locate the running executable.")?;
-    if std::fs::canonicalize(&source).ok() != std::fs::canonicalize(installed_executable()?).ok() {
+    let executable = installed_executable()?;
+    if std::fs::canonicalize(&source).ok() != std::fs::canonicalize(&executable).ok() {
         return Err("Managed updates require the installed Otter controller; run controller --install first.".into());
     }
     otserver_otter::update::verify_binary(&source, otserver_otter::update::BUILD_TARGET)?;
-    let helper = directory.join(format!("update-{id}.updater.exe"));
+    // Windows may forbid executing files from some operator-selected state directories.
+    let helper = windows_update_helper_path(&executable, id);
     copy_executable(&source, &helper)?;
     Command::new(helper)
         .args([
@@ -360,9 +419,10 @@ fn launch_windows_update(directory: &Path, id: &str, parent_pid: u32) -> Result<
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
         .spawn()
         .map(|_| ())
-        .map_err(|_| "Could not start the verified Windows update helper.".to_owned())
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -392,7 +452,7 @@ pub(super) fn apply_update(
 
 #[cfg(target_os = "linux")]
 fn apply_linux_update(directory: Option<PathBuf>, id: &str, parent_pid: u32) -> Result<(), String> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let uid = unsafe { libc::getuid() };
     if !is_update_helper_executable()
@@ -538,13 +598,12 @@ fn apply_linux_update(directory: Option<PathBuf>, id: &str, parent_pid: u32) -> 
         .map_err(
             |_| "Could not copy the verified Otter executable into its installation directory.",
         )?;
-    otserver_otter::update::verify_binary(&staged, otserver_otter::update::BUILD_TARGET)?;
-    if digest_file(&staged)? != pending.binary_digest {
+    verify_open_file(&file)?;
+    if digest_open_file(&file)? != pending.binary_digest {
         let _ = std::fs::remove_file(&staged);
         return Err("The installed Otter staging file failed its digest check.".into());
     }
-    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
-        .map_err(|_| "Could not set executable permissions on the signed Otter update.")?;
+    set_executable_permissions(&file)?;
     set_raw_capability(&file)?;
     drop(file);
     std::fs::rename(&staged, &executable)
@@ -676,6 +735,47 @@ pub(super) fn apply_update(
 }
 
 #[cfg(target_os = "windows")]
+fn replace_windows_file(replaced: &Path, replacement: &Path, backup: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    match backup.symlink_metadata() {
+        Ok(_) => return Err("A Windows update recovery file already exists.".into()),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err("Could not inspect the Windows update recovery path.".into());
+        }
+        Err(_) => {}
+    }
+    let replaced: Vec<u16> = replaced.as_os_str().encode_wide().chain(Some(0)).collect();
+    let replacement: Vec<u16> = replacement
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let backup: Vec<u16> = backup.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: the three paths are valid, NUL-terminated UTF-16 and reside on the same volume.
+    // ReplaceFileW swaps the executable and retains the previous signed file as the backup.
+    if unsafe {
+        ReplaceFileW(
+            replaced.as_ptr(),
+            replacement.as_ptr(),
+            backup.as_ptr(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    } == 0
+    {
+        Err(format!(
+            "Could not replace the Windows Otter executable: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn apply_windows_update(
     directory: Option<PathBuf>,
     id: &str,
@@ -755,14 +855,7 @@ fn apply_windows_update(
         let _ = std::fs::remove_file(&staged_path);
         return Err("The staged Windows Otter executable failed its final verification.".into());
     }
-    if let Err(_) = std::fs::rename(&executable, &backup) {
-        let _ = std::fs::remove_file(&staged_path);
-        return Err("Could not move the old Otter executable aside for replacement.".into());
-    }
-    if std::fs::rename(&staged_path, &executable).is_err() {
-        let _ = std::fs::rename(&backup, &executable);
-        return Err("Could not publish the signed Windows Otter update.".into());
-    }
+    replace_windows_file(&executable, &staged_path, &backup)?;
     drop(store);
 
     let mut child = Command::new(&executable)
@@ -792,7 +885,7 @@ fn apply_windows_update(
 }
 
 #[cfg(target_os = "windows")]
-fn recover_windows_update(directory: &Path, id: &str) -> Result<(), String> {
+pub(super) fn recover_windows_update(directory: &Path, id: &str) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
 
     if !super::valid_id(id) {
@@ -808,6 +901,7 @@ fn recover_windows_update(directory: &Path, id: &str) -> Result<(), String> {
     let executable = installed_executable()?;
     let parent = executable.parent().ok_or("Invalid installation path.")?;
     let backup = parent.join(format!("otserver-otter-update-{id}.previous.exe"));
+    let failed = parent.join(format!("otserver-otter-update-{id}.failed.exe"));
     let current_is_previous =
         otserver_otter::update::verify_binary(&executable, otserver_otter::update::BUILD_TARGET)
             .is_ok_and(|binary| binary.version() == pending.previous_version)
@@ -821,13 +915,8 @@ fn recover_windows_update(directory: &Path, id: &str) -> Result<(), String> {
         {
             return Err("The signed rollback executable failed verification.".into());
         }
-        if executable.exists() {
-            std::fs::remove_file(&executable).map_err(
-                |_| "Could not remove the failed Windows Otter executable for rollback.",
-            )?;
-        }
-        std::fs::rename(&backup, &executable)
-            .map_err(|_| "Could not restore the previous signed Windows Otter executable.")?;
+        replace_windows_file(&executable, &backup, &failed)?;
+        let _ = std::fs::remove_file(&failed);
         true
     };
     state.pending = None;
@@ -838,13 +927,14 @@ fn recover_windows_update(directory: &Path, id: &str) -> Result<(), String> {
         state.failed = Some(id.to_owned());
         state.failed_reason = Some(super::UpdateFailureReason::InstallationFailed);
     }
+    if !state.cleanup_helpers.contains(&id.to_owned()) {
+        state.cleanup_helpers.push(id.to_owned());
+    }
     store
         .save_update_state(&state)
         .map_err(|error| error.to_string())?;
     drop(store);
-    for suffix in ["bin", "updater.exe"] {
-        let _ = std::fs::remove_file(directory.join(format!("update-{id}.{suffix}")));
-    }
+    let _ = cleanup_update_artifacts(directory, id);
     Command::new(&executable)
         .args(["controller", "--state-dir"])
         .arg(directory)
@@ -921,6 +1011,52 @@ fn set_raw_capability(file: &File) -> Result<(), String> {
         Ok(())
     } else {
         Err("Could not grant CAP_NET_RAW to the verified Otter executable.".into())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_open_file(file: &File) -> Result<otserver_otter::update::VerifiedBinary, String> {
+    use std::os::fd::AsRawFd;
+    otserver_otter::update::verify_binary(
+        &PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())),
+        otserver_otter::update::BUILD_TARGET,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn digest_open_file(file: &File) -> Result<String, String> {
+    use std::io::Seek;
+    let mut file = file
+        .try_clone()
+        .map_err(|_| "Could not read the signed Otter executable.")?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|_| "Could not read the signed Otter executable.")?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let length = file
+            .read(&mut buffer)
+            .map_err(|_| "Could not hash the signed Otter executable.")?;
+        if length == 0 {
+            break;
+        }
+        digest.update(&buffer[..length]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+#[cfg(target_os = "linux")]
+fn set_executable_permissions(file: &File) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: this changes only the mode of the already-open staged executable, not a pathname.
+    if unsafe { libc::fchmod(file.as_raw_fd(), 0o755) } == 0 {
+        Ok(())
+    } else {
+        Err("Could not set executable permissions on the signed Otter update.".into())
     }
 }
 
@@ -1290,7 +1426,18 @@ fn start_installation(executable: &Path, directory: &Path) -> Result<String, Str
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         .filter(|path| path.is_absolute())
         .ok_or("Could not locate the user systemd configuration directory.")?;
-    start_installation_with(executable, directory, &config, || system_tool("systemctl"))
+    start_installation_with(
+        executable,
+        directory,
+        &config,
+        || system_tool("systemctl"),
+        |systemctl, arguments| {
+            Command::new(systemctl)
+                .args(arguments)
+                .status()
+                .map(|status| status.success())
+        },
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -1299,6 +1446,7 @@ fn start_installation_with(
     directory: &Path,
     config: &Path,
     find_systemctl: impl FnOnce() -> Result<PathBuf, String>,
+    mut run_systemctl: impl FnMut(&Path, &[&str]) -> std::io::Result<bool>,
 ) -> Result<String, String> {
     let units = config.join("systemd/user");
     std::fs::create_dir_all(&units)
@@ -1318,12 +1466,7 @@ fn start_installation_with(
             "otserver-otter-controller.service",
         ],
     ] {
-        if !Command::new(&systemctl)
-            .args(arguments)
-            .status()
-            .map_err(|_| "Could not run systemctl --user.")?
-            .success()
-        {
+        if !run_systemctl(&systemctl, &arguments).map_err(|_| "Could not run systemctl --user.")? {
             return Err("Could not enable/start the user controller service. Check systemctl --user status otserver-otter-controller.service and journalctl --user -u otserver-otter-controller.service, then retry installation.".into());
         }
     }
@@ -1434,6 +1577,126 @@ mod tests {
     use super::*;
 
     #[test]
+    fn update_cleanup_removes_only_the_validated_id_artifacts() {
+        let id = format!("cleanup-{}", uuid::Uuid::new_v4());
+        let directory =
+            std::env::temp_dir().join(format!("otter-update-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let expected = [
+            directory.join(format!("update-{id}.bin")),
+            directory.join(format!("update-{id}.updater.exe")),
+        ];
+        let unrelated = directory.join("update-other.bin");
+        for path in expected.iter().chain([&unrelated]) {
+            std::fs::write(path, b"staged").unwrap();
+        }
+
+        assert!(cleanup_update_artifacts(&directory, &id));
+        assert!(expected.iter().all(|path| !path.exists()));
+        assert!(unrelated.is_file());
+        assert!(!cleanup_update_artifacts(&directory, "../outside"));
+
+        std::fs::remove_file(unrelated).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn update_cleanup_reports_artifacts_that_cannot_be_removed() {
+        let id = format!("cleanup-{}", uuid::Uuid::new_v4());
+        let directory = std::env::temp_dir().join(format!(
+            "otter-update-cleanup-error-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let blocked = directory.join(format!("update-{id}.bin"));
+        std::fs::create_dir(&blocked).unwrap();
+
+        assert!(!cleanup_update_artifacts(&directory, &id));
+        assert!(blocked.is_dir());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_update_file_helpers_verify_hash_and_report_chmod_failure() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("otter-update-open-file-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("candidate");
+        std::fs::write(&path, b"unsigned candidate").unwrap();
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).mode(0o600);
+        let file = options.open(&path).unwrap();
+
+        assert!(verify_open_file(&file).is_err());
+        assert_eq!(
+            digest_open_file(&file).unwrap(),
+            format!("{:x}", Sha256::digest(b"unsigned candidate"))
+        );
+        let proc_file = File::open("/proc/self/status").unwrap();
+        assert!(set_executable_permissions(&proc_file).is_err());
+
+        drop(file);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_replacement_keeps_a_recoverable_previous_file() {
+        let directory =
+            std::env::temp_dir().join(format!("otter-update-replace-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let installed = directory.join("otserver-otter.exe");
+        let candidate = directory.join("candidate.exe");
+        let backup = directory.join("previous.exe");
+        std::fs::write(&installed, b"previous signed binary").unwrap();
+        std::fs::write(&candidate, b"new signed binary").unwrap();
+
+        replace_windows_file(&installed, &candidate, &backup).unwrap();
+
+        assert_eq!(std::fs::read(&installed).unwrap(), b"new signed binary");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"previous signed binary");
+        assert!(!candidate.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privileged_staging_permissions_follow_the_open_file_not_a_replaced_path() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
+
+        let directory =
+            std::env::temp_dir().join(format!("otter-update-fd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let staged = directory.join("staged");
+        let victim = directory.join("victim");
+        std::fs::write(&victim, b"do not chmod this file").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true).mode(0o600);
+        let file = options.open(&staged).unwrap();
+        std::fs::remove_file(&staged).unwrap();
+        symlink(&victim, &staged).unwrap();
+
+        set_executable_permissions(&file).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert!(
+            std::fs::symlink_metadata(&staged)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn executable_installation_replaces_bytes_without_touching_local_configuration() {
         let directory =
             std::env::temp_dir().join(format!("otter-install-{}", uuid::Uuid::new_v4()));
@@ -1471,6 +1734,19 @@ mod tests {
         }
         copy_executable(&std::fs::canonicalize(&destination).unwrap(), &destination).unwrap();
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn update_helper_is_staged_beside_the_installed_executable() {
+        let executable = Path::new("C:/Users/scanner/Programs/OTserver Otter/otserver-otter.exe");
+        let helper = windows_update_helper_path(executable, "id1");
+
+        assert_eq!(helper.parent(), executable.parent());
+        assert_eq!(
+            helper.file_name().and_then(|name| name.to_str()),
+            Some("otserver-otter-update-id1.helper.exe")
+        );
     }
 
     #[test]
@@ -1540,7 +1816,10 @@ mod tests {
             "Enroll this scanner before installing the controller."
         );
         assert!(directory.join("controller.log").is_file());
-        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+        assert_eq!(
+            std::fs::read_dir(&directory).unwrap().count(),
+            if cfg!(windows) { 1 } else { 2 }
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1772,21 +2051,28 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("otter-systemd-{}", uuid::Uuid::new_v4()));
         let config = directory.join("config");
-        let tools = directory.join("tools");
-        std::fs::create_dir_all(&tools).unwrap();
-        let log = directory.join("calls");
-        let systemctl = tools.join("systemctl");
-        executable_script(
-            &systemctl,
-            &format!("printf '%s\\n' \"$*\" >> '{}'", log.display()),
-            0o700,
-        );
+        let systemctl = directory.join("mock-systemctl");
         let executable = directory.join("otter executable");
         let state = directory.join("private state");
+        let mut calls = Vec::new();
 
-        let message =
-            start_installation_with(&executable, &state, &config, || Ok(systemctl.clone()))
-                .unwrap();
+        let message = start_installation_with(
+            &executable,
+            &state,
+            &config,
+            || Ok(systemctl.clone()),
+            |program, arguments| {
+                calls.push((
+                    program.to_path_buf(),
+                    arguments
+                        .iter()
+                        .map(|argument| argument.to_string())
+                        .collect::<Vec<_>>(),
+                ));
+                Ok(true)
+            },
+        )
+        .unwrap();
 
         let unit =
             std::fs::read_to_string(config.join("systemd/user/otserver-otter-controller.service"))
@@ -1795,13 +2081,27 @@ mod tests {
         assert!(unit.contains(&format!("--state-dir \"{}\"", state.display())));
         assert!(message.contains("enabled at boot and after logout"));
         assert_eq!(
-            std::fs::read_to_string(log)
-                .unwrap()
-                .lines()
-                .collect::<Vec<_>>(),
+            calls,
             [
-                "--user daemon-reload",
-                "--user enable --now otserver-otter-controller.service"
+                (
+                    systemctl.clone(),
+                    vec!["--user", "daemon-reload"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect()
+                ),
+                (
+                    systemctl,
+                    vec![
+                        "--user",
+                        "enable",
+                        "--now",
+                        "otserver-otter-controller.service"
+                    ]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+                )
             ]
         );
         std::fs::remove_dir_all(directory).unwrap();
@@ -1820,7 +2120,8 @@ mod tests {
                 Path::new("/bin/true"),
                 Path::new("/tmp/state"),
                 &blocked_config,
-                || { Ok(PathBuf::from("/bin/true")) }
+                || Ok(PathBuf::from("/bin/true")),
+                |_, _| Ok(true),
             )
             .unwrap_err(),
             "Could not create the user systemd unit directory."
@@ -1828,15 +2129,30 @@ mod tests {
 
         let config = directory.join("config");
         let systemctl = directory.join("systemctl");
-        executable_script(&systemctl, "exit 1", 0o700);
         let error = start_installation_with(
             Path::new("/bin/true"),
             Path::new("/tmp/state"),
             &config,
             || Ok(systemctl.clone()),
+            |_, _| Ok(false),
         )
         .unwrap_err();
         assert!(error.contains("Could not enable/start the user controller service"));
+
+        let error = start_installation_with(
+            Path::new("/bin/true"),
+            Path::new("/tmp/state"),
+            &config,
+            || Ok(systemctl.clone()),
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "mock spawn failure",
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "Could not run systemctl --user.");
 
         let config = directory.join("missing-tool-config");
         let error = start_installation_with(
@@ -1844,6 +2160,7 @@ mod tests {
             Path::new("/tmp/state"),
             &config,
             || Err("missing systemctl".into()),
+            |_, _| Ok(true),
         )
         .unwrap_err();
         assert_eq!(error, "missing systemctl");

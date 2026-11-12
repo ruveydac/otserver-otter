@@ -613,6 +613,49 @@ async fn polling_retries_connection_loss_every_five_minutes_and_recovers() {
 }
 
 #[tokio::test]
+async fn idle_poll_retries_failed_update_cleanup_and_clears_completed_ids() {
+    let (mut api, task) = server(vec![(
+        200,
+        json!({"action":"idle", "retryAfterSeconds":30}),
+    )])
+    .await;
+    let store = PrivateStore::new();
+    let mut state = State {
+        scanner: Some(scanner()),
+        credential_expires_at: credential().credential_expires_at,
+        ..State::default()
+    };
+    let blocked = store.get().path().join("update-update-blocked.bin");
+    std::fs::create_dir(&blocked).unwrap();
+    store
+        .get()
+        .save_update_state(&UpdateState {
+            pending: Some(PendingUpdate {
+                id: "update-blocked".into(),
+                version: "v0.15.0".into(),
+                target: otserver_otter::update::BUILD_TARGET.into(),
+                binary_digest: "a".repeat(64),
+                binary_size: 313,
+                previous_version: "v0.14.0".into(),
+                previous_digest: "b".repeat(64),
+            }),
+            cleanup_helpers: vec!["update-finished".into()],
+            ..UpdateState::default()
+        })
+        .unwrap();
+
+    assert_eq!(
+        poll_once(&mut api, store.get(), &mut state, 30, true).await,
+        Ok(Duration::from_secs(30))
+    );
+    let update_state = store.get().load_update_state().unwrap();
+    assert!(update_state.pending.is_none());
+    assert_eq!(update_state.cleanup_helpers, ["update-blocked"]);
+    assert!(blocked.is_dir());
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn polling_retries_an_offline_controller_without_losing_retained_work() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -722,6 +765,35 @@ async fn enrollment_decodes_credentials_without_logging_response_contents() {
     let requests = task.await.unwrap();
     assert!(requests[0].starts_with("POST /api/otter/v1/enroll "));
     assert!(!requests[0].to_ascii_lowercase().contains("authorization:"));
+}
+
+#[tokio::test]
+async fn enrollment_connection_failure_explains_network_checks_and_token_reuse() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let mut private = PrivateStore::new();
+    private.store.take();
+    let args = controller_args(&[
+        "--server-url",
+        &server_url,
+        "--state-dir",
+        private.path.to_str().unwrap(),
+        "--enroll",
+        "--enroll-only",
+    ]);
+
+    let error = match initialize(&args, Some(&"t".repeat(43))).await {
+        Err(error) => error,
+        Ok(_) => panic!("enrollment unexpectedly succeeded"),
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "Enrollment could not complete because the controller connection or response failed. Check the controller URL, network, DNS, proxy, and TLS settings. If OTserver received the request, create a new single-use token before retrying."
+    );
+    assert!(private.log().contains("Connection failed; check DNS"));
+    assert!(!private.log().contains(&"t".repeat(43)));
 }
 
 #[tokio::test]
@@ -1076,17 +1148,21 @@ fn file_credentials_and_assignment_survive_atomic_state_replacement() {
         use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
         use windows_sys::Win32::Security::{
             ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-            GetSecurityDescriptorControl, SE_DACL_PROTECTED, TOKEN_USER,
+            GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+            TOKEN_OWNER, TOKEN_USER,
         };
         use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 
         let user = store::windows_token_user().unwrap();
+        let default_owner = store::current_windows_default_owner().unwrap();
+        let default_owner_sid = unsafe { (*default_owner.as_ptr().cast::<TOKEN_OWNER>()).Owner };
         for path in [
             &store.path,
             &store.path.join("agent-state.json"),
             &store.path.join("controller.log"),
         ] {
             let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let mut owner = null_mut();
             let mut acl = null_mut();
             let mut descriptor = null_mut();
             // SAFETY: the path is NUL-terminated; output pointers remain valid for the call.
@@ -1095,8 +1171,8 @@ fn file_credentials_and_assignment_survive_atomic_state_replacement() {
                     GetNamedSecurityInfoW(
                         name.as_ptr(),
                         SE_FILE_OBJECT,
-                        DACL_SECURITY_INFORMATION,
-                        null_mut(),
+                        DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+                        &mut owner,
                         null_mut(),
                         &mut acl,
                         null_mut(),
@@ -1112,6 +1188,10 @@ fn file_credentials_and_assignment_survive_atomic_state_replacement() {
             // GetAce is checked before reading the access-allowed ACE and its inline SID.
             let private = unsafe {
                 let private = !acl.is_null()
+                    && !owner.is_null()
+                    && (EqualSid(owner, (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid) != 0
+                        || (!default_owner_sid.is_null()
+                            && EqualSid(owner, default_owner_sid) != 0))
                     && (*acl).AceCount == 1
                     && GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) != 0
                     && control & SE_DACL_PROTECTED != 0
@@ -1139,6 +1219,81 @@ fn file_credentials_and_assignment_survive_atomic_state_replacement() {
 fn state_lock_prevents_duplicate_agent_processes() {
     let store = PrivateStore::new();
     assert!(store::Store::open(Some(store.path.clone())).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "child process used by windows_lock_file_is_removed_after_its_holder_is_killed"]
+fn lock_holder_child_process() {
+    let Some(directory) = std::env::var_os("OTTER_LOCK_HOLDER_DIRECTORY") else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    let _store = store::Store::open(Some(directory.clone())).unwrap();
+    std::fs::write(directory.join("lock-holder-ready"), b"ready").unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_lock_file_is_removed_after_its_holder_is_killed() {
+    use std::process::{Command, Stdio};
+
+    let directory = std::env::temp_dir().join(format!("otter-lock-kill-{}", uuid::Uuid::new_v4()));
+    let store = store::Store::open(Some(directory.clone())).unwrap();
+    drop(store);
+    let ready = directory.join("lock-holder-ready");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "controller::tests::lock_holder_child_process",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("OTTER_LOCK_HOLDER_DIRECTORY", &directory)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let ready_in_time = (0..200).any(|_| {
+        if ready.exists() {
+            return true;
+        }
+        if child.try_wait().unwrap().is_some() {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+        false
+    });
+    if !ready_in_time {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("lock-holder process did not acquire the state lock");
+    }
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(!directory.join("agent.lock").exists());
+    let reopened = store::Store::open(Some(directory.clone())).unwrap();
+    drop(reopened);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn update_launch_failure_includes_the_operating_system_cause() {
+    let error = Error::UpdateLaunch("Access is denied (os error 5)".into());
+
+    assert_eq!(
+        error.to_string(),
+        "Could not prepare or start the verified Otter update helper: Access is denied (os error 5)"
+    );
+    assert_eq!(
+        Error::NotFound.to_string(),
+        "Queued import no longer exists on the controller."
+    );
 }
 
 #[cfg(unix)]
@@ -1231,6 +1386,54 @@ async fn update_failure_reason_survives_network_errors_until_server_acknowledges
             && request.contains("\"status\":\"failed\"")
             && request.contains("\"reason\":\"signatureRejected\"")
     }));
+}
+
+#[test]
+fn pending_update_confirmation_requires_version_target_and_digest_then_queues_cleanup() {
+    let pending = PendingUpdate {
+        id: "update-confirm".into(),
+        version: "v0.15.0".into(),
+        target: otserver_otter::update::BUILD_TARGET.into(),
+        binary_digest: "a".repeat(64),
+        binary_size: 313,
+        previous_version: "v0.14.0".into(),
+        previous_digest: "b".repeat(64),
+    };
+    let mut state = UpdateState {
+        pending: Some(pending.clone()),
+        ..UpdateState::default()
+    };
+
+    assert!(!confirm_pending_update(
+        &mut state,
+        "v0.15.0",
+        otserver_otter::update::BUILD_TARGET,
+        &"c".repeat(64),
+    ));
+    assert!(state.pending.is_some());
+    assert!(confirm_pending_update(
+        &mut state,
+        "v0.15.0",
+        otserver_otter::update::BUILD_TARGET,
+        &"a".repeat(64),
+    ));
+    assert!(state.pending.is_none());
+    assert_eq!(state.version_floor.as_deref(), Some("v0.15.0"));
+    assert_eq!(state.cleanup_helpers, ["update-confirm"]);
+    assert!(!confirm_pending_update(
+        &mut UpdateState::default(),
+        "v0.15.0",
+        otserver_otter::update::BUILD_TARGET,
+        &"a".repeat(64),
+    ));
+    state.pending = Some(pending);
+    assert!(confirm_pending_update(
+        &mut state,
+        "v0.15.0",
+        otserver_otter::update::BUILD_TARGET,
+        &"a".repeat(64),
+    ));
+    assert_eq!(state.cleanup_helpers, ["update-confirm"]);
 }
 
 #[tokio::test]
@@ -1687,6 +1890,45 @@ async fn failed_queued_import_retries_by_id_once_without_reuploading() {
 }
 
 #[tokio::test]
+async fn missing_queued_import_does_not_block_later_status_checks() {
+    let (mut api, task) = server(vec![
+        (404, json!({})),
+        (200, json!({"id":"import2","status":"completed"})),
+    ])
+    .await;
+    let store = PrivateStore::new();
+    api.log = store.get().log.clone();
+    let mut state = State {
+        pending_imports: vec![
+            PendingImport {
+                id: "missing-import".into(),
+                status: "pending".into(),
+                retries: 0,
+            },
+            PendingImport {
+                id: "import2".into(),
+                status: "running".into(),
+                retries: 0,
+            },
+        ],
+        ..State::default()
+    };
+
+    imports(&api, store.get(), &mut state).await.unwrap();
+
+    assert!(state.pending_imports.is_empty());
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("GET /api/asset-imports/missing-import "));
+    assert!(requests[1].starts_with("GET /api/asset-imports/import2 "));
+    assert!(
+        store
+            .log()
+            .contains("remaining import statuses will still be checked")
+    );
+}
+
+#[tokio::test]
 async fn controller_url_mismatch_preserves_state_and_explains_the_overwrite_flag() {
     let mut store = PrivateStore::new();
     store
@@ -1868,6 +2110,73 @@ async fn failed_reenrollment_preserves_previous_machine_credential_and_settings(
     assert_eq!(state.server_url, "https://previous.example/");
     assert_eq!(state.settings.poll_seconds, 80);
     assert_eq!(store.credential(&state).unwrap(), old.credential);
+}
+
+#[tokio::test]
+async fn successful_controller_takeover_clears_old_update_state_and_staging() {
+    let issued = credential();
+    let (api, requests) = server(vec![(
+        201,
+        json!({
+            "credential": issued.credential,
+            "credentialExpiresAt": issued.credential_expires_at,
+            "scanner": {"id":"scanner-new", "name":"New controller", "site":"site1"}
+        }),
+    )])
+    .await;
+    let mut private = PrivateStore::new();
+    let old = credential();
+    let mut state = State {
+        server_url: "https://previous.example/".into(),
+        scanner: Some(scanner()),
+        ..State::default()
+    };
+    private
+        .get()
+        .persist_credential(&mut state, &old, true)
+        .unwrap();
+    let pending = PendingUpdate {
+        id: "old-update".into(),
+        version: "v0.15.0".into(),
+        target: otserver_otter::update::BUILD_TARGET.into(),
+        binary_digest: "a".repeat(64),
+        binary_size: 123,
+        previous_version: "v0.14.0".into(),
+        previous_digest: "b".repeat(64),
+    };
+    private
+        .get()
+        .save_update_state(&UpdateState {
+            version_floor: Some("v0.14.0".into()),
+            pending: Some(pending),
+            ..UpdateState::default()
+        })
+        .unwrap();
+    let candidate = private.path.join("update-old-update.bin");
+    let updater = private.path.join("update-old-update.updater.exe");
+    std::fs::write(&candidate, b"old update").unwrap();
+    std::fs::write(&updater, b"old updater").unwrap();
+    private.store.take();
+
+    let args = controller_args(&[
+        "--server-url",
+        api.base.as_str(),
+        "--state-dir",
+        private.path.to_str().unwrap(),
+        "--enroll",
+        "--enroll-only",
+        "--overwrite-state-dir",
+        "--file-credentials",
+    ]);
+    let (store, state, _) = initialize(&args, Some(&"t".repeat(43))).await.unwrap();
+
+    let updates = store.load_update_state().unwrap();
+    assert!(updates.pending.is_none());
+    assert!(updates.version_floor.is_none());
+    assert!(updates.failed.is_none() && updates.rolled_back.is_none());
+    assert!(!candidate.exists() && !updater.exists());
+    assert_eq!(state.server_url, api.base.as_str());
+    assert_eq!(requests.await.unwrap().len(), 1);
 }
 
 #[test]
