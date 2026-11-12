@@ -486,7 +486,7 @@ fn restrict_windows(path: &Path) -> Result<(), Error> {
     };
     use windows_sys::Win32::Security::{
         CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, OBJECT_INHERIT_ACE,
-        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_USER,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_OWNER, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 
@@ -502,6 +502,8 @@ fn restrict_windows(path: &Path) -> Result<(), Error> {
     // SAFETY: windows_token_user returns a successful TOKEN_USER in a pointer-aligned buffer.
     // Its SID storage remains alive until SetEntriesInAclW has copied it into the new ACL.
     let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let default_owner = windows_token_owner()?;
+    let default_owner_sid = unsafe { (*default_owner.as_ptr().cast::<TOKEN_OWNER>()).Owner };
     let mut owner = null_mut();
     let mut descriptor = null_mut();
     // SAFETY: name is NUL-terminated and output pointers remain valid through LocalFree.
@@ -520,10 +522,17 @@ fn restrict_windows(path: &Path) -> Result<(), Error> {
     if status != 0 {
         return Err(Error::Local("Could not inspect scanner state owner."));
     }
-    // SAFETY: GetNamedSecurityInfoW allocated descriptor and owner points into it.
-    let owned_by_user = unsafe { !owner.is_null() && EqualSid(owner, sid) != 0 };
+    // SAFETY: GetNamedSecurityInfoW allocated descriptor; owner points to a valid SID in it.
+    // Windows may use the token's default owner (such as Administrators when elevated), while
+    // data access remains restricted below to the token's user SID.
+    let owned_by_current_token = unsafe {
+        !owner.is_null()
+            && (EqualSid(owner, sid) != 0 || {
+                !default_owner_sid.is_null() && EqualSid(owner, default_owner_sid) != 0
+            })
+    };
     unsafe { LocalFree(descriptor.cast()) };
-    if !owned_by_user {
+    if !owned_by_current_token {
         return Err(Error::Local(
             "Scanner state must belong to the current Windows user.",
         ));
@@ -551,8 +560,8 @@ fn restrict_windows(path: &Path) -> Result<(), Error> {
             "Could not construct private scanner state ACL.",
         ));
     }
-    // SAFETY: name is NUL-terminated and acl is owned by this call. Only the DACL is changed;
-    // owner, group and SACL are untouched. Protection removes inherited access from parents.
+    // SAFETY: name is NUL-terminated and acl is owned by this call. The protected DACL removes
+    // inherited access from parents.
     let status = unsafe {
         let status = SetNamedSecurityInfoW(
             name.as_ptr(),
@@ -582,11 +591,32 @@ pub(crate) fn current_windows_user() -> Result<Box<[usize; 32]>, String> {
     windows_token_user().map_err(|error| error.to_string())
 }
 
+#[cfg(all(windows, test))]
+pub(crate) fn current_windows_default_owner() -> Result<Box<[usize; 32]>, String> {
+    windows_token_owner().map_err(|error| error.to_string())
+}
+
 #[cfg(windows)]
 pub(super) fn windows_token_user() -> Result<Box<[usize; 32]>, Error> {
+    use windows_sys::Win32::Security::TokenUser;
+
+    windows_token_information(TokenUser)
+}
+
+#[cfg(windows)]
+fn windows_token_owner() -> Result<Box<[usize; 32]>, Error> {
+    use windows_sys::Win32::Security::TokenOwner;
+
+    windows_token_information(TokenOwner)
+}
+
+#[cfg(windows)]
+fn windows_token_information(
+    information_class: windows_sys::Win32::Security::TOKEN_INFORMATION_CLASS,
+) -> Result<Box<[usize; 32]>, Error> {
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TokenUser};
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     let mut token = null_mut();
@@ -594,19 +624,16 @@ pub(super) fn windows_token_user() -> Result<Box<[usize; 32]>, Error> {
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(Error::Local("Could not query scanner state owner token."));
     }
-    // TOKEN_USER plus SECURITY_MAX_SID_SIZE (68 bytes) fits even on 32-bit Windows.
-    // usize storage supplies the alignment required by TOKEN_USER's pointer fields.
-    // Keep the allocation stable: TOKEN_USER contains a pointer into this buffer.
-    let mut user = Box::new([0usize; 32]);
+    // Both token records and their SIDs fit this aligned buffer; SID pointers refer into it.
+    let mut information = Box::new([0usize; 32]);
     let mut length = 0;
-    // SAFETY: the token is valid and the aligned buffer's full size is supplied. CloseHandle
-    // releases the token on both paths; the returned SID is copied into user, not token-owned.
+    // SAFETY: the token and buffer are valid; the data stays in this box after CloseHandle.
     let success = unsafe {
         let success = GetTokenInformation(
             token,
-            TokenUser,
-            user.as_mut_ptr().cast(),
-            std::mem::size_of_val(user.as_ref()) as u32,
+            information_class,
+            information.as_mut_ptr().cast(),
+            std::mem::size_of_val(information.as_ref()) as u32,
             &mut length,
         );
         CloseHandle(token);
@@ -615,7 +642,7 @@ pub(super) fn windows_token_user() -> Result<Box<[usize; 32]>, Error> {
     if success == 0 {
         return Err(Error::Local("Could not read scanner state owner SID."));
     }
-    Ok(user)
+    Ok(information)
 }
 
 #[cfg(not(windows))]

@@ -1077,11 +1077,13 @@ fn file_credentials_and_assignment_survive_atomic_state_replacement() {
         use windows_sys::Win32::Security::{
             ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
             GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
-            TOKEN_USER,
+            TOKEN_OWNER, TOKEN_USER,
         };
         use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 
         let user = store::windows_token_user().unwrap();
+        let default_owner = store::current_windows_default_owner().unwrap();
+        let default_owner_sid = unsafe { (*default_owner.as_ptr().cast::<TOKEN_OWNER>()).Owner };
         for path in [
             &store.path,
             &store.path.join("agent-state.json"),
@@ -1115,7 +1117,9 @@ fn file_credentials_and_assignment_survive_atomic_state_replacement() {
             let private = unsafe {
                 let private = !acl.is_null()
                     && !owner.is_null()
-                    && EqualSid(owner, (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid) != 0
+                    && (EqualSid(owner, (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid) != 0
+                        || (!default_owner_sid.is_null()
+                            && EqualSid(owner, default_owner_sid) != 0))
                     && (*acl).AceCount == 1
                     && GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) != 0
                     && control & SE_DACL_PROTECTED != 0

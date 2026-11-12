@@ -5055,11 +5055,13 @@ mod tests {
         use windows_sys::Win32::Security::{
             ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
             GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
-            TOKEN_USER,
+            TOKEN_OWNER, TOKEN_USER,
         };
         use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 
         let user = crate::controller::store::current_windows_user().unwrap();
+        let default_owner = crate::controller::store::current_windows_default_owner().unwrap();
+        let default_owner_sid = unsafe { (*default_owner.as_ptr().cast::<TOKEN_OWNER>()).Owner };
         let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut owner = null_mut();
         let mut acl = null_mut();
@@ -5086,7 +5088,8 @@ mod tests {
         // SAFETY: descriptor owns the ACL/ACE; GetAce is checked before reading the ACE SID.
         let private = unsafe {
             !owner.is_null()
-                && EqualSid(owner, (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid) != 0
+                && (EqualSid(owner, (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid) != 0
+                    || (!default_owner_sid.is_null() && EqualSid(owner, default_owner_sid) != 0))
                 && !acl.is_null()
                 && (*acl).AceCount == 1
                 && GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) != 0
