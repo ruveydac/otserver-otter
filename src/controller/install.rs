@@ -1766,7 +1766,10 @@ mod tests {
             "Enroll this scanner before installing the controller."
         );
         assert!(directory.join("controller.log").is_file());
-        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+        assert_eq!(
+            std::fs::read_dir(&directory).unwrap().count(),
+            if cfg!(windows) { 1 } else { 2 }
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
