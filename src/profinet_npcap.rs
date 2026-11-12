@@ -27,6 +27,7 @@ const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 // Match libpcap's non-promiscuous NPF setup. An opened adapter needs both the packet filter and
 // a nonzero kernel capture buffer before it can deliver received frames.
 const CAPTURE_HW_FILTER: u32 = 0x0080 | 0x0001 | 0x0002 | 0x0008;
+const PASSIVE_HW_FILTER: u32 = CAPTURE_HW_FILTER | 0x0004;
 
 // Public bpf_insn/bpf_program layout from the Npcap SDK's Packet32.h.
 #[repr(C)]
@@ -132,6 +133,83 @@ const ARP_FILTER: [BpfInsn; 4] = [
         jt: 0,
         jf: 0,
         k: 0,
+    },
+];
+
+// LLDP EtherType after zero, one, or two VLAN tags. The parser still checks the LLDP multicast
+// destination and frame structure before accepting a neighbor.
+const LLDP_FILTER: [BpfInsn; 12] = [
+    BpfInsn {
+        code: 0x28,
+        jt: 0,
+        jf: 0,
+        k: 12,
+    },
+    BpfInsn {
+        code: 0x15,
+        jt: 9,
+        jf: 0,
+        k: 0x88cc,
+    },
+    BpfInsn {
+        code: 0x15,
+        jt: 1,
+        jf: 0,
+        k: 0x8100,
+    },
+    BpfInsn {
+        code: 0x15,
+        jt: 0,
+        jf: 6,
+        k: 0x88a8,
+    },
+    BpfInsn {
+        code: 0x28,
+        jt: 0,
+        jf: 0,
+        k: 16,
+    },
+    BpfInsn {
+        code: 0x15,
+        jt: 5,
+        jf: 0,
+        k: 0x88cc,
+    },
+    BpfInsn {
+        code: 0x15,
+        jt: 1,
+        jf: 0,
+        k: 0x8100,
+    },
+    BpfInsn {
+        code: 0x15,
+        jt: 0,
+        jf: 2,
+        k: 0x88a8,
+    },
+    BpfInsn {
+        code: 0x28,
+        jt: 0,
+        jf: 0,
+        k: 20,
+    },
+    BpfInsn {
+        code: 0x15,
+        jt: 1,
+        jf: 0,
+        k: 0x88cc,
+    },
+    BpfInsn {
+        code: 0x06,
+        jt: 0,
+        jf: 0,
+        k: 0,
+    },
+    BpfInsn {
+        code: 0x06,
+        jt: 0,
+        jf: 0,
+        k: u32::MAX,
     },
 ];
 
@@ -373,19 +451,21 @@ pub fn capture(
     )
 }
 
-pub fn capture_raw(
+pub fn capture_raw_until(
     interface: &str,
     request: &[u8],
     wait: Duration,
     cancelled: &AtomicBool,
+    stop_when: impl Fn() -> bool,
     on_frame: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>, String>,
 ) -> Result<(), String> {
-    capture_inner(
+    capture_inner_until(
         interface,
         request,
         wait,
         cancelled,
         CaptureFilter::All,
+        stop_when,
         on_frame,
     )
 }
@@ -441,17 +521,38 @@ fn capture_inner(
     filter: CaptureFilter,
     on_frame: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>, String>,
 ) -> Result<(), String> {
+    capture_inner_until(
+        interface,
+        request,
+        wait,
+        cancelled,
+        filter,
+        || false,
+        on_frame,
+    )
+}
+
+fn capture_inner_until(
+    interface: &str,
+    request: &[u8],
+    wait: Duration,
+    cancelled: &AtomicBool,
+    filter: CaptureFilter,
+    stop_when: impl Fn() -> bool,
+    on_frame: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>, String>,
+) -> Result<(), String> {
     if cancelled.load(Ordering::Relaxed) {
         return Ok(());
     }
     let api = Api::load()?;
-    capture_with_api(
+    capture_with_api_until(
         &api,
         interface,
         std::iter::once(request),
         wait,
         cancelled,
         filter,
+        stop_when,
         on_frame,
     )
 }
@@ -463,6 +564,28 @@ fn capture_with_api<F: AsRef<[u8]>>(
     wait: Duration,
     cancelled: &AtomicBool,
     filter: CaptureFilter,
+    on_frame: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>, String>,
+) -> Result<(), String> {
+    capture_with_api_until(
+        api,
+        interface,
+        requests,
+        wait,
+        cancelled,
+        filter,
+        || false,
+        on_frame,
+    )
+}
+
+fn capture_with_api_until<F: AsRef<[u8]>>(
+    api: &Api,
+    interface: &str,
+    requests: impl Iterator<Item = F>,
+    wait: Duration,
+    cancelled: &AtomicBool,
+    filter: CaptureFilter,
+    mut stop_when: impl FnMut() -> bool,
     mut on_frame: impl FnMut(&[u8]) -> Result<Option<Vec<u8>>, String>,
 ) -> Result<(), String> {
     let mut requests = requests.fuse().peekable();
@@ -488,7 +611,12 @@ fn capture_with_api<F: AsRef<[u8]>>(
     // requires an explicit NDIS packet filter before its read event can receive traffic.
     // SAFETY: adapter is open and the call only configures this handle.
     unsafe { SetLastError(0) };
-    if unsafe { (api.set_hw_filter)(adapter.handle, CAPTURE_HW_FILTER) } == 0 {
+    let hardware_filter = if filter == CaptureFilter::Passive {
+        PASSIVE_HW_FILTER
+    } else {
+        CAPTURE_HW_FILTER
+    };
+    if unsafe { (api.set_hw_filter)(adapter.handle, hardware_filter) } == 0 {
         return Err(npcap_error(
             &format!("Npcap could not enable capture on interface {interface}"),
             // SAFETY: read immediately after the failed Win32 API call.
@@ -534,15 +662,17 @@ fn capture_with_api<F: AsRef<[u8]>>(
         ));
     }
     // Best effort: reject unrelated traffic in the driver as well as at the callback.
-    if !matches!(filter, CaptureFilter::All | CaptureFilter::Passive)
+    if filter != CaptureFilter::All
         && let Some(set_bpf) = api.set_bpf
     {
         let mut dcp = DCP_FILTER;
         let mut arp = ARP_FILTER;
-        let instructions = if filter == CaptureFilter::Dcp {
-            &mut dcp[..]
-        } else {
-            &mut arp[..]
+        let mut lldp = LLDP_FILTER;
+        let instructions = match filter {
+            CaptureFilter::Dcp => &mut dcp[..],
+            CaptureFilter::Arp => &mut arp[..],
+            CaptureFilter::Passive => &mut lldp[..],
+            CaptureFilter::All => unreachable!(),
         };
         let mut program = BpfProgram {
             length: instructions.len() as u32,
@@ -564,7 +694,7 @@ fn capture_with_api<F: AsRef<[u8]>>(
     };
     let mut last_sent = Instant::now();
     loop {
-        if cancelled.load(Ordering::Relaxed) {
+        if cancelled.load(Ordering::Relaxed) || stop_when() {
             break;
         }
         let poll_ms = if let Some(request) = requests.next() {
@@ -644,6 +774,7 @@ fn capture_with_api<F: AsRef<[u8]>>(
         let mut deliver = |frame: &[u8]| {
             if (filter == CaptureFilter::Dcp && !is_identify_response(frame))
                 || (filter == CaptureFilter::Arp && frame.get(12..14) != Some(&[0x08, 0x06]))
+                || (filter == CaptureFilter::Passive && !is_lldp_frame(frame))
             {
                 return Ok(());
             }
@@ -818,6 +949,21 @@ fn is_identify_response(frame: &[u8]) -> bool {
         && frame[16..18] == [0x05, 0x01]
 }
 
+fn is_lldp_frame(frame: &[u8]) -> bool {
+    let mut offset = 12;
+    for _ in 0..=2 {
+        let Some(ether_type) = frame.get(offset..offset + 2) else {
+            return false;
+        };
+        match ether_type {
+            [0x88, 0xcc] => return true,
+            [0x81, 0x00] | [0x88, 0xa8] if offset < 20 => offset += 4,
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn align_packet(length: usize) -> usize {
     (length + PACKET_ALIGNMENT - 1) & !(PACKET_ALIGNMENT - 1)
 }
@@ -841,7 +987,7 @@ fn npcap_error(context: &str, error: u32) -> String {
     }
 }
 
-fn system_directory() -> Result<PathBuf, String> {
+pub(crate) fn system_directory() -> Result<PathBuf, String> {
     let mut buffer = [0_u16; 32_768];
     // SAFETY: buffer is writable for the supplied element count.
     let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
@@ -874,8 +1020,8 @@ mod capture_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_adapter_name, capture_wait_duration, is_npcap_name, parse_bpf_records,
-        wait_millis,
+        BpfInsn, LLDP_FILTER, PASSIVE_HW_FILTER, canonical_adapter_name, capture_wait_duration,
+        is_lldp_frame, is_npcap_name, parse_bpf_records, wait_millis,
     };
     use std::time::Duration;
 
@@ -893,6 +1039,69 @@ mod tests {
             r"\Device\NPF_{8D11417D-4D16-4D5B-9917-C30CF60DF212}"
         ));
         assert!(!is_npcap_name("{8D11417D-4D16-4D5B-9917-C30CF60DF212}"));
+    }
+
+    #[test]
+    fn passive_capture_enables_all_multicast_and_recognizes_vlan_lldp() {
+        assert_eq!(PASSIVE_HW_FILTER & 0x0004, 0x0004);
+        for tags in [
+            Vec::<u16>::new(),
+            vec![0x8100],
+            vec![0x88a8],
+            vec![0x8100, 0x88a8],
+        ] {
+            let mut frame = vec![0; 64];
+            let mut offset = 12;
+            for tag in tags {
+                frame[offset..offset + 2].copy_from_slice(&tag.to_be_bytes());
+                offset += 2;
+                frame[offset..offset + 2].copy_from_slice(&[0, 1]);
+                offset += 2;
+            }
+            frame[offset..offset + 2].copy_from_slice(&0x88cc_u16.to_be_bytes());
+            assert!(is_lldp_frame(&frame));
+            assert!(bpf_accepts(&LLDP_FILTER, &frame));
+        }
+
+        let mut unrelated = vec![0; 64];
+        unrelated[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
+        assert!(!is_lldp_frame(&unrelated));
+        assert!(!bpf_accepts(&LLDP_FILTER, &unrelated));
+
+        let mut too_many_tags = vec![0; 64];
+        too_many_tags[12..14].copy_from_slice(&0x8100_u16.to_be_bytes());
+        too_many_tags[16..18].copy_from_slice(&0x8100_u16.to_be_bytes());
+        too_many_tags[20..22].copy_from_slice(&0x8100_u16.to_be_bytes());
+        too_many_tags[24..26].copy_from_slice(&0x88cc_u16.to_be_bytes());
+        assert!(!is_lldp_frame(&too_many_tags));
+        assert!(!bpf_accepts(&LLDP_FILTER, &too_many_tags));
+    }
+
+    fn bpf_accepts(instructions: &[BpfInsn], frame: &[u8]) -> bool {
+        let mut accumulator = 0;
+        let mut pc = 0;
+        while let Some(instruction) = instructions.get(pc) {
+            match instruction.code {
+                0x28 => {
+                    let offset = instruction.k as usize;
+                    let Some(bytes) = frame.get(offset..offset + 2) else {
+                        return false;
+                    };
+                    accumulator = u32::from(u16::from_be_bytes([bytes[0], bytes[1]]));
+                    pc += 1;
+                }
+                0x15 => {
+                    pc += 1 + usize::from(if accumulator == instruction.k {
+                        instruction.jt
+                    } else {
+                        instruction.jf
+                    });
+                }
+                0x06 => return instruction.k != 0,
+                _ => panic!("unexpected instruction in the LLDP test filter"),
+            }
+        }
+        false
     }
 
     #[test]

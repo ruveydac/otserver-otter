@@ -14,6 +14,7 @@ const RPC_CLIENT_PORT: u16 = EPM_PORT;
 const DEFAULT_RECORD_DATA_LENGTH: u32 = 32_768;
 const MAX_RECORD_DATA_LENGTH: u32 = 32_768;
 const MAX_RPC_BODY_LENGTH: usize = MAX_RECORD_DATA_LENGTH as usize + 128;
+const MAX_RPC_FRAGMENTS: usize = 256;
 pub(crate) const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const EPM_INTERFACE: &str = "e1af8308-5d1f-11c9-91a4-08002b14a0fa";
@@ -433,15 +434,80 @@ pub(crate) fn exchange(
             )?;
             send_frame(&ack_frame)?;
         }
-        let last = !header.is_fragmented() || header.is_last_fragment();
-        fragments.push((header, body));
-        if last {
+        push_rpc_fragment(&mut fragments, header, body)?;
+        if rpc_fragments_complete(&fragments) {
             return reassemble_rpc_fragments(fragments);
         }
     }
     Err(format!(
         "PROFINET RPC response from {target_ip}:{target_port} timed out."
     ))
+}
+
+pub(crate) fn push_rpc_fragment(
+    fragments: &mut Vec<(RpcHeader, Vec<u8>)>,
+    header: RpcHeader,
+    body: Vec<u8>,
+) -> Result<(), String> {
+    if header.packet_type != 2 || usize::from(header.fragment_number) >= MAX_RPC_FRAGMENTS {
+        return Err("DCE/RPC response exceeded the bounded fragment count.".into());
+    }
+    if let Some((first, _)) = fragments.first()
+        && (header.big_endian != first.big_endian
+            || header.object_uuid != first.object_uuid
+            || header.interface_uuid != first.interface_uuid
+            || header.activity_uuid != first.activity_uuid
+            || header.sequence != first.sequence
+            || header.operation != first.operation
+            || header.is_fragmented() != first.is_fragmented())
+    {
+        return Err("DCE/RPC response fragments did not describe one request.".into());
+    }
+    if let Some((existing_header, existing_body)) = fragments
+        .iter()
+        .find(|(existing, _)| existing.fragment_number == header.fragment_number)
+    {
+        if existing_header == &header && existing_body == &body {
+            return Ok(());
+        }
+        return Err("DCE/RPC response contained conflicting duplicate fragments.".into());
+    }
+    if fragments.len() >= MAX_RPC_FRAGMENTS
+        || fragments
+            .iter()
+            .map(|(_, fragment)| fragment.len())
+            .sum::<usize>()
+            .checked_add(body.len())
+            .is_none_or(|total| total > MAX_RPC_BODY_LENGTH)
+    {
+        return Err("DCE/RPC response exceeded its bounded reassembly size.".into());
+    }
+    fragments.push((header, body));
+    Ok(())
+}
+
+pub(crate) fn rpc_fragments_complete(fragments: &[(RpcHeader, Vec<u8>)]) -> bool {
+    let Some((first, _)) = fragments.first() else {
+        return false;
+    };
+    if !first.is_fragmented() {
+        return fragments.len() == 1 && first.fragment_number == 0;
+    }
+    let mut seen = [false; MAX_RPC_FRAGMENTS];
+    let mut last = None;
+    for (header, _) in fragments {
+        let number = usize::from(header.fragment_number);
+        if !header.is_fragmented() || seen[number] {
+            return false;
+        }
+        seen[number] = true;
+        if header.is_last_fragment() && last.replace(number).is_some() {
+            return false;
+        }
+    }
+    last.is_some_and(|last| {
+        fragments.len() == last + 1 && seen[..=last].iter().all(|present| *present)
+    })
 }
 
 pub(crate) fn ethernet_ipv4_udp_frame(
@@ -670,6 +736,9 @@ pub(crate) fn reassemble_rpc_fragments(
 ) -> Result<(RpcHeader, Vec<u8>), String> {
     if fragments.is_empty() {
         return Err("DCE/RPC response contained no fragments.".into());
+    }
+    if fragments.len() > MAX_RPC_FRAGMENTS {
+        return Err("DCE/RPC response exceeded the bounded fragment count.".into());
     }
     fragments.sort_by_key(|(header, _)| header.fragment_number);
     let first = fragments[0].0.clone();
@@ -2501,6 +2570,60 @@ mod tests {
             )])
             .unwrap_err()
             .contains("bounded reassembly length")
+        );
+    }
+
+    #[test]
+    fn rpc_fragment_collection_deduplicates_and_completes_out_of_order() {
+        let base = RpcHeader::new(
+            2,
+            0x04,
+            false,
+            endpoint(false).object_uuid,
+            endpoint(false).interface_uuid,
+            endpoint(false).activity_uuid,
+            1,
+            7,
+            5,
+            0,
+        )
+        .unwrap();
+        let first = RpcHeader {
+            fragment_number: 0,
+            ..base.clone()
+        };
+        let last = RpcHeader {
+            flags: 0x06,
+            fragment_number: 1,
+            ..base
+        };
+        let mut fragments = Vec::new();
+
+        push_rpc_fragment(&mut fragments, last.clone(), vec![2]).unwrap();
+        assert!(!rpc_fragments_complete(&fragments));
+        push_rpc_fragment(&mut fragments, last.clone(), vec![2]).unwrap();
+        assert_eq!(fragments.len(), 1);
+        push_rpc_fragment(&mut fragments, first.clone(), vec![1]).unwrap();
+        assert!(rpc_fragments_complete(&fragments));
+
+        let (_, body) = reassemble_rpc_fragments(fragments).unwrap();
+        assert_eq!(body, [1, 2]);
+        assert!(
+            push_rpc_fragment(&mut vec![(first.clone(), vec![1])], first, vec![9])
+                .unwrap_err()
+                .contains("conflicting duplicate")
+        );
+        assert!(
+            push_rpc_fragment(
+                &mut Vec::new(),
+                RpcHeader {
+                    fragment_number: MAX_RPC_FRAGMENTS as u16,
+                    ..last
+                },
+                vec![]
+            )
+            .unwrap_err()
+            .contains("fragment count")
         );
     }
 

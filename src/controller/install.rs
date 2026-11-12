@@ -8,6 +8,45 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+pub(super) fn cleanup_update_artifacts(directory: &Path, id: &str) -> bool {
+    if !super::valid_id(id) {
+        return false;
+    }
+    let mut complete = true;
+    for suffix in ["bin", "updater.exe"] {
+        let path = directory.join(format!("update-{id}.{suffix}"));
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            complete = false;
+        }
+    }
+    #[cfg(windows)]
+    {
+        let Ok(executable) = installed_executable() else {
+            return false;
+        };
+        let Some(parent) = executable.parent() else {
+            return false;
+        };
+        let path = parent.join(format!("otserver-otter-update-{id}.previous.exe"));
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            complete = false;
+        }
+        for suffix in ["new", "failed"] {
+            let path = parent.join(format!("otserver-otter-update-{id}.{suffix}.exe"));
+            if let Err(error) = std::fs::remove_file(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                complete = false;
+            }
+        }
+    }
+    complete
+}
+
 pub(super) fn install(directory: Option<PathBuf>, graphical: bool) -> Result<String, String> {
     let store = Store::open(directory).map_err(|e| e.to_string())?;
     let mut state = store.load().map_err(|e| e.to_string())?;
@@ -675,6 +714,47 @@ pub(super) fn apply_update(
 }
 
 #[cfg(target_os = "windows")]
+fn replace_windows_file(replaced: &Path, replacement: &Path, backup: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    match backup.symlink_metadata() {
+        Ok(_) => return Err("A Windows update recovery file already exists.".into()),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err("Could not inspect the Windows update recovery path.".into());
+        }
+        Err(_) => {}
+    }
+    let replaced: Vec<u16> = replaced.as_os_str().encode_wide().chain(Some(0)).collect();
+    let replacement: Vec<u16> = replacement
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let backup: Vec<u16> = backup.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: the three paths are valid, NUL-terminated UTF-16 and reside on the same volume.
+    // ReplaceFileW swaps the executable and retains the previous signed file as the backup.
+    if unsafe {
+        ReplaceFileW(
+            replaced.as_ptr(),
+            replacement.as_ptr(),
+            backup.as_ptr(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    } == 0
+    {
+        Err(format!(
+            "Could not replace the Windows Otter executable: {}",
+            std::io::Error::last_os_error()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn apply_windows_update(
     directory: Option<PathBuf>,
     id: &str,
@@ -754,14 +834,7 @@ fn apply_windows_update(
         let _ = std::fs::remove_file(&staged_path);
         return Err("The staged Windows Otter executable failed its final verification.".into());
     }
-    if let Err(_) = std::fs::rename(&executable, &backup) {
-        let _ = std::fs::remove_file(&staged_path);
-        return Err("Could not move the old Otter executable aside for replacement.".into());
-    }
-    if std::fs::rename(&staged_path, &executable).is_err() {
-        let _ = std::fs::rename(&backup, &executable);
-        return Err("Could not publish the signed Windows Otter update.".into());
-    }
+    replace_windows_file(&executable, &staged_path, &backup)?;
     drop(store);
 
     let mut child = Command::new(&executable)
@@ -791,7 +864,7 @@ fn apply_windows_update(
 }
 
 #[cfg(target_os = "windows")]
-fn recover_windows_update(directory: &Path, id: &str) -> Result<(), String> {
+pub(super) fn recover_windows_update(directory: &Path, id: &str) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
 
     if !super::valid_id(id) {
@@ -807,6 +880,7 @@ fn recover_windows_update(directory: &Path, id: &str) -> Result<(), String> {
     let executable = installed_executable()?;
     let parent = executable.parent().ok_or("Invalid installation path.")?;
     let backup = parent.join(format!("otserver-otter-update-{id}.previous.exe"));
+    let failed = parent.join(format!("otserver-otter-update-{id}.failed.exe"));
     let current_is_previous =
         otserver_otter::update::verify_binary(&executable, otserver_otter::update::BUILD_TARGET)
             .is_ok_and(|binary| binary.version() == pending.previous_version)
@@ -820,13 +894,8 @@ fn recover_windows_update(directory: &Path, id: &str) -> Result<(), String> {
         {
             return Err("The signed rollback executable failed verification.".into());
         }
-        if executable.exists() {
-            std::fs::remove_file(&executable).map_err(
-                |_| "Could not remove the failed Windows Otter executable for rollback.",
-            )?;
-        }
-        std::fs::rename(&backup, &executable)
-            .map_err(|_| "Could not restore the previous signed Windows Otter executable.")?;
+        replace_windows_file(&executable, &backup, &failed)?;
+        let _ = std::fs::remove_file(&failed);
         true
     };
     state.pending = None;
@@ -837,13 +906,14 @@ fn recover_windows_update(directory: &Path, id: &str) -> Result<(), String> {
         state.failed = Some(id.to_owned());
         state.failed_reason = Some(super::UpdateFailureReason::InstallationFailed);
     }
+    if !state.cleanup_helpers.contains(&id.to_owned()) {
+        state.cleanup_helpers.push(id.to_owned());
+    }
     store
         .save_update_state(&state)
         .map_err(|error| error.to_string())?;
     drop(store);
-    for suffix in ["bin", "updater.exe"] {
-        let _ = std::fs::remove_file(directory.join(format!("update-{id}.{suffix}")));
-    }
+    let _ = cleanup_update_artifacts(directory, id);
     Command::new(&executable)
         .args(["controller", "--state-dir"])
         .arg(directory)
@@ -1477,6 +1547,50 @@ fn start_installation(_: &Path, _: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_cleanup_removes_only_the_validated_id_artifacts() {
+        let id = format!("cleanup-{}", uuid::Uuid::new_v4());
+        let directory =
+            std::env::temp_dir().join(format!("otter-update-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let expected = [
+            directory.join(format!("update-{id}.bin")),
+            directory.join(format!("update-{id}.updater.exe")),
+        ];
+        let unrelated = directory.join("update-other.bin");
+        for path in expected.iter().chain([&unrelated]) {
+            std::fs::write(path, b"staged").unwrap();
+        }
+
+        assert!(cleanup_update_artifacts(&directory, &id));
+        assert!(expected.iter().all(|path| !path.exists()));
+        assert!(unrelated.is_file());
+        assert!(!cleanup_update_artifacts(&directory, "../outside"));
+
+        std::fs::remove_file(unrelated).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_replacement_keeps_a_recoverable_previous_file() {
+        let directory =
+            std::env::temp_dir().join(format!("otter-update-replace-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let installed = directory.join("otserver-otter.exe");
+        let candidate = directory.join("candidate.exe");
+        let backup = directory.join("previous.exe");
+        std::fs::write(&installed, b"previous signed binary").unwrap();
+        std::fs::write(&candidate, b"new signed binary").unwrap();
+
+        replace_windows_file(&installed, &candidate, &backup).unwrap();
+
+        assert_eq!(std::fs::read(&installed).unwrap(), b"new signed binary");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"previous signed binary");
+        assert!(!candidate.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

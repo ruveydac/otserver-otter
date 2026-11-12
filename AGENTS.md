@@ -457,7 +457,10 @@ MAC, so this checks protocol clients, not distinct device identity. The importab
 after validation; retain only the text summary and Compose log. DCP is disabled because Docker
 Desktop does not bridge raw Ethernet to Windows capture drivers. Validate active Windows DCP and
 multi-device MAC discovery on physical Layer-2 devices or a dedicated external test interface after
-Npcap changes. SMB/RPC are excluded because host services own TCP 445/135.
+Npcap changes. After Windows-native changes, also verify the private config/state ACL and replacement,
+Task Scheduler S4U registration/restart, Schannel outbound TLS, `pktmon` fallback, and Npcap LLDP/PNIO
+capture on native Windows. Linux cross-checks and Wine do not replace those OS-permission, TLS, or
+physical-adapter checks. SMB/RPC are excluded because host services own TCP 445/135.
 
 Responders use pinned Snap7, libIEC61850, SNMP Simulator, checksum-pinned OpENer/BACnet Stack,
 asyncua, and bounded FINS/Fox/DNP3 implementations. NetBIOS uses Samba `nmbd`; SMB/RPC use real

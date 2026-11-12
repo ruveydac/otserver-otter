@@ -1,7 +1,7 @@
 //! Outbound controller v1 client. Local scans still use the shared safety/pacing path.
 mod install;
 mod log;
-mod store;
+pub(crate) mod store;
 #[cfg(test)]
 mod tests;
 
@@ -397,6 +397,8 @@ struct UpdateState {
     failed: Option<String>,
     #[serde(default)]
     failed_reason: Option<UpdateFailureReason>,
+    #[serde(default)]
+    cleanup_helpers: Vec<String>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -1698,23 +1700,39 @@ async fn handle_update(
 
 fn confirm_local_update(store: &store::Store) -> Result<(), Error> {
     let mut state = store.load_update_state()?;
-    let Some(pending) = state.pending.as_ref() else {
+    if state.pending.is_none() {
         return Ok(());
-    };
+    }
     let executable = std::env::current_exe().map_err(|_| Error::Invalid)?;
     let verified =
         otserver_otter::update::verify_binary(&executable, otserver_otter::update::BUILD_TARGET)
             .map_err(|_| Error::Invalid)?;
-    if verified.version() != pending.version
-        || verified.target() != pending.target
-        || current_binary_digest()? != pending.binary_digest
-    {
+    let digest = current_binary_digest()?;
+    if !confirm_pending_update(&mut state, verified.version(), verified.target(), &digest) {
         return Ok(());
+    }
+    store.save_update_state(&state)?;
+    Ok(())
+}
+
+fn confirm_pending_update(
+    state: &mut UpdateState,
+    version: &str,
+    target: &str,
+    digest: &str,
+) -> bool {
+    let Some(pending) = state.pending.as_ref() else {
+        return false;
+    };
+    if version != pending.version || target != pending.target || digest != pending.binary_digest {
+        return false;
+    }
+    if !state.cleanup_helpers.contains(&pending.id) {
+        state.cleanup_helpers.push(pending.id.clone());
     }
     state.version_floor = Some(pending.version.clone());
     state.pending = None;
-    store.save_update_state(&state)?;
-    Ok(())
+    true
 }
 
 pub async fn run(args: ControllerArgs) -> Result<(), String> {
@@ -1728,9 +1746,20 @@ pub async fn run(args: ControllerArgs) -> Result<(), String> {
             args.parent_pid.ok_or("Missing controller process ID.")?,
         );
     }
+    #[cfg(windows)]
+    let state_directory = args.state_dir.clone();
     match run_inner(args).await {
         Err(Error::UpdateHandoff) => Ok(()),
-        Err(error) => Err(error.to_string()),
+        Err(error) => {
+            #[cfg(windows)]
+            if let Ok(directory) = store::Store::directory(state_directory)
+                && let Ok(state) = store::Store::read_update_state(&directory)
+                && let Some(pending) = state.pending
+            {
+                let _ = install::recover_windows_update(&directory, &pending.id);
+            }
+            Err(error.to_string())
+        }
         Ok(()) => Ok(()),
     }
 }
@@ -1991,12 +2020,21 @@ async fn poll_once(
                     run.phase = Phase::Terminal;
                 }
                 let mut update_state = store.load_update_state()?;
+                let mut update_state_changed = false;
                 if let Some(pending) = update_state.pending.take() {
-                    for suffix in ["bin", "updater.exe"] {
-                        if let Ok(path) = store.update_path(&pending.id, suffix) {
-                            let _ = std::fs::remove_file(path);
-                        }
+                    if !install::cleanup_update_artifacts(store.path(), &pending.id) {
+                        update_state.cleanup_helpers.push(pending.id);
                     }
+                    update_state_changed = true;
+                }
+                for id in std::mem::take(&mut update_state.cleanup_helpers) {
+                    if !install::cleanup_update_artifacts(store.path(), &id) {
+                        update_state.cleanup_helpers.push(id);
+                    } else {
+                        update_state_changed = true;
+                    }
+                }
+                if update_state_changed {
                     store.save_update_state(&update_state)?;
                 }
                 imports(api, store, state).await?;

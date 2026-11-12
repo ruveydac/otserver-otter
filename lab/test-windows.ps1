@@ -66,10 +66,11 @@ $sourceMac = $labAdapter.MacAddress.Replace('-', ':').ToUpperInvariant()
 $interfaceGuid = $labAdapter.InterfaceGuid.ToString().Trim('{', '}').ToUpperInvariant()
 $interfaceId = "{$interfaceGuid}"
 $env:OTSERVER_LAB_BIND_IP = $labAddress
-$configPath = Join-Path (Split-Path -Parent $ScannerPath) 'otter.json'
-Set-Content -LiteralPath $configPath -Value '{"snmp":{"version":"2c","community":"lab-public"}}' -Encoding utf8
-New-Item -ItemType Directory -Force -Path $artifactDirectory | Out-Null
 $runId = [Guid]::NewGuid().ToString('N').Substring(0, 8)
+$testDirectory = Join-Path $env:TEMP "otserver-windows-scanner-smoke-$runId"
+$configPath = Join-Path $testDirectory 'otter.json'
+$testScannerPath = Join-Path $testDirectory 'otserver-otter.exe'
+New-Item -ItemType Directory -Force -Path $artifactDirectory | Out-Null
 $outputPath = Join-Path $env:TEMP "otserver-windows-protocol-smoke-$runId.otserver.json"
 $logPath = Join-Path $artifactDirectory "windows-compose-$runId.log"
 $summaryPath = Join-Path $artifactDirectory "windows-protocol-smoke-$runId.txt"
@@ -87,6 +88,16 @@ Write-Host 'IEC 61850 is excluded: its MMS port 102 is already host-bound by the
 Write-Host 'SMB/RPC are excluded: Windows host services own TCP 445/135; Linux lab tests use Samba.'
 
 try {
+    New-Item -ItemType Directory -Force -Path $testDirectory | Out-Null
+    Copy-Item -LiteralPath $ScannerPath -Destination $testScannerPath
+    $ScannerPath = $testScannerPath
+    $utf8WithoutBom = New-Object System.Text.UTF8Encoding -ArgumentList $false
+    [System.IO.File]::WriteAllText(
+        $configPath,
+        '{"snmp":{"version":"2c","community":"lab-public"}}',
+        $utf8WithoutBom
+    )
+
     & $DockerPath @composeArguments up --build --wait @services
     if ($LASTEXITCODE -ne 0) { throw "Docker lab startup failed with exit code $LASTEXITCODE." }
 
@@ -151,5 +162,8 @@ try {
     }
     if (Test-Path -LiteralPath $configPath) {
         Remove-Item -LiteralPath $configPath -Force
+    }
+    if (Test-Path -LiteralPath $testDirectory) {
+        Remove-Item -LiteralPath $testDirectory -Recurse -Force
     }
 }

@@ -612,10 +612,14 @@ fn write_config_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
         let mut file = options
             .open(&temporary)
             .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
+        #[cfg(windows)]
+        crate::controller::store::restrict_windows_file(&temporary)
+            .map_err(|error| format!("Could not secure {}: {error}", path.display()))?;
         file.write_all(data)
             .and_then(|()| file.sync_all())
             .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
-        replace_file(&temporary, path)
+        drop(file);
+        replace_config_file(&temporary, path)
             .map_err(|error| format!("Could not write {}: {error}", path.display()))
     })();
     if result.is_err() {
@@ -656,7 +660,58 @@ fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(not(windows))]
+fn replace_config_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    replace_file(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_config_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    match destination.symlink_metadata() {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            crate::controller::store::restrict_windows_file(destination).map_err(|message| {
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, message)
+            })?;
+            let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+            let destination: Vec<u16> = destination
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            // SAFETY: both paths are valid, nul-terminated UTF-16; ReplaceFileW preserves the
+            // destination security descriptor while replacing its contents.
+            let status = unsafe {
+                ReplaceFileW(
+                    destination.as_ptr(),
+                    source.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            };
+            if status == 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "configuration destination must be a regular file",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            replace_file(source, destination)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub fn parse_config(data: &[u8]) -> Result<ScannerConfigs, String> {
+    let data = data.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(data);
     let configs: ScannerConfigs =
         serde_json::from_slice(data).map_err(|error| error.to_string())?;
     configs.validate()?;
@@ -2767,6 +2822,18 @@ mod tests {
         assert!(parse_config(br#"[{"targets":["192.0.2.1"]}]"#).is_err());
         assert!(parse_config(br#"[{"name":" "}]"#).is_err());
         assert!(parse_config(br#"[{"name":"Line A"},{"name":"Line A"}]"#).is_err());
+    }
+
+    #[test]
+    fn configuration_parser_accepts_a_utf8_bom() {
+        let parsed = parse_config(
+            b"\xef\xbb\xbf{\"targets\":[\"192.0.2.1\"],\"interface\":\"test\",\"sourceMac\":\"00:11:22:33:44:55\"}",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.configs()[0].targets.as_ref().unwrap()[0],
+            "192.0.2.1"
+        );
     }
 
     fn complete_config(name: &str, target: &str, output: &str) -> ScannerConfig {
@@ -4961,6 +5028,82 @@ mod tests {
             0o600
         );
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_config_save_keeps_the_current_users_private_acl() {
+        let directory = std::env::temp_dir().join(format!("otter-config-acl-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("otter.json");
+
+        write_config_atomic(&path, b"{\"apiKey\":\"first\"}").unwrap();
+        assert!(windows_file_is_private(&path));
+        write_config_atomic(&path, b"{\"apiKey\":\"second\"}").unwrap();
+
+        assert!(windows_file_is_private(&path));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"apiKey\":\"second\"}");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn windows_file_is_private(path: &Path) -> bool {
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr::{addr_of, null_mut};
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+            GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+            TOKEN_USER,
+        };
+        use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+        let user = crate::controller::store::current_windows_user().unwrap();
+        let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut owner = null_mut();
+        let mut acl = null_mut();
+        let mut descriptor = null_mut();
+        // SAFETY: path is NUL-terminated; output pointers are valid through LocalFree.
+        if unsafe {
+            GetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                &mut acl,
+                null_mut(),
+                &mut descriptor,
+            )
+        } != 0
+        {
+            return false;
+        }
+        let mut ace = null_mut();
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: descriptor owns the ACL/ACE; GetAce is checked before reading the ACE SID.
+        let private = unsafe {
+            !owner.is_null()
+                && EqualSid(owner, (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid) != 0
+                && !acl.is_null()
+                && (*acl).AceCount == 1
+                && GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) != 0
+                && control & SE_DACL_PROTECTED != 0
+                && GetAce(acl, 0, &mut ace) != 0
+                && (*ace.cast::<ACCESS_ALLOWED_ACE>()).Header.AceType == 0
+                && (*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask == FILE_ALL_ACCESS
+                && EqualSid(
+                    addr_of!((*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart)
+                        .cast_mut()
+                        .cast(),
+                    (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid,
+                ) != 0
+        };
+        // SAFETY: GetNamedSecurityInfoW allocated the descriptor for this call.
+        unsafe { LocalFree(descriptor.cast()) };
+        private
     }
 
     #[tokio::test]

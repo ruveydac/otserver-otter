@@ -126,17 +126,21 @@ impl Store {
     pub(super) fn clear_update_state(&self) -> Result<(), Error> {
         let state = self.load_update_state()?;
         Self::write_update_state(&self.directory, &UpdateState::default())?;
-        for id in [
-            state.pending.map(|pending| pending.id),
-            state.failed,
-            state.rolled_back,
-        ]
-        .into_iter()
-        .flatten()
-        {
+        let mut ids = state.cleanup_helpers;
+        ids.extend(
+            [
+                state.pending.map(|pending| pending.id),
+                state.failed,
+                state.rolled_back,
+            ]
+            .into_iter()
+            .flatten(),
+        );
+        for id in ids {
             for suffix in ["bin", "updater.exe"] {
                 let _ = std::fs::remove_file(self.directory.join(format!("update-{id}.{suffix}")));
             }
+            let _ = super::install::cleanup_update_artifacts(&self.directory, &id);
         }
         Ok(())
     }
@@ -371,17 +375,25 @@ fn decode_update_state(data: &[u8]) -> Result<UpdateState, Error> {
     }
     let state: UpdateState =
         serde_json::from_slice(data).map_err(|_| Error::Local("Otter update state is invalid."))?;
-    if state.pending.as_ref().is_some_and(|pending| {
-        !super::valid_id(&pending.id)
-            || pending.target != otserver_otter::update::BUILD_TARGET
-            || !is_digest(&pending.binary_digest)
-            || !is_digest(&pending.previous_digest)
-            || pending.binary_size == 0
-            || pending.binary_size > 512 * 1024 * 1024
-    }) || state
-        .rolled_back
-        .as_ref()
-        .is_some_and(|id| !super::valid_id(id))
+    let mut cleanup_ids = std::collections::BTreeSet::new();
+    let cleanup_helpers_valid = state.cleanup_helpers.len() <= 128
+        && state
+            .cleanup_helpers
+            .iter()
+            .all(|id| super::valid_id(id) && cleanup_ids.insert(id));
+    if !cleanup_helpers_valid
+        || state.pending.as_ref().is_some_and(|pending| {
+            !super::valid_id(&pending.id)
+                || pending.target != otserver_otter::update::BUILD_TARGET
+                || !is_digest(&pending.binary_digest)
+                || !is_digest(&pending.previous_digest)
+                || pending.binary_size == 0
+                || pending.binary_size > 512 * 1024 * 1024
+        })
+        || state
+            .rolled_back
+            .as_ref()
+            .is_some_and(|id| !super::valid_id(id))
         || state.failed.as_ref().is_some_and(|id| !super::valid_id(id))
         || (state.failed.is_none() && state.failed_reason.is_some())
         || (state.rolled_back.is_some() && state.failed.is_some())
@@ -469,12 +481,12 @@ fn restrict_windows(path: &Path) -> Result<(), Error> {
     use std::ptr::{null, null_mut};
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{
-        EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW,
-        SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+        EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SET_ACCESS,
+        SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::{
-        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
-        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_USER,
+        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, OBJECT_INHERIT_ACE,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 
@@ -490,6 +502,32 @@ fn restrict_windows(path: &Path) -> Result<(), Error> {
     // SAFETY: windows_token_user returns a successful TOKEN_USER in a pointer-aligned buffer.
     // Its SID storage remains alive until SetEntriesInAclW has copied it into the new ACL.
     let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let mut owner = null_mut();
+    let mut descriptor = null_mut();
+    // SAFETY: name is NUL-terminated and output pointers remain valid through LocalFree.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(Error::Local("Could not inspect scanner state owner."));
+    }
+    // SAFETY: GetNamedSecurityInfoW allocated descriptor and owner points into it.
+    let owned_by_user = unsafe { !owner.is_null() && EqualSid(owner, sid) != 0 };
+    unsafe { LocalFree(descriptor.cast()) };
+    if !owned_by_user {
+        return Err(Error::Local(
+            "Scanner state must belong to the current Windows user.",
+        ));
+    }
     let access = EXPLICIT_ACCESS_W {
         grfAccessPermissions: FILE_ALL_ACCESS,
         grfAccessMode: SET_ACCESS,
@@ -532,6 +570,16 @@ fn restrict_windows(path: &Path) -> Result<(), Error> {
         return Err(Error::Local("Could not restrict scanner state ACL."));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn restrict_windows_file(path: &Path) -> Result<(), String> {
+    restrict_windows(path).map_err(|error| error.to_string())
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn current_windows_user() -> Result<Box<[usize; 32]>, String> {
+    windows_token_user().map_err(|error| error.to_string())
 }
 
 #[cfg(windows)]
@@ -631,6 +679,7 @@ mod tests {
             rolled_back: None,
             failed: None,
             failed_reason: None,
+            cleanup_helpers: vec![],
         };
         store.save_update_state(&update).unwrap();
         let loaded = store.load_update_state().unwrap();
@@ -658,6 +707,26 @@ mod tests {
         assert!(matches!(store.load_update_state(), Err(Error::Invalid)));
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn update_cleanup_identifiers_roundtrip_and_reject_invalid_or_duplicate_values() {
+        let update = UpdateState {
+            cleanup_helpers: vec!["update-1".into()],
+            ..UpdateState::default()
+        };
+        let encoded = serde_json::to_vec(&update).unwrap();
+        assert_eq!(
+            decode_update_state(&encoded).unwrap().cleanup_helpers,
+            ["update-1"]
+        );
+
+        assert!(decode_update_state(br#"{"cleanupHelpers":["../outside"]}"#).is_err());
+        assert!(decode_update_state(br#"{"cleanupHelpers":["update-1","update-1"]}"#).is_err());
+        let too_many = serde_json::json!({
+            "cleanupHelpers": (0..129).map(|index| format!("update-{index}")).collect::<Vec<_>>()
+        });
+        assert!(decode_update_state(&serde_json::to_vec(&too_many).unwrap()).is_err());
     }
 
     #[test]

@@ -197,9 +197,11 @@ pub(crate) fn source_ipv4(interface: &str) -> Result<Ipv4Addr, String> {
 
 #[cfg(windows)]
 pub fn interface_ip_addresses(interface: &str) -> Result<Vec<IpAddr>, String> {
-    crate::profinet::interfaces()?
+    let interfaces = crate::profinet::interfaces()?;
+    let selected = interfaces
         .into_iter()
-        .find(|item| item.name == interface || item.friendly_name == interface)
+        .find(|item| crate::profinet::windows_interface_matches(item, interface));
+    selected
         .map(|item| {
             item.addresses
                 .iter()

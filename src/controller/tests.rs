@@ -1076,7 +1076,8 @@ fn file_credentials_and_assignment_survive_atomic_state_replacement() {
         use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
         use windows_sys::Win32::Security::{
             ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-            GetSecurityDescriptorControl, SE_DACL_PROTECTED, TOKEN_USER,
+            GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+            TOKEN_USER,
         };
         use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 
@@ -1087,6 +1088,7 @@ fn file_credentials_and_assignment_survive_atomic_state_replacement() {
             &store.path.join("controller.log"),
         ] {
             let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let mut owner = null_mut();
             let mut acl = null_mut();
             let mut descriptor = null_mut();
             // SAFETY: the path is NUL-terminated; output pointers remain valid for the call.
@@ -1095,8 +1097,8 @@ fn file_credentials_and_assignment_survive_atomic_state_replacement() {
                     GetNamedSecurityInfoW(
                         name.as_ptr(),
                         SE_FILE_OBJECT,
-                        DACL_SECURITY_INFORMATION,
-                        null_mut(),
+                        DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+                        &mut owner,
                         null_mut(),
                         &mut acl,
                         null_mut(),
@@ -1112,6 +1114,8 @@ fn file_credentials_and_assignment_survive_atomic_state_replacement() {
             // GetAce is checked before reading the access-allowed ACE and its inline SID.
             let private = unsafe {
                 let private = !acl.is_null()
+                    && !owner.is_null()
+                    && EqualSid(owner, (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid) != 0
                     && (*acl).AceCount == 1
                     && GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) != 0
                     && control & SE_DACL_PROTECTED != 0
@@ -1231,6 +1235,40 @@ async fn update_failure_reason_survives_network_errors_until_server_acknowledges
             && request.contains("\"status\":\"failed\"")
             && request.contains("\"reason\":\"signatureRejected\"")
     }));
+}
+
+#[test]
+fn pending_update_confirmation_requires_version_target_and_digest_then_queues_cleanup() {
+    let pending = PendingUpdate {
+        id: "update-confirm".into(),
+        version: "v0.15.0".into(),
+        target: otserver_otter::update::BUILD_TARGET.into(),
+        binary_digest: "a".repeat(64),
+        binary_size: 313,
+        previous_version: "v0.14.0".into(),
+        previous_digest: "b".repeat(64),
+    };
+    let mut state = UpdateState {
+        pending: Some(pending),
+        ..UpdateState::default()
+    };
+
+    assert!(!confirm_pending_update(
+        &mut state,
+        "v0.15.0",
+        otserver_otter::update::BUILD_TARGET,
+        &"c".repeat(64),
+    ));
+    assert!(state.pending.is_some());
+    assert!(confirm_pending_update(
+        &mut state,
+        "v0.15.0",
+        otserver_otter::update::BUILD_TARGET,
+        &"a".repeat(64),
+    ));
+    assert!(state.pending.is_none());
+    assert_eq!(state.version_floor.as_deref(), Some("v0.15.0"));
+    assert_eq!(state.cleanup_helpers, ["update-confirm"]);
 }
 
 #[tokio::test]
