@@ -65,7 +65,12 @@ instructions are in `README.md`; detailed operator and development guidance foll
   timeout on Windows and Linux. Report missing interface/device IPv4, unavailable Npcap, ambiguous
   addresses, and per-record failures in exported warnings. Failed records must retain successful
   reads; failed API/module enumeration must still permit primary I&M0 at API 0, slot 0, subslot 1
-  and its advertised optional records. Cancellation stops further requests and retains partial data.
+  and its advertised optional records. Device-level diagnosis (`0xF80C`) and DAP port records
+  (`0x802A`, `0x802B`, `0x8072`) are optional evidence: read port records only for DAP port subslots
+  from RealIdentificationData, bound them to 16 per device, and classify failures as INFO without
+  making an export partial. `--disable-pn-epm`, `disablePnEpm`, and the GUI toggle skip the PNIO
+  EPM/record-read path while leaving DCP enabled. Cancellation stops further requests and retains
+  partial data.
 - Active DCP must verify that its source MAC belongs to the selected physical interface. Send
   Identify-All once with `ResponseDelayFactor` `0x0080`; never use zero or rapid retries.
   After a successful send, collect replies for at least 60 seconds unless cancelled or capture
@@ -252,6 +257,8 @@ All discovery protocols are enabled by default. CLI `--no-<protocol>` switches a
 individually. SNMP inventory and LLDP/CDP neighbor evidence share credentials but have independent
 switches. The GUI exposes matching toggles. Managed CDP disablement requires a scanner version that
 supports `noCdp`; management omits the default `noCdp: false` for older scanners.
+`--disable-pn-epm` and `disablePnEpm` independently disable PROFINET PNIO EPM/record reads while
+leaving DCP enabled; the GUI exposes a matching toggle.
 
 ADS discovery uses `adsTargetNetIds` to map target IPv4 strings to their six-octet AMS NetIDs when
 UDP ServerInfo is unavailable, `adsSourceNetId` to override the scanner NetID derived from the local

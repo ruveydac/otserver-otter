@@ -40,6 +40,11 @@ remain neighbor evidence; management addresses do not create identities, links, 
 Use `--no-cdp` or `noCdp` to disable CDP independently of LLDP. Managed configurations that disable
 CDP require an Otter scanner version that supports `noCdp`.
 
+PROFINET record reads use read-only DCE/RPC implicit reads after DCP discovery. Otter exports I&M
+identity, device-level diagnosis and maintenance evidence, and DAP port link/statistics evidence.
+Use `--disable-pn-epm` or `disablePnEpm` to skip PNIO EPM and record reads while keeping DCP enabled.
+Optional diagnosis and port records that a device does not expose are informational, not scan failures.
+
 ## Quick start
 
 Download the build for your platform from the

@@ -97,6 +97,9 @@ pub struct ScanArgs {
     pub no_arp: bool,
     #[arg(long)]
     pub no_profinet: bool,
+    /// Disable PROFINET PNIO EPM and record reads while keeping DCP discovery enabled.
+    #[arg(long)]
+    pub disable_pn_epm: bool,
     #[arg(long)]
     pub allow_dcp_source: bool,
     #[arg(long)]
@@ -211,6 +214,8 @@ pub struct ScannerConfig {
     pub no_arp: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_profinet: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_pn_epm: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_dcp_source: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -380,6 +385,7 @@ pub struct BatchResult {
 pub struct ProtocolOptions {
     pub arp: bool,
     pub profinet: bool,
+    pub pn_epm: bool,
     pub s7: bool,
     pub enip: bool,
     pub bacnet: bool,
@@ -403,6 +409,7 @@ impl Default for ProtocolOptions {
         Self {
             arp: true,
             profinet: true,
+            pn_epm: true,
             s7: true,
             enip: true,
             bacnet: true,
@@ -823,6 +830,7 @@ pub fn resolve_scan(
     let protocols = ProtocolOptions {
         arp: !(args.no_arp || config.no_arp.unwrap_or(false)),
         profinet: !(args.no_profinet || config.no_profinet.unwrap_or(false)),
+        pn_epm: !(args.disable_pn_epm || config.disable_pn_epm.unwrap_or(false)),
         s7: !(no_native_protocols || args.no_s7 || config.no_s7.unwrap_or(false)),
         enip: !(no_native_protocols || args.no_enip || config.no_enip.unwrap_or(false)),
         bacnet: !(no_native_protocols || args.no_bacnet || config.no_bacnet.unwrap_or(false)),
@@ -1437,8 +1445,9 @@ pub async fn scan(
         options.protocols.arp,
         options.allow_dcp_source,
     );
-    if options.protocols.profinet && !cancelled.load(Ordering::Relaxed) {
-        logger.log("Reading PROFINET PNIO I&M records for discovered MAC/IP pairs...".into());
+    if options.protocols.profinet && options.protocols.pn_epm && !cancelled.load(Ordering::Relaxed)
+    {
+        logger.log("Reading PROFINET PNIO records for discovered MAC/IP pairs...".into());
         let selected = options.interface.clone();
         let mac = source_mac.clone();
         let targets = probe_targets.clone();
@@ -1451,23 +1460,19 @@ pub async fn scan(
         .await
         .map_err(|error| error.to_string())?;
         devices = enriched;
-        let diagnostics =
-            result.unwrap_or_else(|error| vec![format!("PROFINET PNIO scan skipped: {error}")]);
-        let mut incomplete = false;
-        for warning in &diagnostics {
-            let status = if pnio_no_response(warning) {
-                protocols::ProbeStatus::NoResponse
-            } else {
-                protocols::ProbeStatus::Partial
-            };
-            let formatted = if let Some(target) = pnio_warning_target(warning) {
+        let diagnostics = result.unwrap_or_else(|error| profinet::PnioDiagnostics {
+            warnings: vec![format!("PROFINET PNIO scan skipped: {error}")],
+            info: Vec::new(),
+        });
+        let format_pnio = |warning: &str, status: &str, code: &str| {
+            if let Some(target) = pnio_warning_target(warning) {
                 if let Ok(ip) = target.parse::<Ipv4Addr>() {
                     format_diagnostic(
                         &ip.to_string(),
                         None,
                         "profinet-pnio",
-                        status.label(),
-                        diagnostic_code(warning, status),
+                        status,
+                        code,
                         "udp/34964 or advertised PNIO endpoint; timeout 2s per RPC exchange",
                         "record-read",
                         warning,
@@ -1476,8 +1481,8 @@ pub async fn scan(
                     format_mac_diagnostic(
                         &target,
                         "profinet-pnio",
-                        status.label(),
-                        diagnostic_code(warning, status),
+                        status,
+                        code,
                         "udp/34964 or advertised PNIO endpoint; timeout 2s per RPC exchange",
                         "record-read",
                         warning,
@@ -1493,7 +1498,20 @@ pub async fn scan(
                     "prepare",
                     &format!("Interface-scoped PNIO diagnostic: {warning}"),
                 )
+            }
+        };
+        for info in &diagnostics.info {
+            logger.diagnostic("profinet-pnio", "INFO", "optional-record");
+            logger.log(format_pnio(info, "INFO", "optional-record"));
+        }
+        let mut incomplete = false;
+        for warning in &diagnostics.warnings {
+            let status = if pnio_no_response(warning) {
+                protocols::ProbeStatus::NoResponse
+            } else {
+                protocols::ProbeStatus::Partial
             };
+            let formatted = format_pnio(warning, status.label(), diagnostic_code(warning, status));
             logger.diagnostic(
                 "profinet-pnio",
                 status.label(),
@@ -2735,6 +2753,7 @@ mod tests {
         ProtocolOptions {
             arp: false,
             profinet: false,
+            pn_epm: false,
             s7: false,
             enip: false,
             bacnet: false,
@@ -2831,6 +2850,7 @@ mod tests {
         assert_eq!(resolved.output, PathBuf::from("configured.json"));
         assert!(resolved.protocols.arp);
         assert!(resolved.protocols.profinet);
+        assert!(resolved.protocols.pn_epm);
         assert!(resolved.allow_dcp_source);
         assert!(!resolved.protocols.s7);
         assert!(!resolved.protocols.enip);
@@ -2863,6 +2883,22 @@ mod tests {
     }
 
     #[test]
+    fn disable_pn_epm_switch_and_config_keep_dcp_enabled() {
+        let mut cli = args();
+        cli.disable_pn_epm = true;
+        let resolved =
+            resolve_scan(cli, complete_config("Test", "192.0.2.1", "test.json"), None).unwrap();
+        assert!(resolved.protocols.profinet);
+        assert!(!resolved.protocols.pn_epm);
+
+        let mut config = complete_config("Test", "192.0.2.1", "test.json");
+        config.disable_pn_epm = Some(true);
+        let resolved = resolve_scan(args(), config, None).unwrap();
+        assert!(resolved.protocols.profinet);
+        assert!(!resolved.protocols.pn_epm);
+    }
+
+    #[test]
     fn serializes_and_deserializes_config_roundtrip() {
         let config = ScannerConfig {
             name: None,
@@ -2878,6 +2914,7 @@ mod tests {
             no_protocols: None,
             no_arp: Some(true),
             no_profinet: None,
+            disable_pn_epm: None,
             allow_dcp_source: None,
             no_s7: Some(true),
             no_enip: None,
@@ -3148,6 +3185,7 @@ mod tests {
             "--allow-dcp-source",
             "--no-arp",
             "--no-profinet",
+            "--disable-pn-epm",
             "--no-s7",
             "--no-enip",
             "--no-bacnet",
@@ -3175,6 +3213,7 @@ mod tests {
         assert!(args.allow_dcp_source);
         assert!(args.no_arp);
         assert!(args.no_profinet);
+        assert!(args.disable_pn_epm);
         assert!(args.no_s7);
         assert!(args.no_enip);
         assert!(args.no_bacnet);
@@ -5330,6 +5369,7 @@ mod tests {
                     protocols: ProtocolOptions {
                         arp: false,
                         profinet: false,
+                        pn_epm: false,
                         s7: false,
                         enip: false,
                         bacnet: false,

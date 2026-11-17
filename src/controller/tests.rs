@@ -887,6 +887,7 @@ fn configuration_maps_profile_options_and_separate_credentials() {
         "noProtocols",
         "noArp",
         "noProfinet",
+        "disablePnEpm",
         "allowDcpSource",
         "noS7",
         "noEnip",
@@ -916,6 +917,7 @@ fn configuration_maps_profile_options_and_separate_credentials() {
     assert!(
         !options.protocols.arp
             && !options.protocols.profinet
+            && !options.protocols.pn_epm
             && !options.protocols.netbios
             && !options.protocols.smb
             && !options.protocols.rpc

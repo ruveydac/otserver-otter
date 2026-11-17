@@ -868,6 +868,7 @@ fn mapped_config(
         "noProtocols",
         "noArp",
         "noProfinet",
+        "disablePnEpm",
         "allowDcpSource",
         "noS7",
         "noEnip",
