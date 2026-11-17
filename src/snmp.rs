@@ -60,6 +60,7 @@ pub struct ResultData {
     pub warnings: Vec<String>,
     pub inventory_complete: bool,
     pub lldp_complete: bool,
+    pub cdp_complete: bool,
 }
 
 #[derive(Debug)]
@@ -86,6 +87,7 @@ impl std::error::Error for QueryError {}
 pub struct QuerySelection {
     pub inventory: bool,
     pub lldp: bool,
+    pub cdp: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -414,6 +416,7 @@ async fn query_inner(
     let mut warnings = vec![];
     let mut inventory_complete = true;
     let mut lldp_complete = true;
+    let mut cdp_complete = true;
     let mut walks = WalkOutcomes {
         outcomes: Vec::new(),
         partial_rows: Arc::clone(partial_rows),
@@ -1402,6 +1405,66 @@ async fn query_inner(
             );
         }
     }
+    let mut cdp_neighbors = BTreeMap::<String, Map<String, serde_json::Value>>::new();
+    if selection.cdp {
+        const CDP_ROOT: &str = "1.3.6.1.4.1.9.9.23.1.2.1.1";
+        for (column, name) in [
+            ("3", "addressType"),
+            ("4", "address"),
+            ("5", "version"),
+            ("6", "deviceId"),
+            ("7", "portId"),
+            ("8", "platform"),
+            ("9", "capabilities"),
+            ("10", "vtpDomain"),
+            ("11", "nativeVlan"),
+            ("12", "duplex"),
+            ("13", "applianceID"),
+            ("14", "vlanID"),
+            ("15", "powerConsumption"),
+            ("16", "mtu"),
+            ("17", "systemName"),
+            ("18", "systemObjectID"),
+            ("19", "primaryManagementAddressType"),
+            ("20", "primaryManagementAddress"),
+            ("21", "secondaryManagementAddressType"),
+            ("22", "secondaryManagementAddress"),
+            ("23", "physicalLocation"),
+            ("24", "lastChange"),
+        ] {
+            match collect_walk(
+                &client,
+                &format!("{CDP_ROOT}.{column}"),
+                MAX_TABLE_ROWS,
+                &mut walks,
+            )
+            .await
+            {
+                Ok(values) => {
+                    for item in values {
+                        let key = item.oid.to_string();
+                        let value = value_json(&item.value);
+                        raw.insert(key.clone(), value.clone());
+                        if let Some((actual_column, index)) = table_cell(&key, CDP_ROOT)
+                            && actual_column == column
+                        {
+                            let entry = cdp_neighbors.entry(index.clone()).or_default();
+                            let indices = index.split('.').collect::<Vec<_>>();
+                            if indices.len() == 2 {
+                                entry.insert("interfaceIndex".into(), json!(indices[0]));
+                                entry.insert("deviceIndex".into(), json!(indices[1]));
+                            }
+                            entry.insert(name.into(), value);
+                        }
+                    }
+                }
+                Err(error) => {
+                    cdp_complete = false;
+                    warnings.push(format!("SNMP CDP-MIB {target} column {column}: {error}"));
+                }
+            }
+        }
+    }
     let unresolved_neighbors: Vec<_> = neighbors.iter().filter(|(_, neighbor)| neighbor.chassis_mac().is_none()).map(|(index, neighbor)| json!({"index": index, "chassisSubtype": neighbor.chassis_subtype, "chassisIdHex": neighbor.chassis_id.as_deref().map(hex), "localPort": neighbor.local_port, "portSubtype": neighbor.port_subtype, "portId": neighbor.port, "name": neighbor.name, "inventory": neighbor.med})).collect();
     let has_unresolved_neighbors = !unresolved_neighbors.is_empty();
     raw.insert("unresolvedNeighbors".into(), json!(unresolved_neighbors));
@@ -1412,6 +1475,11 @@ async fn query_inner(
                 .is_some_and(|oid| oid.starts_with("1.0.8802"))
             {
                 lldp_complete = false;
+            } else if walk["oid"]
+                .as_str()
+                .is_some_and(|oid| oid.starts_with("1.3.6.1.4.1.9.9.23.1.2.1.1"))
+            {
+                cdp_complete = false;
             } else {
                 inventory_complete = false;
             }
@@ -1422,6 +1490,10 @@ async fn query_inner(
         }
     }
     raw.insert("collectionOutcomes".into(), json!(walks.outcomes));
+    raw.insert(
+        "cdpNeighbors".into(),
+        json!(cdp_neighbors.into_values().collect::<Vec<_>>()),
+    );
     raw.insert(
         "acquisition".into(),
         json!({"mechanism": "management-table-read"}),
@@ -1528,38 +1600,43 @@ async fn query_inner(
     };
     Ok(ResultData {
         identity_mac: identity_mac.clone(),
-        observation: (selection.inventory || has_unresolved_neighbors).then(|| Observation {
-            source: if selection.inventory {
-                Source::Snmp
-            } else {
-                Source::Lldp
+        observation: (selection.inventory || selection.cdp || has_unresolved_neighbors).then(
+            || Observation {
+                source: if selection.inventory {
+                    Source::Snmp
+                } else if selection.lldp {
+                    Source::Lldp
+                } else {
+                    Source::Cdp
+                },
+                observed_at,
+                ip_address: Some(target.into()),
+                mac_address: identity_mac.clone(),
+                fields,
+                raw: {
+                    raw.insert(
+                        "observationId".into(),
+                        json!(uuid::Uuid::new_v4().to_string()),
+                    );
+                    raw.insert(
+                        "subject".into(),
+                        identity_mac.as_ref().map_or_else(
+                            || json!({ "kind": "endpoint", "ipAddress": target }),
+                            |mac| json!({ "kind": "device", "macAddress": mac }),
+                        ),
+                    );
+                    raw.into()
+                },
+                warnings: warnings.clone(),
             },
-            observed_at,
-            ip_address: Some(target.into()),
-            mac_address: identity_mac.clone(),
-            fields,
-            raw: {
-                raw.insert(
-                    "observationId".into(),
-                    json!(uuid::Uuid::new_v4().to_string()),
-                );
-                raw.insert(
-                    "subject".into(),
-                    identity_mac.as_ref().map_or_else(
-                        || json!({ "kind": "endpoint", "ipAddress": target }),
-                        |mac| json!({ "kind": "device", "macAddress": mac }),
-                    ),
-                );
-                raw.into()
-            },
-            warnings: warnings.clone(),
-        }),
+        ),
         interfaces: interfaces.into_values().collect(),
         ports: ports.into_values().collect(),
         links,
         warnings,
         inventory_complete,
         lldp_complete,
+        cdp_complete,
     })
 }
 
@@ -1654,8 +1731,10 @@ fn partial_or_error(
         observation: Some(Observation {
             source: if selection.inventory {
                 Source::Snmp
-            } else {
+            } else if selection.lldp {
                 Source::Lldp
+            } else {
+                Source::Cdp
             },
             observed_at,
             ip_address: Some(target.to_owned()),
@@ -1681,6 +1760,7 @@ fn partial_or_error(
         warnings: vec![warning],
         inventory_complete: !selection.inventory,
         lldp_complete: !selection.lldp,
+        cdp_complete: !selection.cdp,
     })
 }
 
@@ -2458,6 +2538,7 @@ mod tests {
             QuerySelection {
                 inventory: true,
                 lldp: false,
+                cdp: false,
             },
         )
         .await;
@@ -2581,6 +2662,22 @@ mod tests {
             (
                 "1.0.8802.1.1.2.1.4.2.1.3.0.7.1.1.4.192.0.2.2",
                 Value::Integer(2),
+            ),
+            ("1.3.6.1.4.1.9.9.23.1.2.1.1.3.1.2", Value::Integer(1)),
+            (
+                "1.3.6.1.4.1.9.9.23.1.2.1.1.4.1.2",
+                Value::OctetString(vec![192, 0, 2, 2].into()),
+            ),
+            ("1.3.6.1.4.1.9.9.23.1.2.1.1.6.1.2", string("remote-switch")),
+            (
+                "1.3.6.1.4.1.9.9.23.1.2.1.1.7.1.2",
+                string("GigabitEthernet1/2"),
+            ),
+            ("1.3.6.1.4.1.9.9.23.1.2.1.1.8.1.2", string("Cisco IOS")),
+            ("1.3.6.1.4.1.9.9.23.1.2.1.1.11.1.2", Value::Integer(100)),
+            (
+                "1.3.6.1.4.1.9.9.23.1.2.1.1.17.1.2",
+                string("remote-switch.example"),
             ),
             ("1.0.8802.1.1.2.1.5.1", Value::IpAddress([192, 0, 2, 1])),
             ("1.0.62439.1.1.1.1.1.1", Value::Integer(1)),
@@ -2768,6 +2865,7 @@ mod tests {
             QuerySelection {
                 inventory: true,
                 lldp: true,
+                cdp: true,
             },
         )
         .await
@@ -2788,6 +2886,18 @@ mod tests {
         assert!(uuid::Uuid::parse_str(observation.raw["observationId"].as_str().unwrap()).is_ok());
         assert!(result.inventory_complete);
         assert!(result.lldp_complete);
+        assert!(result.cdp_complete);
+        assert_eq!(
+            observation.raw["cdpNeighbors"][0]["deviceId"],
+            "remote-switch"
+        );
+        assert_eq!(observation.raw["cdpNeighbors"][0]["address"], "C0000202");
+        assert_eq!(observation.raw["cdpNeighbors"][0]["nativeVlan"], 100);
+        assert_eq!(
+            result.links.len(),
+            1,
+            "CDP-MIB addresses must not infer topology"
+        );
         assert_eq!(result.interfaces[0].name.as_deref(), Some("port-1"));
         assert_eq!(
             result.interfaces[0].ip_addresses,
@@ -2894,6 +3004,7 @@ mod tests {
                 "1.0.8802.1.1.2.1.5.3791.1.2",
                 "1.0.8802.1.1.2.1.5.3791.1.3",
                 "1.0.62439.1",
+                "1.3.6.1.4.1.9.9.23.1.2.1.1.",
             ] {
                 assert!(
                     requested.iter().any(|oid| oid.starts_with(prefix)),
@@ -2909,6 +3020,7 @@ mod tests {
             QuerySelection {
                 inventory: true,
                 lldp: false,
+                cdp: false,
             },
         )
         .await
@@ -2926,6 +3038,7 @@ mod tests {
             QuerySelection {
                 inventory: true,
                 lldp: false,
+                cdp: false,
             },
         )
         .await
@@ -2946,6 +3059,7 @@ mod tests {
             QuerySelection {
                 inventory: true,
                 lldp: false,
+                cdp: false,
             },
         )
         .await;
@@ -2973,6 +3087,7 @@ mod tests {
             QuerySelection {
                 inventory: false,
                 lldp: true,
+                cdp: false,
             },
         )
         .await;
@@ -2987,6 +3102,7 @@ mod tests {
             QuerySelection {
                 inventory: false,
                 lldp: true,
+                cdp: false,
             },
         )
         .await
@@ -3004,6 +3120,7 @@ mod tests {
             QuerySelection {
                 inventory: true,
                 lldp: false,
+                cdp: false,
             },
         )
         .await
@@ -3027,6 +3144,7 @@ mod tests {
             QuerySelection {
                 inventory: false,
                 lldp: true,
+                cdp: false,
             },
         )
         .await
@@ -3049,6 +3167,7 @@ mod tests {
             QuerySelection {
                 inventory: true,
                 lldp: false,
+                cdp: false,
             },
         )
         .await;
@@ -3079,6 +3198,7 @@ mod tests {
                 QuerySelection {
                     inventory: true,
                     lldp: false,
+                    cdp: false,
                 },
             )
             .await
@@ -3108,6 +3228,7 @@ mod tests {
                 QuerySelection {
                     inventory: false,
                     lldp: true,
+                    cdp: false,
                 },
             )
             .await
@@ -3123,6 +3244,7 @@ mod tests {
             QuerySelection {
                 inventory: false,
                 lldp: true,
+                cdp: false,
             },
         )
         .await
@@ -3261,6 +3383,7 @@ mod tests {
                 QuerySelection {
                     inventory: false,
                     lldp: true,
+                    cdp: false,
                 },
             ),
         )
@@ -3318,6 +3441,7 @@ mod tests {
                 QuerySelection {
                     inventory: true,
                     lldp: false,
+                    cdp: false,
                 },
             ),
         )
@@ -3366,6 +3490,7 @@ mod tests {
             QuerySelection {
                 inventory: true,
                 lldp: false,
+                cdp: false,
             },
             &partial_rows,
             "SNMP request failed".into(),

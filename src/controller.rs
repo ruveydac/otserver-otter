@@ -884,6 +884,7 @@ fn mapped_config(
         "noOpcua",
         "noSnmp",
         "noLldp",
+        "noCdp",
         "opcuaPorts",
         "adsSourceNetId",
         "adsTargetNetIds",

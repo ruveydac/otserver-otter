@@ -275,6 +275,7 @@ pub struct GuiApp {
     opcua_enabled: bool,
     snmp_enabled: bool,
     lldp_enabled: bool,
+    cdp_enabled: bool,
     controller_url: String,
     enrollment_token: String,
     overwrite_enrollment: bool,
@@ -349,6 +350,7 @@ impl GuiApp {
             opcua_enabled: true,
             snmp_enabled: true,
             lldp_enabled: true,
+            cdp_enabled: true,
             controller_url: String::new(),
             enrollment_token: String::new(),
             overwrite_enrollment: false,
@@ -435,6 +437,7 @@ impl GuiApp {
         self.opcua_enabled = !(legacy_native_disabled || config.no_opcua.unwrap_or(false));
         self.snmp_enabled = !config.no_snmp.unwrap_or(false);
         self.lldp_enabled = !config.no_lldp.unwrap_or(false);
+        self.cdp_enabled = !config.no_cdp.unwrap_or(false);
         let mut opcua = config
             .opcua_credentials
             .map(|credentials| credentials.to_vec())
@@ -574,6 +577,7 @@ impl GuiApp {
         config.no_opcua = (!self.opcua_enabled).then_some(true);
         config.no_snmp = (!self.snmp_enabled).then_some(true);
         config.no_lldp = (!self.lldp_enabled).then_some(true);
+        config.no_cdp = (!self.cdp_enabled).then_some(true);
         config.opcua_credentials = self.opcua_credentials_config();
         config.opcua_username = None;
         config.opcua_password = None;
@@ -1144,6 +1148,7 @@ impl GuiApp {
                                 ("OPC UA", &mut self.opcua_enabled),
                                 ("SNMP", &mut self.snmp_enabled),
                                 ("LLDP", &mut self.lldp_enabled),
+                                ("CDP", &mut self.cdp_enabled),
                             ] {
                                 protocol_changed |= ui.toggle_value(enabled, label).changed();
                             }

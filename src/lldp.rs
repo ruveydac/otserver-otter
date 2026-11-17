@@ -32,7 +32,7 @@ pub fn scan(
     let mut neighbors = BTreeMap::new();
     let started = Instant::now();
     let mut limited = false;
-    let result = capture(interface, CAPTURE_WINDOW, cancelled, |frame| {
+    let result = capture_passive(interface, CAPTURE_WINDOW, cancelled, |frame| {
         limited |= !retain_frame(&mut neighbors, frame, local_mac, Instant::now());
     });
     let mut warnings = Vec::new();
@@ -261,7 +261,7 @@ fn med_field(subtype: u8) -> Option<(&'static str, &'static str)> {
 }
 
 #[cfg(windows)]
-fn capture(
+pub(crate) fn capture_passive(
     interface: &str,
     wait: Duration,
     cancelled: &AtomicBool,
@@ -275,7 +275,7 @@ fn capture(
 }
 
 #[cfg(target_os = "linux")]
-fn capture(
+pub(crate) fn capture_passive(
     interface: &str,
     wait: Duration,
     cancelled: &AtomicBool,
@@ -286,7 +286,7 @@ fn capture(
     // SAFETY: name is NUL-terminated; the returned index has no ownership.
     let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
     if index == 0 {
-        return Err("LLDP interface not found".into());
+        return Err("capture interface not found".into());
     }
     // ETH_P_ALL retains VLAN headers; binding below restricts capture to the selected link.
     // SAFETY: socket returns a new owned descriptor or -1.
@@ -378,8 +378,13 @@ fn capture(
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-fn capture(_: &str, _: Duration, _: &AtomicBool, _: impl FnMut(&[u8])) -> Result<(), String> {
-    Err("Passive LLDP requires Linux or Windows/Npcap".into())
+pub(crate) fn capture_passive(
+    _: &str,
+    _: Duration,
+    _: &AtomicBool,
+    _: impl FnMut(&[u8]),
+) -> Result<(), String> {
+    Err("Passive link-layer capture requires Linux or Windows/Npcap".into())
 }
 
 #[cfg(test)]

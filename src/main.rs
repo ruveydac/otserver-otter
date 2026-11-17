@@ -130,6 +130,8 @@ pub struct ScanArgs {
     #[arg(long)]
     pub no_lldp: bool,
     #[arg(long)]
+    pub no_cdp: bool,
+    #[arg(long)]
     pub server_url: Option<String>,
     #[arg(long)]
     pub site: Option<String>,
@@ -241,6 +243,8 @@ pub struct ScannerConfig {
     pub no_snmp: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_lldp: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_cdp: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opcua_ports: Option<Vec<u16>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -390,6 +394,7 @@ pub struct ProtocolOptions {
     pub opcua: bool,
     pub snmp: bool,
     pub lldp: bool,
+    pub cdp: bool,
     pub ads: bool,
 }
 
@@ -412,6 +417,7 @@ impl Default for ProtocolOptions {
             opcua: true,
             snmp: true,
             lldp: true,
+            cdp: true,
             ads: true,
         }
     }
@@ -832,6 +838,7 @@ pub fn resolve_scan(
         opcua: !(no_native_protocols || args.no_opcua || config.no_opcua.unwrap_or(false)),
         snmp: !(args.no_snmp || config.no_snmp.unwrap_or(false)),
         lldp: !(args.no_lldp || config.no_lldp.unwrap_or(false)),
+        cdp: !(args.no_cdp || config.no_cdp.unwrap_or(false)),
     };
     let opcua = opcua_probe_settings(&config);
     let targets = if args.targets.is_empty() {
@@ -1287,19 +1294,21 @@ pub async fn scan(
     } else {
         profinet::interfaces()
     };
-    let source_mac =
-        if (options.protocols.arp || options.protocols.profinet || options.protocols.lldp)
-            && !cancelled.load(Ordering::Relaxed)
-        {
-            scan_source_mac(
-                &options.interface,
-                &options.source_mac,
-                interfaces.as_ref().map_err(Clone::clone)?,
-                logger,
-            )?
-        } else {
-            options.source_mac.clone()
-        };
+    let source_mac = if (options.protocols.arp
+        || options.protocols.profinet
+        || options.protocols.lldp
+        || options.protocols.cdp)
+        && !cancelled.load(Ordering::Relaxed)
+    {
+        scan_source_mac(
+            &options.interface,
+            &options.source_mac,
+            interfaces.as_ref().map_err(Clone::clone)?,
+            logger,
+        )?
+    } else {
+        options.source_mac.clone()
+    };
     let interface = scan_interface_ref(
         &options.interface,
         &source_mac,
@@ -1327,6 +1336,16 @@ pub async fn scan(
         let cancellation = Arc::clone(cancelled);
         Some(tokio::task::spawn_blocking(move || {
             otserver_otter::lldp::scan(&interface, &mac, &cancellation)
+        }))
+    } else {
+        None
+    };
+    let cdp_capture = if options.protocols.cdp && !cancelled.load(Ordering::Relaxed) {
+        let interface = options.interface.clone();
+        let mac = source_mac.clone();
+        let cancellation = Arc::clone(cancelled);
+        Some(tokio::task::spawn_blocking(move || {
+            otserver_otter::cdp::scan(&interface, &mac, &cancellation)
         }))
     } else {
         None
@@ -1535,22 +1554,19 @@ pub async fn scan(
         logger.devices(configuration, &devices);
     }
 
-    if (options.protocols.snmp || options.protocols.lldp) && !cancelled.load(Ordering::Relaxed) {
+    if (options.protocols.snmp || options.protocols.lldp || options.protocols.cdp)
+        && !cancelled.load(Ordering::Relaxed)
+    {
         let snmp_selection = snmp::QuerySelection {
             inventory: options.protocols.snmp,
             lldp: options.protocols.lldp,
+            cdp: options.protocols.cdp,
         };
         logger.log(format!(
-            "Resolved SNMP inventory={} LLDP topology={}.",
-            snmp_selection.inventory, snmp_selection.lldp
+            "Resolved SNMP inventory={}, LLDP topology={}, CDP topology={}.",
+            snmp_selection.inventory, snmp_selection.lldp, snmp_selection.cdp
         ));
-        let label = match (snmp_selection.inventory, snmp_selection.lldp) {
-            (true, true) => "SNMP and LLDP",
-            (true, false) => "SNMP",
-            (false, true) => "LLDP",
-            (false, false) => unreachable!("guard requires one query type"),
-        };
-        logger.log(format!("Querying {label}..."));
+        logger.log("Querying SNMP inventory and enabled neighbor tables...".into());
         let ips = probe_targets
             .iter()
             .map(Ipv4Addr::to_string)
@@ -1637,6 +1653,78 @@ pub async fn scan(
                     &error.to_string(),
                 );
                 logger.diagnostic("lldp-passive", "FAIL", "capture-task-failed");
+                logger.log(diagnostic.clone());
+                errors.push(diagnostic);
+            }
+        }
+    }
+    if let Some(capture) = cdp_capture {
+        match capture.await {
+            Ok(Ok(result)) => {
+                devices.extend(result.devices);
+                links.extend(result.links);
+                for warning in result.warnings {
+                    let informational =
+                        warning.starts_with("Passive CDP observed the selected link");
+                    protocol_failed |= !informational;
+                    let status = if informational { "INFO" } else { "PARTIAL" };
+                    let code = if informational {
+                        "capture-window-complete"
+                    } else {
+                        diagnostic_code(&warning, protocols::ProbeStatus::Partial)
+                    };
+                    let diagnostic = format_mac_diagnostic(
+                        "01:00:0c:cc:cc:cc",
+                        "cdp-passive",
+                        status,
+                        code,
+                        &format!(
+                            "selected interface {}; capture window 30s",
+                            options.interface
+                        ),
+                        "capture",
+                        &warning,
+                    );
+                    logger.diagnostic("cdp-passive", status, code);
+                    logger.log(diagnostic.clone());
+                    warnings.push(diagnostic);
+                }
+            }
+            Ok(Err(error)) => {
+                let diagnostic = format_mac_diagnostic(
+                    "01:00:0c:cc:cc:cc",
+                    "cdp-passive",
+                    "FAIL",
+                    diagnostic_code(&error, protocols::ProbeStatus::Failure),
+                    &format!(
+                        "selected interface {}; capture window 30s",
+                        options.interface
+                    ),
+                    "capture",
+                    &error,
+                );
+                logger.diagnostic(
+                    "cdp-passive",
+                    "FAIL",
+                    diagnostic_code(&error, protocols::ProbeStatus::Failure),
+                );
+                logger.log(diagnostic.clone());
+                errors.push(diagnostic);
+            }
+            Err(error) => {
+                let diagnostic = format_mac_diagnostic(
+                    "01:00:0c:cc:cc:cc",
+                    "cdp-passive",
+                    "FAIL",
+                    "capture-task-failed",
+                    &format!(
+                        "selected interface {}; capture window 30s",
+                        options.interface
+                    ),
+                    "capture",
+                    &error.to_string(),
+                );
+                logger.diagnostic("cdp-passive", "FAIL", "capture-task-failed");
                 logger.log(diagnostic.clone());
                 errors.push(diagnostic);
             }
@@ -2317,6 +2405,7 @@ fn apply_snmp_probe(
             for (enabled, protocol, stage) in [
                 (selection.inventory, "snmp", "inventory"),
                 (selection.lldp, "lldp-snmp", "neighbor-inventory"),
+                (selection.cdp, "cdp-snmp", "neighbor-inventory"),
             ] {
                 if !enabled {
                     continue;
@@ -2392,16 +2481,46 @@ fn apply_snmp_probe(
             },
         ));
     }
+    if selection.cdp {
+        logger.log(format_diagnostic(
+            &ip,
+            result.identity_mac.as_deref(),
+            "cdp-snmp",
+            if result.cdp_complete {
+                "SUCCESS"
+            } else {
+                "PARTIAL"
+            },
+            if result.cdp_complete {
+                "neighbor-inventory-complete"
+            } else {
+                "neighbor-inventory-partial"
+            },
+            snmp_endpoint,
+            "neighbor-inventory",
+            if result.cdp_complete {
+                "SNMP CDP neighbor collection completed."
+            } else {
+                "SNMP CDP neighbor collection was incomplete; successful rows retained."
+            },
+        ));
+    }
     let mut incomplete = selection.inventory && !result.inventory_complete
-        || selection.lldp && !result.lldp_complete;
+        || selection.lldp && !result.lldp_complete
+        || selection.cdp && !result.cdp_complete;
     if selection.inventory && !result.inventory_complete {
         logger.diagnostic("snmp", "PARTIAL", "inventory-partial");
     }
     if selection.lldp && !result.lldp_complete {
         logger.diagnostic("lldp-snmp", "PARTIAL", "neighbor-inventory-partial");
     }
+    if selection.cdp && !result.cdp_complete {
+        logger.diagnostic("cdp-snmp", "PARTIAL", "neighbor-inventory-partial");
+    }
     for warning in result.warnings.drain(..) {
-        let protocol = if warning.contains("LLDP") || warning.contains("lldp") {
+        let protocol = if warning.contains("CDP") || warning.contains("cdp") {
+            "cdp-snmp"
+        } else if warning.contains("LLDP") || warning.contains("lldp") {
             "lldp-snmp"
         } else {
             "snmp"
@@ -2630,6 +2749,7 @@ mod tests {
             opcua: false,
             snmp: false,
             lldp: false,
+            cdp: false,
             ads: false,
         }
     }
@@ -2774,6 +2894,7 @@ mod tests {
             no_opcua: Some(true),
             no_snmp: Some(true),
             no_lldp: Some(true),
+            no_cdp: Some(true),
             opcua_ports: Some(vec![4840, 4841]),
             opcua_credentials: None,
             opcua_username: Some("opc-user".into()),
@@ -3040,6 +3161,7 @@ mod tests {
             "--no-opcua",
             "--no-snmp",
             "--no-lldp",
+            "--no-cdp",
             "--ignore-self-signed",
             "--http-proxy",
             "http://proxy.example:8080",
@@ -3066,6 +3188,7 @@ mod tests {
         assert!(args.no_opcua);
         assert!(args.no_snmp);
         assert!(args.no_lldp);
+        assert!(args.no_cdp);
         assert!(args.ignore_self_signed);
         assert_eq!(
             args.http_proxy.as_deref(),
@@ -3096,6 +3219,19 @@ mod tests {
                 !(cli_disabled || config_disabled)
             );
             assert!(options.protocols.s7);
+        }
+    }
+
+    #[test]
+    fn cdp_is_independent_and_enabled_by_default() {
+        for (cli_disabled, config_disabled) in [(false, false), (true, false), (false, true)] {
+            let mut cli = args();
+            cli.no_cdp = cli_disabled;
+            let mut config = complete_config("Test", "192.0.2.1", "test.json");
+            config.no_cdp = Some(config_disabled);
+            let options = resolve_scan(cli, config, None).unwrap();
+            assert_eq!(options.protocols.cdp, !(cli_disabled || config_disabled));
+            assert!(options.protocols.lldp);
         }
     }
 
@@ -3387,6 +3523,7 @@ mod tests {
             warnings: vec![],
             inventory_complete: true,
             lldp_complete: true,
+            cdp_complete: true,
         };
 
         let logger = DeviceLogger::default();
@@ -3400,6 +3537,7 @@ mod tests {
             snmp::QuerySelection {
                 inventory: true,
                 lldp: false,
+                cdp: false,
             },
             Some(Ok(("192.0.2.10".into(), vec![], Ok(result)))),
         ));
@@ -3464,6 +3602,7 @@ mod tests {
             snmp::QuerySelection {
                 inventory: true,
                 lldp: false,
+                cdp: false,
             },
         )
         .await
@@ -3486,6 +3625,7 @@ mod tests {
             snmp::QuerySelection {
                 inventory: true,
                 lldp: false,
+                cdp: false,
             },
             Some(Ok(("127.0.0.1".into(), vec![], Err(error)))),
         ));
@@ -4770,6 +4910,7 @@ mod tests {
             warnings,
             inventory_complete,
             lldp_complete,
+            cdp_complete: true,
         };
         let logger = CapturingLogger::default();
         let mut devices = vec![Device {
@@ -4807,6 +4948,7 @@ mod tests {
             snmp::QuerySelection {
                 inventory: true,
                 lldp: true,
+                cdp: false,
             },
             Some(Ok((
                 "192.0.2.10".into(),
@@ -4844,6 +4986,7 @@ mod tests {
             snmp::QuerySelection {
                 inventory: false,
                 lldp: false,
+                cdp: false,
             },
             Some(Ok((
                 "192.0.2.11".into(),
@@ -4863,6 +5006,7 @@ mod tests {
             snmp::QuerySelection {
                 inventory: true,
                 lldp: false,
+                cdp: false,
             },
             Some(Ok((
                 "192.0.2.12".into(),
@@ -4887,6 +5031,7 @@ mod tests {
             snmp::QuerySelection {
                 inventory: true,
                 lldp: false,
+                cdp: false,
             },
             None,
         ));
@@ -4901,6 +5046,7 @@ mod tests {
             snmp::QuerySelection {
                 inventory: true,
                 lldp: true,
+                cdp: false,
             },
         )
         .await;
@@ -4918,6 +5064,7 @@ mod tests {
             snmp::QuerySelection {
                 inventory: true,
                 lldp: true,
+                cdp: false,
             },
             Some(Ok(("192.0.2.20".into(), attempts, Err(error)))),
         ));
@@ -4956,6 +5103,7 @@ mod tests {
             snmp::QuerySelection {
                 inventory: true,
                 lldp: true,
+                cdp: false,
             },
             Some(Err(snmp_error)),
         ));
@@ -5196,6 +5344,7 @@ mod tests {
                         opcua: false,
                         snmp: false,
                         lldp: false,
+                        cdp: false,
                         ads: false,
                     },
                     allow_dcp_source: false,

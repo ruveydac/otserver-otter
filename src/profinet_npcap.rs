@@ -136,80 +136,37 @@ const ARP_FILTER: [BpfInsn; 4] = [
     },
 ];
 
-// LLDP EtherType after zero, one, or two VLAN tags. The parser still checks the LLDP multicast
-// destination and frame structure before accepting a neighbor.
-const LLDP_FILTER: [BpfInsn; 12] = [
+// Limit passive capture to multicast traffic; callbacks retain only valid LLDP and CDP frames.
+const PASSIVE_FILTER: [BpfInsn; 5] = [
     BpfInsn {
-        code: 0x28,
-        jt: 0,
-        jf: 0,
-        k: 12,
-    },
-    BpfInsn {
-        code: 0x15,
-        jt: 9,
-        jf: 0,
-        k: 0x88cc,
-    },
-    BpfInsn {
-        code: 0x15,
-        jt: 1,
-        jf: 0,
-        k: 0x8100,
-    },
-    BpfInsn {
-        code: 0x15,
-        jt: 0,
-        jf: 6,
-        k: 0x88a8,
-    },
-    BpfInsn {
-        code: 0x28,
-        jt: 0,
-        jf: 0,
-        k: 16,
-    },
-    BpfInsn {
-        code: 0x15,
-        jt: 5,
-        jf: 0,
-        k: 0x88cc,
-    },
-    BpfInsn {
-        code: 0x15,
-        jt: 1,
-        jf: 0,
-        k: 0x8100,
-    },
-    BpfInsn {
-        code: 0x15,
-        jt: 0,
-        jf: 2,
-        k: 0x88a8,
-    },
-    BpfInsn {
-        code: 0x28,
-        jt: 0,
-        jf: 0,
-        k: 20,
-    },
-    BpfInsn {
-        code: 0x15,
-        jt: 1,
-        jf: 0,
-        k: 0x88cc,
-    },
-    BpfInsn {
-        code: 0x06,
+        code: 0x30,
         jt: 0,
         jf: 0,
         k: 0,
+    },
+    BpfInsn {
+        code: 0x54,
+        jt: 0,
+        jf: 0,
+        k: 1,
+    },
+    BpfInsn {
+        code: 0x15,
+        jt: 0,
+        jf: 1,
+        k: 1,
     },
     BpfInsn {
         code: 0x06,
         jt: 0,
         jf: 0,
         k: u32::MAX,
+    },
+    BpfInsn {
+        code: 0x06,
+        jt: 0,
+        jf: 0,
+        k: 0,
     },
 ];
 
@@ -667,11 +624,11 @@ fn capture_with_api_until<F: AsRef<[u8]>>(
     {
         let mut dcp = DCP_FILTER;
         let mut arp = ARP_FILTER;
-        let mut lldp = LLDP_FILTER;
+        let mut passive = PASSIVE_FILTER;
         let instructions = match filter {
             CaptureFilter::Dcp => &mut dcp[..],
             CaptureFilter::Arp => &mut arp[..],
-            CaptureFilter::Passive => &mut lldp[..],
+            CaptureFilter::Passive => &mut passive[..],
             CaptureFilter::All => unreachable!(),
         };
         let mut program = BpfProgram {
@@ -774,7 +731,9 @@ fn capture_with_api_until<F: AsRef<[u8]>>(
         let mut deliver = |frame: &[u8]| {
             if (filter == CaptureFilter::Dcp && !is_identify_response(frame))
                 || (filter == CaptureFilter::Arp && frame.get(12..14) != Some(&[0x08, 0x06]))
-                || (filter == CaptureFilter::Passive && !is_lldp_frame(frame))
+                || (filter == CaptureFilter::Passive
+                    && !is_lldp_frame(frame)
+                    && !crate::cdp::is_cdp_frame(frame))
             {
                 return Ok(());
             }
@@ -1020,7 +979,7 @@ mod capture_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        BpfInsn, LLDP_FILTER, PASSIVE_HW_FILTER, canonical_adapter_name, capture_wait_duration,
+        BpfInsn, PASSIVE_FILTER, PASSIVE_HW_FILTER, canonical_adapter_name, capture_wait_duration,
         is_lldp_frame, is_npcap_name, parse_bpf_records, wait_millis,
     };
     use std::time::Duration;
@@ -1051,6 +1010,7 @@ mod tests {
             vec![0x8100, 0x88a8],
         ] {
             let mut frame = vec![0; 64];
+            frame[..6].copy_from_slice(&[1, 0x80, 0xc2, 0, 0, 0x0e]);
             let mut offset = 12;
             for tag in tags {
                 frame[offset..offset + 2].copy_from_slice(&tag.to_be_bytes());
@@ -1060,48 +1020,26 @@ mod tests {
             }
             frame[offset..offset + 2].copy_from_slice(&0x88cc_u16.to_be_bytes());
             assert!(is_lldp_frame(&frame));
-            assert!(bpf_accepts(&LLDP_FILTER, &frame));
+            assert!(bpf_accepts(&PASSIVE_FILTER, &frame));
         }
 
         let mut unrelated = vec![0; 64];
         unrelated[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
         assert!(!is_lldp_frame(&unrelated));
-        assert!(!bpf_accepts(&LLDP_FILTER, &unrelated));
+        assert!(!bpf_accepts(&PASSIVE_FILTER, &unrelated));
 
         let mut too_many_tags = vec![0; 64];
+        too_many_tags[..6].copy_from_slice(&[1, 0x80, 0xc2, 0, 0, 0x0e]);
         too_many_tags[12..14].copy_from_slice(&0x8100_u16.to_be_bytes());
         too_many_tags[16..18].copy_from_slice(&0x8100_u16.to_be_bytes());
         too_many_tags[20..22].copy_from_slice(&0x8100_u16.to_be_bytes());
         too_many_tags[24..26].copy_from_slice(&0x88cc_u16.to_be_bytes());
         assert!(!is_lldp_frame(&too_many_tags));
-        assert!(!bpf_accepts(&LLDP_FILTER, &too_many_tags));
+        assert!(bpf_accepts(&PASSIVE_FILTER, &too_many_tags));
     }
 
     fn bpf_accepts(instructions: &[BpfInsn], frame: &[u8]) -> bool {
-        let mut accumulator = 0;
-        let mut pc = 0;
-        while let Some(instruction) = instructions.get(pc) {
-            match instruction.code {
-                0x28 => {
-                    let offset = instruction.k as usize;
-                    let Some(bytes) = frame.get(offset..offset + 2) else {
-                        return false;
-                    };
-                    accumulator = u32::from(u16::from_be_bytes([bytes[0], bytes[1]]));
-                    pc += 1;
-                }
-                0x15 => {
-                    pc += 1 + usize::from(if accumulator == instruction.k {
-                        instruction.jt
-                    } else {
-                        instruction.jf
-                    });
-                }
-                0x06 => return instruction.k != 0,
-                _ => panic!("unexpected instruction in the LLDP test filter"),
-            }
-        }
-        false
+        run_filter(instructions, frame) != 0
     }
 
     #[test]
@@ -1161,6 +1099,10 @@ mod tests {
                 }
                 0x30 => {
                     accumulator = frame[insn.k as usize] as u32;
+                    pc += 1;
+                }
+                0x54 => {
+                    accumulator &= insn.k;
                     pc += 1;
                 }
                 0x15 => {

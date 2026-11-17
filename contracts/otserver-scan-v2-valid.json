@@ -179,6 +179,25 @@
           "warnings": []
         },
         {
+          "source": "cdp",
+          "observedAt": "2026-10-13T09:00:07Z",
+          "macAddress": "02:10:00:00:00:02",
+          "fields": {
+            "name": "Remote I/O",
+            "model": "IO-100",
+            "protocols": ["cdp"]
+          },
+          "raw": {
+            "protocol": "cdp",
+            "version": 2,
+            "deviceId": "remote-io",
+            "portId": "GigabitEthernet1/1",
+            "ttl": 180,
+            "inventory": { "nativeVlan": 100 }
+          },
+          "warnings": []
+        },
+        {
           "source": "profinet-dcp",
           "observedAt": "2026-10-13T09:00:07Z",
           "ipAddress": "192.0.2.2",
@@ -241,6 +260,16 @@
       },
       "remote": { "macAddress": "02:10:00:00:00:02", "portId": "port-1" },
       "raw": { "protocol": "lldp" }
+    },
+    {
+      "source": "cdp",
+      "observedAt": "2026-10-13T09:00:08Z",
+      "local": { "macAddress": "02:10:00:00:00:01" },
+      "remote": {
+        "macAddress": "02:10:00:00:00:02",
+        "portId": "GigabitEthernet1/1"
+      },
+      "raw": { "protocol": "cdp", "version": 2 }
     }
   ],
   "unresolved": [

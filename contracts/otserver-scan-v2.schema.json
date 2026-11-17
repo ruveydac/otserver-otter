@@ -101,6 +101,7 @@
             "arp",
             "bacnet",
             "beckhoff-ads",
+            "cdp",
             "dnp3",
             "ethernet-ip",
             "http",
@@ -317,7 +318,7 @@
       "additionalProperties": false,
       "required": ["source", "observedAt", "local", "remote", "raw"],
       "properties": {
-        "source": { "type": "string", "enum": ["lldp", "profinet-dcp", "snmp", "unknown"] },
+        "source": { "type": "string", "enum": ["cdp", "lldp", "profinet-dcp", "snmp", "unknown"] },
         "observedAt": { "type": "string", "format": "date-time" },
         "local": { "$ref": "#/$defs/endpoint" },
         "remote": { "$ref": "#/$defs/endpoint" },
