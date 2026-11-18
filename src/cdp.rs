@@ -406,6 +406,18 @@ mod tests {
         frame
     }
 
+    fn refresh_checksum(frame: &mut [u8]) {
+        let packet = &mut frame[22..];
+        packet[2..4].fill(0);
+        let mut sum = packet.chunks(2).fold(0_u32, |sum, chunk| {
+            sum + u32::from(u16::from_be_bytes([chunk[0], *chunk.get(1).unwrap_or(&0)]))
+        });
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        packet[2..4].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    }
+
     #[test]
     fn parses_cdp_v1_and_v2_without_expanding_ip_scope() {
         for version in [1, 2] {
@@ -441,6 +453,56 @@ mod tests {
         bad = frame;
         bad[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
         assert!(parse(&bad, local).is_none());
+    }
+
+    #[test]
+    fn rejects_malformed_snap_and_tlv_data() {
+        let local = "02:00:00:00:00:02";
+        let mut bad_snap = advertisement(2);
+        bad_snap[14] = 0xab;
+        assert!(parse(&bad_snap, local).is_none());
+
+        let mut short_tlv = advertisement(2);
+        short_tlv[28..30].copy_from_slice(&3_u16.to_be_bytes());
+        refresh_checksum(&mut short_tlv);
+        assert!(parse(&short_tlv, local).is_none());
+
+        let mut empty_identity = advertisement_with(2, &[(1, b"")]);
+        refresh_checksum(&mut empty_identity);
+        assert!(parse(&empty_identity, local).is_none());
+    }
+
+    #[test]
+    fn rejects_duplicate_device_and_port_identifiers() {
+        let local = "02:00:00:00:00:02";
+        let mut duplicate_device = advertisement_with(2, &[(1, b"switch-2")]);
+        refresh_checksum(&mut duplicate_device);
+        assert!(parse(&duplicate_device, local).is_none());
+
+        let mut duplicate_port = advertisement_with(2, &[(3, b"GigabitEthernet1/2")]);
+        refresh_checksum(&mut duplicate_port);
+        assert!(parse(&duplicate_port, local).is_none());
+    }
+
+    #[test]
+    fn preserves_unknown_tlvs_and_rejects_excessive_tlv_counts() {
+        let local = "02:00:00:00:00:02";
+        let unknown = [0xde, 0xad];
+        let frame = advertisement_with(2, &[(99, &unknown)]);
+        let (device, _) = parse(&frame, local).unwrap();
+        assert_eq!(
+            device.observations[0].raw["tlvs"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["type"],
+            99
+        );
+
+        let value = [0];
+        let extra = vec![(99, value.as_slice()); MAX_TLVS + 1];
+        let frame = advertisement_with(2, &extra);
+        assert!(parse(&frame, local).is_none());
     }
 
     #[test]
