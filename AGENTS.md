@@ -37,6 +37,7 @@ instructions are in `README.md`; detailed operator and development guidance foll
 - CDP is passive and scoped to the selected link. Only a validated advertisement's Ethernet source
   MAC may establish its neighbor identity or topology link. Keep CDP-MIB neighbors as evidence when
   there is no trustworthy remote MAC; management addresses never create identity, links, or IP probes.
+  `--no-cdp`, `noCdp`, and the GUI toggle disable CDP independently of LLDP and legacy `noProtocols`.
 - `--allow-dcp-source`, `allowDcpSource`, and the GUI toggle run DCP before ARP, add reported DCP IPs
   to the ARP sweep, and allow unambiguous DCP identities outside the configured range into later IP
   probes; preserve MAC correlation and OUI vendor resolution.

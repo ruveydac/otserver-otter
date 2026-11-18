@@ -2245,6 +2245,7 @@ mod tests {
             no_profinet: Some(true),
             no_snmp: Some(true),
             no_lldp: Some(true),
+            no_cdp: Some(true),
             ..ScannerConfig::default()
         };
         let mut app = GuiApp::new(ScannerConfigs::Single(Box::new(config)));
@@ -2615,6 +2616,24 @@ mod tests {
             app.netbios_enabled = !app.netbios_enabled;
             assert_eq!(app.to_config().no_netbios, (!disabled).then_some(true));
             assert_eq!(app.to_config().no_protocols, None);
+        }
+    }
+
+    #[test]
+    fn cdp_toggle_roundtrips_independently_of_legacy_disable() {
+        for (no_cdp, no_protocols) in [(None, None), (Some(true), None), (None, Some(true))] {
+            let config = ScannerConfig {
+                no_cdp,
+                no_protocols,
+                ..ScannerConfig::default()
+            };
+            let mut app = GuiApp::new(ScannerConfigs::Single(Box::new(config)));
+            let disabled = no_cdp.unwrap_or(false);
+            assert_eq!(app.cdp_enabled, !disabled);
+            assert_eq!(app.to_config().no_cdp, disabled.then_some(true));
+            assert_eq!(app.to_config().no_protocols, None);
+            app.cdp_enabled = !app.cdp_enabled;
+            assert_eq!(app.to_config().no_cdp, (!disabled).then_some(true));
         }
     }
 

@@ -2863,6 +2863,7 @@ mod tests {
         assert!(!resolved.protocols.opcua);
         assert!(resolved.protocols.snmp);
         assert!(resolved.protocols.lldp);
+        assert!(resolved.protocols.cdp);
         assert_eq!(resolved.snmp[0].username.as_deref(), Some("ops"));
         assert_eq!(resolved.snmp[0].auth_password.as_deref(), Some("secret"));
         let upload = resolved.upload.unwrap();
@@ -3263,11 +3264,17 @@ mod tests {
 
     #[test]
     fn cdp_is_independent_and_enabled_by_default() {
-        for (cli_disabled, config_disabled) in [(false, false), (true, false), (false, true)] {
+        for (cli_disabled, config_disabled, legacy_disabled) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
             let mut cli = args();
             cli.no_cdp = cli_disabled;
             let mut config = complete_config("Test", "192.0.2.1", "test.json");
             config.no_cdp = Some(config_disabled);
+            config.no_protocols = Some(legacy_disabled);
             let options = resolve_scan(cli, config, None).unwrap();
             assert_eq!(options.protocols.cdp, !(cli_disabled || config_disabled));
             assert!(options.protocols.lldp);
@@ -5422,6 +5429,7 @@ mod tests {
         scan.no_profinet = true;
         scan.no_snmp = true;
         scan.no_lldp = true;
+        scan.no_cdp = true;
 
         let result = run_cli_with_configs(
             Cli {
@@ -5454,6 +5462,7 @@ mod tests {
         scan.no_profinet = true;
         scan.no_snmp = true;
         scan.no_lldp = true;
+        scan.no_cdp = true;
         let configs = ScannerConfigs::Multiple(vec![
             ScannerConfig {
                 name: Some("valid".into()),
