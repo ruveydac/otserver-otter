@@ -4,7 +4,7 @@
 
 ### Read-only OT discovery for the [OTserver inventory](https://github.com/ruveydac/OTserver)
 
-Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Beckhoff ADS · Fox · DNP3 · IEC 61850 · NetBIOS · SMB · RPC · HTTP/HTTPS · OPC UA · SNMP · LLDP
+Native ARP · PROFINET DCP · S7 · EtherNet/IP · BACnet · FINS · Beckhoff ADS · Fox · DNP3 · IEC 61850 · NetBIOS · SMB · RPC · HTTP/HTTPS · OPC UA · SNMP · LLDP · CDP
 
 [![Website](https://img.shields.io/badge/otserver.org-111111?logo=firefoxbrowser&logoColor=white)](https://otserver.org)
 [![codecov](https://codecov.io/gh/ruveydac/OTserver-otter/graph/badge.svg)](https://codecov.io/gh/ruveydac/OTserver-otter)
@@ -27,12 +27,23 @@ managed scanner.
 ## What it discovers
 
 Otter uses ARP, PROFINET, S7, EtherNet/IP, BACnet, Omron FINS, Beckhoff ADS, Niagara Fox, DNP3,
-IEC 61850, NetBIOS, SMB, RPC, HTTP/HTTPS, OPC UA, SNMP, and LLDP to collect identity and network
+IEC 61850, NetBIOS, SMB, RPC, HTTP/HTTPS, OPC UA, SNMP, LLDP, and CDP to collect identity and network
 evidence.
 
 Discovery uses fixed, read-only requests. Otter does not change device configuration, run exploits,
 or perform active vulnerability checks. Only scan networks you own or are authorized to assess.
 Read-only discovery still generates network traffic; assess its suitability for your network.
+
+CDP and LLDP listen passively on the selected link for 30 seconds. For CDP, only a validated
+advertisement's Ethernet source MAC creates a neighbor device or topology link. SNMP CDP-MIB rows
+remain neighbor evidence; management addresses do not create identities, links, or scan targets.
+Use `--no-cdp` or `noCdp` to disable CDP independently of LLDP. Managed configurations that disable
+CDP require an Otter scanner version that supports `noCdp`.
+
+PROFINET record reads use read-only DCE/RPC implicit reads after DCP discovery. Otter exports I&M
+identity, device-level diagnosis and maintenance evidence, and DAP port link/statistics evidence.
+Use `--disable-pn-epm` or `disablePnEpm` to skip PNIO EPM and record reads while keeping DCP enabled.
+Optional diagnosis and port records that a device does not expose are informational, not scan failures.
 
 ## Quick start
 

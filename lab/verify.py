@@ -201,7 +201,7 @@ def assert_full(result: dict) -> None:
         if "pnioRecords" in (item.get("raw") or {})
     )
     pnio_records = pnio["raw"]["pnioRecords"]
-    assert len(pnio_records) >= 15
+    assert len(pnio_records) >= 25
     assert {
         "0xF821",
         "0xF840",
@@ -212,6 +212,10 @@ def assert_full(result: dict) -> None:
         "0xAFF3",
         "0xAFF4",
         "0xAFF5",
+        "0xF80C",
+        "0x802A",
+        "0x802B",
+        "0x8072",
     } <= {record["index"] for record in pnio_records}
     assert pnio["fields"]["protocols"] == ["profinet", "profinet-pnio"]
     assert (
@@ -480,7 +484,7 @@ def assert_pnio(result: dict) -> None:
         if "pnioRecords" in (item.get("raw") or {})
     )
     records = pnio["raw"]["pnioRecords"]
-    assert len(records) >= 15
+    assert len(records) >= 25
     assert {
         "0xF821",
         "0xF840",
@@ -491,6 +495,10 @@ def assert_pnio(result: dict) -> None:
         "0xAFF3",
         "0xAFF4",
         "0xAFF5",
+        "0xF80C",
+        "0x802A",
+        "0x802B",
+        "0x8072",
     } <= {record["index"] for record in records}
     assert pnio["fields"]["protocols"] == ["profinet", "profinet-pnio"]
     assert (
@@ -517,6 +525,14 @@ def assert_pnio(result: dict) -> None:
         == "Chengdu Zongheng Intelligence Control Technology Co., Ltd."
     )
     assert len(by_index["0xAFF5"]["assetManagementBlocks"]) == 3
+    assert by_index["0xF80C"]["entries"][0]["severity"] == "maintenance-required"
+    assert by_index["0x802A"]["ports"][0]["portId"] == "port-001"
+    assert by_index["0x802A"]["ports"][0]["linkState"]["link"] == "up"
+    assert by_index["0x802B"]["checks"][0]["slot"] == 0
+    assert by_index["0x8072"]["statistics"][0]["counters"]["ifInOctets"] == 1
+    assert "pnio:0:0:32769" in {
+        entity["ref"] for entity in pnio["raw"]["physicalEntities"]
+    }
     assert_pnio_components(pnio)
 
 
@@ -539,6 +555,13 @@ def assert_pnio_components(pnio: dict) -> None:
         assert entity["serialClaim"]["scope"] == "submodule"
         assert entity["serialClaim"]["componentRef"] == ref
         assert entity["serialClaim"]["original"] == record["parsed"]["serialNumber"]
+    port = entities.get("pnio:0:0:32769")
+    if port is not None:
+        assert port["class"] == "port"
+        assert port["portId"] == "port-001"
+        assert port["linkState"]["port"] == "forwarding"
+        assert port["linkState"]["link"] == "up"
+        assert port["statistics"][0]["counters"]["ifInOctets"] == 1
 
 
 def assert_pnio_fallback(result: dict) -> None:
@@ -550,7 +573,7 @@ def assert_pnio_fallback(result: dict) -> None:
     assert pnio["fields"]["softwareRevision"] == "V1.2.3"
     assert pnio["ipAddress"] == "172.30.0.10"
     assert {record["index"] for record in pnio["raw"]["pnioRecords"]} == {
-        "0xAFF0", "0xAFF1", "0xAFF3", "0xAFF4", "0xAFF5",
+        "0xAFF0", "0xAFF1", "0xAFF3", "0xAFF4", "0xAFF5", "0xF80C",
     }
     assert len(pnio["warnings"]) == 4
     for index in ("0xF821", "0xF840", "0xF000", "0xAFF2"):

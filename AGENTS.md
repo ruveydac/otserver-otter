@@ -12,7 +12,7 @@ Identity, BACnet ReadProperty, Omron FINS identity, Beckhoff ADS/AMS ServerInfo 
 ReadDeviceInfo/ReadState requests, Niagara Fox hello, DNP3 Group 0 device attributes, NetBIOS Node
 Status, SMB1/2/3 and RPC NTLM challenge identity, OPC UA asset discovery,
 HTTP/HTTPS status/title/Server-header collection,
-SNMP GET/WALK, and LLDP. It exports
+SNMP GET/WALK, LLDP, and CDP. It exports
 `otserver-scan` schema-version-2 JSON for OTserver.
 
 The canonical wire contract is `contracts/otserver-scan-v2.schema.json`.
@@ -34,6 +34,10 @@ instructions are in `README.md`; detailed operator and development guidance foll
   log stale configured MACs and export the actual sender MAC. With ARP enabled, native protocols,
   SNMP, and LLDP use discovered, unambiguous MAC/IP pairs. Only explicit ARP disablement enables
   IP probing independently of Layer-2 discovery; never substitute a gateway MAC for a routed target.
+- CDP is passive and scoped to the selected link. Only a validated advertisement's Ethernet source
+  MAC may establish its neighbor identity or topology link. Keep CDP-MIB neighbors as evidence when
+  there is no trustworthy remote MAC; management addresses never create identity, links, or IP probes.
+  `--no-cdp`, `noCdp`, and the GUI toggle disable CDP independently of LLDP and legacy `noProtocols`.
 - `--allow-dcp-source`, `allowDcpSource`, and the GUI toggle run DCP before ARP, add reported DCP IPs
   to the ARP sweep, and allow unambiguous DCP identities outside the configured range into later IP
   probes; preserve MAC correlation and OUI vendor resolution.
@@ -62,7 +66,12 @@ instructions are in `README.md`; detailed operator and development guidance foll
   timeout on Windows and Linux. Report missing interface/device IPv4, unavailable Npcap, ambiguous
   addresses, and per-record failures in exported warnings. Failed records must retain successful
   reads; failed API/module enumeration must still permit primary I&M0 at API 0, slot 0, subslot 1
-  and its advertised optional records. Cancellation stops further requests and retains partial data.
+  and its advertised optional records. Device-level diagnosis (`0xF80C`) and DAP port records
+  (`0x802A`, `0x802B`, `0x8072`) are optional evidence: read port records only for DAP port subslots
+  from RealIdentificationData, bound them to 16 per device, and classify failures as INFO without
+  making an export partial. `--disable-pn-epm`, `disablePnEpm`, and the GUI toggle skip the PNIO
+  EPM/record-read path while leaving DCP enabled. Cancellation stops further requests and retains
+  partial data.
 - Active DCP must verify that its source MAC belongs to the selected physical interface. Send
   Identify-All once with `ResponseDelayFactor` `0x0080`; never use zero or rapid retries.
   After a successful send, collect replies for at least 60 seconds unless cancelled or capture
@@ -245,9 +254,12 @@ and never persist the token or managed protocol credentials.
 
 All discovery protocols are enabled by default. CLI `--no-<protocol>` switches and JSON `noArp`,
 `noProfinet`, `noS7`, `noEnip`, `noBacnet`, `noFins`, `noFox`, `noDnp3`, `noIec61850`, `noNetbios`,
-`noSmb`, `noRpc`, `noHttp`, `noAds`, `noOpcua`, `noSnmp`, and `noLldp` disable them individually.
-SNMP inventory and LLDP topology share credentials but have independent switches. The GUI exposes
-matching toggles.
+`noSmb`, `noRpc`, `noHttp`, `noAds`, `noOpcua`, `noSnmp`, `noLldp`, and `noCdp` disable them
+individually. SNMP inventory and LLDP/CDP neighbor evidence share credentials but have independent
+switches. The GUI exposes matching toggles. Managed CDP disablement requires a scanner version that
+supports `noCdp`; management omits the default `noCdp: false` for older scanners.
+`--disable-pn-epm` and `disablePnEpm` independently disable PROFINET PNIO EPM/record reads while
+leaving DCP enabled; the GUI exposes a matching toggle.
 
 ADS discovery uses `adsTargetNetIds` to map target IPv4 strings to their six-octet AMS NetIDs when
 UDP ServerInfo is unavailable, `adsSourceNetId` to override the scanner NetID derived from the local
@@ -421,6 +433,9 @@ to HTTP. Other hosts require explicit HTTPS. No scanner-side listener is opened.
   neighbors, expires TTLs and honors withdrawal/cancellation. Management addresses never expand IP
   probe scope. Preserve chassis/port subtypes and LLDP-MED inventory; remote inventory must not
   become the reporting SNMP agent's identity. Missing Npcap does not disable SNMP LLDP collection.
+- CDP combines Cisco CDP-MIB cache rows with a concurrent 30-second passive selected-link capture.
+  CDP-MIB addresses remain evidence and never expand probe scope or create topology links. Only a
+  validated passive CDP advertisement's Ethernet source MAC identifies its neighbor.
 - SNMP software revisions and OPC UA SoftwareRevision remain `softwareRevision`, never a fallback
   for firmware. OPC UA endpoint security/certificate evidence and standard server BuildInfo remain
   application-scoped under `raw`, separate from represented assets. Certificate retention is bounded

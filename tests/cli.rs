@@ -142,6 +142,7 @@ fn scan_with_all_probes_disabled_writes_a_valid_export_without_using_local_confi
             "--no-profinet",
             "--no-snmp",
             "--no-lldp",
+            "--no-cdp",
         ])
         .output()
         .unwrap();
@@ -161,7 +162,7 @@ fn scan_failure_takes_precedence_over_a_successful_batch_configuration() {
     let executable = isolated_binary(
         &directory,
         br#"[
-            {"name":"valid","targets":["127.0.0.1"],"interface":"lo","sourceMac":"00:11:22:33:44:55","noProtocols":true,"noArp":true,"noProfinet":true,"noSnmp":true,"noLldp":true},
+            {"name":"valid","targets":["127.0.0.1"],"interface":"lo","sourceMac":"00:11:22:33:44:55","noProtocols":true,"noArp":true,"noProfinet":true,"noSnmp":true,"noLldp":true,"noCdp":true},
             {"name":"invalid","interface":"lo","sourceMac":"00:11:22:33:44:55"}
         ]"#,
     );
@@ -187,7 +188,7 @@ fn scan_partial_results_use_the_documented_partial_exit_status() {
     let directory = temporary_directory("partial-scan");
     let executable = isolated_binary(
         &directory,
-        br#"{"targets":["127.0.0.1"],"interface":"lo","sourceMac":"00:11:22:33:44:55","noProtocols":true,"noArp":true,"noProfinet":true,"noLldp":true,"snmp":{"version":"unsupported"}}"#,
+        br#"{"targets":["127.0.0.1"],"interface":"lo","sourceMac":"00:11:22:33:44:55","noProtocols":true,"noArp":true,"noProfinet":true,"noLldp":true,"noCdp":true,"snmp":{"version":"unsupported"}}"#,
     );
     let output_path = directory.join("partial.json");
     let output = Command::new(executable)

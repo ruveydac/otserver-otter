@@ -137,6 +137,83 @@ def module_record(block_type: int, version: tuple[int, int]) -> bytes:
     return record_block(block_type, payload, version)
 
 
+def identification_record() -> bytes:
+    payload = (
+        (1).to_bytes(2, "big")
+        + (0).to_bytes(4, "big")
+        + (2).to_bytes(2, "big")
+        + (0).to_bytes(2, "big")
+        + (0x0001).to_bytes(4, "big")
+        + (1).to_bytes(2, "big")
+        + (0x8001).to_bytes(2, "big")
+        + (0x0002).to_bytes(4, "big")
+        + (1).to_bytes(2, "big")
+        + (0x1111).to_bytes(4, "big")
+        + (1).to_bytes(2, "big")
+        + (1).to_bytes(2, "big")
+        + (0x2222).to_bytes(4, "big")
+    )
+    return record_block(0x0013, payload, (1, 1))
+
+
+def diagnosis_record() -> bytes:
+    payload = (
+        (0).to_bytes(4, "big")
+        + (0).to_bytes(2, "big")
+        + (1).to_bytes(2, "big")
+        + (0x8000).to_bytes(2, "big")
+        + (0x0800).to_bytes(2, "big")
+        + (0x8000).to_bytes(2, "big")
+        + (0x8000).to_bytes(2, "big")
+        + (0x0200).to_bytes(2, "big")
+        + (1).to_bytes(2, "big")
+    )
+    return record_block(0x0010, payload, (1, 1))
+
+
+def port_data_real_record() -> bytes:
+    payload = (
+        b"\0\0"
+        + (0).to_bytes(2, "big")
+        + (0x8001).to_bytes(2, "big")
+        + b"\x08"
+        + b"port-001"
+        + b"\x01"
+        + b"\0\0"
+        + b"\x08"
+        + b"port-002"
+        + b"\x04"
+        + b"peer"
+        + b"\0\0"
+        + (1000).to_bytes(4, "big")
+        + bytes((0x00, 0x11, 0x22, 0x33, 0x44, 0x55))
+        + b"\0\0"
+        + (0x001E).to_bytes(2, "big")
+        + b"\0\0"
+        + (0).to_bytes(4, "big")
+        + (0).to_bytes(4, "big")
+        + b"\x05\x01"
+        + b"\0\0"
+        + (1).to_bytes(4, "big")
+    )
+    return record_block(0x020F, payload)
+
+
+def port_data_check_record() -> bytes:
+    payload = (
+        b"\0\0"
+        + (0).to_bytes(2, "big")
+        + (0x8001).to_bytes(2, "big")
+        + record_block(0x020C, b"\x00\x1e\0\0")
+    )
+    return record_block(0x0200, payload)
+
+
+def port_statistics_record() -> bytes:
+    payload = b"\0\0" + b"".join(value.to_bytes(4, "big") for value in range(1, 7))
+    return record_block(0x0251, payload)
+
+
 def im5_record() -> bytes:
     payload = bytearray(b" " * 152)
     payload[0:64] = b"A" * 64
@@ -160,7 +237,15 @@ def pnio_record(index: int) -> bytes:
     if index == 0xF840:
         return module_record(0x0030, (1, 0))
     if index == 0xF000:
-        return module_record(0x0013, (1, 1))
+        return identification_record()
+    if index == 0xF80C:
+        return diagnosis_record()
+    if index == 0x802A:
+        return port_data_real_record()
+    if index == 0x802B:
+        return port_data_check_record()
+    if index == 0x8072:
+        return port_statistics_record()
     if index == 0xAFF0:
         payload = bytearray(54)
         payload[0:2] = (0x1234).to_bytes(2, "big")

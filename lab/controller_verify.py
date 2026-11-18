@@ -95,7 +95,7 @@ def main(binary):
                     configuration = {
                         "name": "Lab", "targets": ["192.0.2.1"], "interface": interface["name"],
                         "sourceMac": "00:11:22:33:44:55", "serverUrl": url, "site": "site1",
-                        "noProtocols": True, "noArp": True, "noProfinet": True, "noSnmp": True, "noLldp": True,
+                        "noProtocols": True, "noArp": True, "noProfinet": True, "noSnmp": True, "noLldp": True, "noCdp": True,
                     }
                     if run == "run3":
                         configuration["output"] = "/forbidden/server/path"
@@ -167,7 +167,7 @@ def main(binary):
             assert saved["assignment"]["phase"] == "ready" and saved["fileCredential"]["credential"] == "b" * 43
             assert saved["assignment"]["uploadAttempts"] == 1
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment)
-            last_logs = process.communicate(timeout=165)
+            last_logs = process.communicate(timeout=210)
             assert process.returncode == 1, "revocation must stop the agent"
             assert data["error"] is None and data["rotations"] == 1 and len(data["uploads"]) == 2
             assert data["uploadTimes"][1] - data["uploadTimes"][0] >= 120

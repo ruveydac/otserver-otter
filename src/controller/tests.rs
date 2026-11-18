@@ -887,6 +887,7 @@ fn configuration_maps_profile_options_and_separate_credentials() {
         "noProtocols",
         "noArp",
         "noProfinet",
+        "disablePnEpm",
         "allowDcpSource",
         "noS7",
         "noEnip",
@@ -916,6 +917,7 @@ fn configuration_maps_profile_options_and_separate_credentials() {
     assert!(
         !options.protocols.arp
             && !options.protocols.profinet
+            && !options.protocols.pn_epm
             && !options.protocols.netbios
             && !options.protocols.smb
             && !options.protocols.rpc
@@ -1047,6 +1049,7 @@ async fn assigned_run_persists_a_protocol_disabled_scan_then_uploads_and_finishe
     job.configuration["noProfinet"] = json!(true);
     job.configuration["noSnmp"] = json!(true);
     job.configuration["noLldp"] = json!(true);
+    job.configuration["noCdp"] = json!(true);
     let lease = job.lease_expires_at.clone();
     let (api, task) = server(vec![
         (200, json!({"status":"running"})),

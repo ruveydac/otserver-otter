@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+pub mod cdp;
 pub mod contract;
 pub mod discovery;
 pub mod lldp;

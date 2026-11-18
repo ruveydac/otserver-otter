@@ -15,6 +15,13 @@ const DEFAULT_RECORD_DATA_LENGTH: u32 = 32_768;
 const MAX_RECORD_DATA_LENGTH: u32 = 32_768;
 const MAX_RPC_BODY_LENGTH: usize = MAX_RECORD_DATA_LENGTH as usize + 128;
 const MAX_RPC_FRAGMENTS: usize = 256;
+const DEVICE_DIAGNOSIS_INDEX: u16 = 0xF80C;
+const PORT_DATA_INDEX: u16 = 0x802A;
+const PORT_CHECK_INDEX: u16 = 0x802B;
+const PORT_STATISTICS_INDEX: u16 = 0x8072;
+const PORT_SUBSLOT_START: u16 = 0x8001;
+const PORT_SUBSLOT_END: u16 = 0x80FF;
+const MAX_PORT_TARGETS: usize = 16;
 pub(crate) const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const EPM_INTERFACE: &str = "e1af8308-5d1f-11c9-91a4-08002b14a0fa";
@@ -146,6 +153,7 @@ pub(crate) struct RecordRead {
 pub(crate) struct RecordScan {
     pub records: Vec<RecordRead>,
     pub warnings: Vec<String>,
+    pub info: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -212,7 +220,7 @@ pub(crate) fn read_records(
         data_length: DEFAULT_RECORD_DATA_LENGTH,
     };
     let mut result = RecordScan::default();
-    let mut read_one = |target: RecordTarget| -> Option<RecordRead> {
+    let mut read_one = |target: RecordTarget, optional: bool| -> Option<RecordRead> {
         if cancelled.load(Ordering::Relaxed) {
             return None;
         }
@@ -231,16 +239,21 @@ pub(crate) fn read_records(
         match read() {
             Ok(record) => Some(record),
             Err(error) => {
-                result.warnings.push(format!(
+                let warning = format!(
                     "PNIO record 0x{:04X} (API {}, slot {}, subslot {}) failed: {error}",
                     target.index, target.api, target.slot, target.subslot,
-                ));
+                );
+                if optional {
+                    result.info.push(warning);
+                } else {
+                    result.warnings.push(warning);
+                }
                 None
             }
         }
     };
 
-    let api_record = read_one(primary(0xF821));
+    let api_record = read_one(primary(0xF821), false);
     let apis = api_record
         .as_ref()
         .and_then(|record| record.parsed["apis"].as_array())
@@ -255,6 +268,7 @@ pub(crate) fn read_records(
     result.records.extend(api_record);
 
     let mut module_targets = BTreeSet::new();
+    let mut port_targets = BTreeSet::new();
     for api in apis {
         for index in [0xF840, 0xF000] {
             if cancelled.load(Ordering::Relaxed) {
@@ -264,14 +278,27 @@ pub(crate) fn read_records(
                 api,
                 ..primary(index)
             };
-            let Some(record) = read_one(target) else {
+            let Some(record) = read_one(target, false) else {
                 continue;
             };
+            if index == 0xF000 {
+                let mut api_targets = BTreeSet::new();
+                collect_module_targets(&record.parsed, api, &mut api_targets);
+                port_targets.extend(
+                    api_targets
+                        .into_iter()
+                        .filter(|(_, slot, subslot)| is_dap_port(*slot, *subslot)),
+                );
+            }
             collect_module_targets(&record.parsed, api, &mut module_targets);
             result.records.push(record);
         }
     }
     module_targets.insert((0, 0, 1));
+    let port_targets = port_targets
+        .into_iter()
+        .take(MAX_PORT_TARGETS)
+        .collect::<Vec<_>>();
     let mut im_targets = BTreeSet::new();
     for (api, slot, subslot) in module_targets {
         if cancelled.load(Ordering::Relaxed) {
@@ -284,7 +311,7 @@ pub(crate) fn read_records(
             index: 0xAFF0,
             data_length: DEFAULT_RECORD_DATA_LENGTH,
         };
-        let Some(record) = read_one(target) else {
+        let Some(record) = read_one(target, is_dap_port(slot, subslot)) else {
             continue;
         };
         let supported = record.parsed["imSupported"].as_u64().unwrap_or(0) as u16;
@@ -305,14 +332,43 @@ pub(crate) fn read_records(
         if cancelled.load(Ordering::Relaxed) {
             break;
         }
-        if let Some(record) = read_one(RecordTarget {
+        if let Some(record) = read_one(
+            RecordTarget {
+                api,
+                slot,
+                subslot,
+                index,
+                data_length: DEFAULT_RECORD_DATA_LENGTH,
+            },
+            is_dap_port(slot, subslot),
+        ) {
+            result.records.push(record);
+        }
+    }
+    if !cancelled.load(Ordering::Relaxed)
+        && let Some(record) = read_one(primary(DEVICE_DIAGNOSIS_INDEX), true)
+    {
+        result.records.push(record);
+    }
+    for (api, slot, subslot) in port_targets {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        let target = |index| RecordTarget {
             api,
             slot,
             subslot,
             index,
             data_length: DEFAULT_RECORD_DATA_LENGTH,
-        }) {
-            result.records.push(record);
+        };
+        let Some(record) = read_one(target(PORT_DATA_INDEX), true) else {
+            continue;
+        };
+        result.records.push(record);
+        for index in [PORT_CHECK_INDEX, PORT_STATISTICS_INDEX] {
+            if let Some(record) = read_one(target(index), true) {
+                result.records.push(record);
+            }
         }
     }
     if cancelled.load(Ordering::Relaxed) {
@@ -321,6 +377,10 @@ pub(crate) fn read_records(
             .push("PROFINET PNIO record scan was cancelled; results are incomplete.".into());
     }
     Ok(result)
+}
+
+fn is_dap_port(slot: u16, subslot: u16) -> bool {
+    slot == 0 && (PORT_SUBSLOT_START..=PORT_SUBSLOT_END).contains(&subslot)
 }
 
 fn collect_module_targets(value: &Value, api: u32, targets: &mut BTreeSet<(u32, u16, u16)>) {
@@ -914,6 +974,10 @@ pub(crate) fn parse_record(index: u16, data: &[u8]) -> Result<Value, String> {
         0xF821 => parse_api_record(data, 0x001A),
         0xF000 => parse_api_record(data, 0x0013),
         0xF840 => parse_filter_record(data),
+        DEVICE_DIAGNOSIS_INDEX => parse_device_diagnosis(data),
+        PORT_DATA_INDEX => parse_port_data_real(data),
+        PORT_CHECK_INDEX => parse_port_data_check(data),
+        PORT_STATISTICS_INDEX => parse_port_statistics(data),
         _ => Err(format!("Unsupported PROFINET record index 0x{index:04X}.")),
     }
 }
@@ -1060,6 +1124,356 @@ fn parse_im5_data(data: &[u8]) -> Result<Value, String> {
         result["vendorName"] = json!(name);
     }
     Ok(result)
+}
+
+fn parse_device_diagnosis(data: &[u8]) -> Result<Value, String> {
+    let mut entries = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        let (block_type, block_length, version_high, version_low) = block_header(&data[offset..])?;
+        if block_type != 0x0010 || version_high != 1 || version_low > 1 {
+            return Err("PROFINET diagnosis record contained an unsupported block.".into());
+        }
+        let end = offset
+            .checked_add(usize::from(block_length) + 4)
+            .ok_or_else(|| "PROFINET diagnosis block length overflowed.".to_string())?;
+        if end > data.len() {
+            return Err("PROFINET diagnosis record was truncated.".into());
+        }
+        let block = &data[offset..end];
+        let mut position = 6;
+        let api = if version_low == 1 {
+            let value = read_be32(block, position)?;
+            position += 4;
+            value
+        } else {
+            0
+        };
+        let slot = read_be16(block, position)?;
+        position += 2;
+        let subslot = read_be16(block, position)?;
+        position += 2;
+        let summary_channel = read_be16(block, position)?;
+        position += 2;
+        let summary_properties = read_be16(block, position)?;
+        position += 2;
+        let usi = read_be16(block, position)?;
+        position += 2;
+        let body = &block[position..];
+        let item_size = match usi {
+            0x8000 => Some(6),
+            0x8002 => Some(12),
+            0x8003 => Some(16),
+            _ => None,
+        };
+        if let Some(item_size) = item_size {
+            if !body.len().is_multiple_of(item_size) {
+                return Err("PROFINET diagnosis item list was truncated.".into());
+            }
+            for item in body.chunks_exact(item_size) {
+                let channel = read_be16(item, 0)?;
+                let properties = read_be16(item, 2)?;
+                let error_type = read_be16(item, 4)?;
+                let mut entry = json!({
+                    "api": api,
+                    "slot": slot,
+                    "subslot": subslot,
+                    "channel": channel,
+                    "channelProperties": properties,
+                    "severity": diagnosis_severity(properties),
+                    "userStructureIdentifier": format!("0x{usi:04X}"),
+                    "channelErrorType": format!("0x{error_type:04X}"),
+                });
+                if usi >= 0x8002 {
+                    entry["extendedChannelErrorType"] =
+                        json!(format!("0x{:04X}", read_be16(item, 6)?));
+                    entry["extendedChannelAddValue"] =
+                        json!(format!("0x{:08X}", read_be32(item, 8)?));
+                }
+                if usi == 0x8003 {
+                    entry["qualifiedChannelQualifier"] =
+                        json!(format!("0x{:08X}", read_be32(item, 12)?));
+                }
+                entries.push(entry);
+            }
+        } else {
+            entries.push(json!({
+                "api": api,
+                "slot": slot,
+                "subslot": subslot,
+                "channel": summary_channel,
+                "channelProperties": summary_properties,
+                "severity": diagnosis_severity(summary_properties),
+                "userStructureIdentifier": format!("0x{usi:04X}"),
+                "data": hex(body),
+            }));
+        }
+        offset = end;
+    }
+    Ok(json!({
+        "blockType": 0x0010,
+        "entries": entries,
+    }))
+}
+
+fn diagnosis_severity(properties: u16) -> &'static str {
+    match properties & 0x0600 {
+        0x0200 => "maintenance-required",
+        0x0400 => "maintenance-demanded",
+        0x0600 => "qualified",
+        _ => "diagnosis",
+    }
+}
+
+fn parse_port_data_real(data: &[u8]) -> Result<Value, String> {
+    let mut ports = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        let (block_type, block_length, version_high, version_low) = block_header(&data[offset..])?;
+        if block_type != 0x020F || version_high != 1 || version_low != 0 {
+            return Err("PROFINET port data contained an unsupported block.".into());
+        }
+        let end = offset
+            .checked_add(usize::from(block_length) + 4)
+            .ok_or_else(|| "PROFINET port data block length overflowed.".to_string())?;
+        if end > data.len() {
+            return Err("PROFINET port data record was truncated.".into());
+        }
+        let block = &data[offset..end];
+        let mut cursor = Cursor::new(block);
+        cursor.bytes(6)?;
+        cursor.align(4)?;
+        let slot = cursor.u16(true)?;
+        let subslot = cursor.u16(true)?;
+        let port_id_length = usize::from(cursor.byte()?);
+        if port_id_length > 64 {
+            return Err("PROFINET port identifier was oversized.".into());
+        }
+        let port_id = clean_text(cursor.bytes(port_id_length)?);
+        let peer_count = usize::from(cursor.byte()?);
+        if peer_count > 16 {
+            return Err("PROFINET port peer count was oversized.".into());
+        }
+        cursor.align(4)?;
+        let mut peers = Vec::new();
+        for _ in 0..peer_count {
+            let peer_port_length = usize::from(cursor.byte()?);
+            if peer_port_length > 64 {
+                return Err("PROFINET peer port identifier was oversized.".into());
+            }
+            let peer_port = clean_text(cursor.bytes(peer_port_length)?);
+            let peer_chassis_length = usize::from(cursor.byte()?);
+            if peer_chassis_length > 64 {
+                return Err("PROFINET peer chassis identifier was oversized.".into());
+            }
+            let peer_chassis = clean_text(cursor.bytes(peer_chassis_length)?);
+            cursor.align(4)?;
+            let line_delay = cursor.u32(true)?;
+            let peer_mac = mac_string(cursor.bytes(6)?)?;
+            cursor.align(4)?;
+            peers.push(json!({
+                "portId": peer_port,
+                "chassisId": peer_chassis,
+                "lineDelay": line_delay,
+                "macAddress": peer_mac,
+            }));
+        }
+        let mau_type = cursor.u16(true)?;
+        cursor.align(4)?;
+        let domain_boundary = cursor.u32(true)?;
+        let multicast_boundary = cursor.u32(true)?;
+        let link_state_port = cursor.byte()?;
+        let link_state_link = cursor.byte()?;
+        cursor.align(4)?;
+        let media_type = cursor.u32(true)?;
+        if cursor.remaining() != 0 {
+            return Err("PROFINET port data contained trailing bytes.".into());
+        }
+        ports.push(json!({
+            "blockType": 0x020F,
+            "slot": slot,
+            "subslot": subslot,
+            "portId": port_id,
+            "numberOfPeers": peer_count,
+            "peers": peers,
+            "mauType": mau_type,
+            "domainBoundary": domain_boundary,
+            "multicastBoundary": multicast_boundary,
+            "linkState": {
+                "port": link_state_port_name(link_state_port),
+                "portCode": link_state_port,
+                "link": link_state_link_name(link_state_link),
+                "linkCode": link_state_link,
+            },
+            "mediaType": media_type,
+            "mediaTypeName": media_type_name(media_type),
+        }));
+        offset = end;
+    }
+    Ok(json!({
+        "blockType": 0x020F,
+        "ports": ports,
+    }))
+}
+
+fn parse_port_data_check(data: &[u8]) -> Result<Value, String> {
+    let mut checks = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        let (block_type, block_length, version_high, version_low) = block_header(&data[offset..])?;
+        if block_type != 0x0200 || version_high != 1 || version_low != 0 {
+            return Err("PROFINET port check contained an unsupported block.".into());
+        }
+        let end = offset
+            .checked_add(usize::from(block_length) + 4)
+            .ok_or_else(|| "PROFINET port check block length overflowed.".to_string())?;
+        if end > data.len() {
+            return Err("PROFINET port check record was truncated.".into());
+        }
+        let block = &data[offset..end];
+        if block.len() < 12 {
+            return Err("PROFINET port check record was truncated.".into());
+        }
+        let slot = read_be16(block, 8)?;
+        let subslot = read_be16(block, 10)?;
+        let mut position = 12;
+        let mut blocks = Vec::new();
+        while position < block.len() {
+            if block.len() - position < 6 {
+                if block[position..].iter().all(|byte| *byte == 0) {
+                    break;
+                }
+                return Err("PROFINET port check contained trailing bytes.".into());
+            }
+            let (child_type, child_length, _, _) = block_header(&block[position..])?;
+            let child_end = position
+                .checked_add(usize::from(child_length) + 4)
+                .ok_or_else(|| "PROFINET port check child length overflowed.".to_string())?;
+            if child_end > block.len() {
+                return Err("PROFINET port check contained a truncated child block.".into());
+            }
+            blocks.push(json!({
+                "blockType": child_type,
+                "blockLength": child_length,
+                "raw": hex(&block[position..child_end]),
+            }));
+            position = child_end;
+            if position < block.len() {
+                position = (position + 3) & !3;
+                if position > block.len() {
+                    position = block.len();
+                }
+            }
+        }
+        checks.push(json!({
+            "blockType": 0x0200,
+            "slot": slot,
+            "subslot": subslot,
+            "blocks": blocks,
+        }));
+        offset = end;
+    }
+    Ok(json!({
+        "blockType": 0x0200,
+        "checks": checks,
+    }))
+}
+
+fn parse_port_statistics(data: &[u8]) -> Result<Value, String> {
+    let mut statistics = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        let (block_type, block_length, version_high, version_low) = block_header(&data[offset..])?;
+        if block_type != 0x0251 || version_high != 1 || version_low > 1 {
+            return Err("PROFINET port statistics contained an unsupported block.".into());
+        }
+        let end = offset
+            .checked_add(usize::from(block_length) + 4)
+            .ok_or_else(|| "PROFINET port statistics block length overflowed.".to_string())?;
+        if end > data.len() {
+            return Err("PROFINET port statistics record was truncated.".into());
+        }
+        let block = &data[offset..end];
+        let mut position = 6;
+        let counter_status = if version_low == 1 {
+            let value = read_be16(block, position)?;
+            position += 2;
+            Some(value)
+        } else {
+            position += 2;
+            None
+        };
+        let mut counters = serde_json::Map::new();
+        for name in [
+            "ifInOctets",
+            "ifOutOctets",
+            "ifInDiscards",
+            "ifOutDiscards",
+            "ifInErrors",
+            "ifOutErrors",
+        ] {
+            counters.insert(name.into(), json!(read_be32(block, position)?));
+            position += 4;
+        }
+        if position != block.len() {
+            return Err("PROFINET port statistics contained trailing bytes.".into());
+        }
+        statistics.push(json!({
+            "blockType": 0x0251,
+            "counterStatus": counter_status,
+            "counters": counters,
+        }));
+        offset = end;
+    }
+    Ok(json!({
+        "blockType": 0x0251,
+        "statistics": statistics,
+    }))
+}
+
+fn mac_string(bytes: &[u8]) -> Result<String, String> {
+    let bytes: [u8; 6] = bytes
+        .try_into()
+        .map_err(|_| "PROFINET MAC address was truncated.".to_string())?;
+    Ok(format!(
+        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+    ))
+}
+
+fn link_state_port_name(value: u8) -> Option<&'static str> {
+    match value {
+        0x00 => Some("unknown"),
+        0x01 => Some("disabled/discarding"),
+        0x02 => Some("blocking"),
+        0x03 => Some("listening"),
+        0x04 => Some("learning"),
+        0x05 => Some("forwarding"),
+        0x06 => Some("broken"),
+        _ => None,
+    }
+}
+
+fn link_state_link_name(value: u8) -> Option<&'static str> {
+    match value {
+        0x01 => Some("up"),
+        0x02 => Some("down"),
+        0x03 => Some("testing"),
+        0x04 => Some("unknown"),
+        0x05 => Some("dormant"),
+        0x06 => Some("notpresent"),
+        0x07 => Some("lowerlayerdown"),
+        _ => None,
+    }
+}
+
+fn media_type_name(value: u32) -> Option<&'static str> {
+    match value {
+        0x0001 => Some("copper"),
+        0x0002 => Some("fiber-optic"),
+        0x0003 => Some("radio"),
+        _ => None,
+    }
 }
 
 fn parse_api_record(data: &[u8], expected_type: u16) -> Result<Value, String> {
@@ -1729,6 +2143,105 @@ mod tests {
         block_record(0x0025, (1, 0), &payload)
     }
 
+    fn device_diagnosis_record() -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend(0_u32.to_be_bytes());
+        payload.extend(0_u16.to_be_bytes());
+        payload.extend(1_u16.to_be_bytes());
+        payload.extend(0x8000_u16.to_be_bytes());
+        payload.extend(0x0800_u16.to_be_bytes());
+        payload.extend(0x8000_u16.to_be_bytes());
+        payload.extend(0x8000_u16.to_be_bytes());
+        payload.extend(0x0200_u16.to_be_bytes());
+        payload.extend(1_u16.to_be_bytes());
+        let mut record = block_record(0x0010, (1, 1), &payload);
+
+        let mut extended = Vec::new();
+        extended.extend(0_u32.to_be_bytes());
+        extended.extend(0_u16.to_be_bytes());
+        extended.extend(1_u16.to_be_bytes());
+        extended.extend(0x8000_u16.to_be_bytes());
+        extended.extend(0x0800_u16.to_be_bytes());
+        extended.extend(0x8002_u16.to_be_bytes());
+        extended.extend(1_u16.to_be_bytes());
+        extended.extend(0x0400_u16.to_be_bytes());
+        extended.extend(2_u16.to_be_bytes());
+        extended.extend(0x8003_u16.to_be_bytes());
+        extended.extend(0x1234_5678_u32.to_be_bytes());
+        record.extend(block_record(0x0010, (1, 1), &extended));
+
+        let mut vendor = Vec::new();
+        vendor.extend(0_u32.to_be_bytes());
+        vendor.extend(0_u16.to_be_bytes());
+        vendor.extend(1_u16.to_be_bytes());
+        vendor.extend(0x8000_u16.to_be_bytes());
+        vendor.extend(0x0800_u16.to_be_bytes());
+        vendor.extend(0x1234_u16.to_be_bytes());
+        vendor.extend([0xAA, 0xBB]);
+        record.extend(block_record(0x0010, (1, 1), &vendor));
+        record
+    }
+
+    fn port_data_real_record() -> Vec<u8> {
+        let mut payload = vec![0, 0];
+        payload.extend(0_u16.to_be_bytes());
+        payload.extend(0x8001_u16.to_be_bytes());
+        payload.push(8);
+        payload.extend(b"port-001");
+        payload.push(1);
+        payload.extend([0, 0]);
+        payload.push(8);
+        payload.extend(b"port-002");
+        payload.push(4);
+        payload.extend(b"peer");
+        payload.extend([0, 0]);
+        payload.extend(1_000_u32.to_be_bytes());
+        payload.extend([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        payload.extend([0, 0]);
+        payload.extend(0x001E_u16.to_be_bytes());
+        payload.extend([0, 0]);
+        payload.extend(0_u32.to_be_bytes());
+        payload.extend(0_u32.to_be_bytes());
+        payload.push(5);
+        payload.push(1);
+        payload.extend([0, 0]);
+        payload.extend(1_u32.to_be_bytes());
+        block_record(0x020F, (1, 0), &payload)
+    }
+
+    fn port_data_check_record() -> Vec<u8> {
+        let mut payload = vec![0, 0];
+        payload.extend(0_u16.to_be_bytes());
+        payload.extend(0x8001_u16.to_be_bytes());
+        payload.extend(block_record(0x020C, (1, 0), &[0x00, 0x1E, 0, 0]));
+        block_record(0x0200, (1, 0), &payload)
+    }
+
+    fn port_statistics_record() -> Vec<u8> {
+        let mut payload = vec![0, 0];
+        for value in 1_u32..=6 {
+            payload.extend(value.to_be_bytes());
+        }
+        block_record(0x0251, (1, 0), &payload)
+    }
+
+    fn identification_record_with_port() -> Vec<u8> {
+        let mut payload = vec![0, 1];
+        payload.extend(0_u32.to_be_bytes());
+        payload.extend(2_u16.to_be_bytes());
+        payload.extend(0_u16.to_be_bytes());
+        payload.extend(0x0001_u32.to_be_bytes());
+        payload.extend(1_u16.to_be_bytes());
+        payload.extend(0x8001_u16.to_be_bytes());
+        payload.extend(0x0002_u32.to_be_bytes());
+        payload.extend(1_u16.to_be_bytes());
+        payload.extend(0x1111_u32.to_be_bytes());
+        payload.extend(1_u16.to_be_bytes());
+        payload.extend(1_u16.to_be_bytes());
+        payload.extend(0x2222_u32.to_be_bytes());
+        block_record(0x0013, (1, 1), &payload)
+    }
+
     fn record_for_index(index: u16) -> Vec<u8> {
         match index {
             0xF821 => api_list_record(),
@@ -1740,6 +2253,10 @@ mod tests {
             0xAFF3 => im3_record(),
             0xAFF4 => im4_record(),
             0xAFF5 => im5_record(),
+            0xF80C => device_diagnosis_record(),
+            0x802A => port_data_real_record(),
+            0x802B => port_data_check_record(),
+            0x8072 => port_statistics_record(),
             _ => panic!("unexpected test record index 0x{index:04X}"),
         }
     }
@@ -1873,11 +2390,13 @@ mod tests {
 
         assert_eq!(epm_calls, 2);
         assert!(scan.warnings.is_empty());
+        assert!(scan.info.is_empty());
         let records = scan.records;
-        assert_eq!(records.len(), 15);
+        assert_eq!(records.len(), 16);
         assert!(records.iter().any(|record| record.target.index == 0xF821));
         assert!(records.iter().any(|record| record.target.index == 0xF840));
         assert!(records.iter().any(|record| record.target.index == 0xF000));
+        assert!(records.iter().any(|record| record.target.index == 0xF80C));
         assert!(records.iter().any(|record| {
             record.target.slot == 1 && record.target.subslot == 1 && record.target.index == 0xAFF5
         }));
@@ -1904,6 +2423,391 @@ mod tests {
         let parsed = parse_record(0xAFF5, &im5_record()).unwrap();
         assert_eq!(parsed["im5Data"][0]["vendorId"], "1234");
         assert_eq!(parsed["assetManagementBlocks"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn parses_device_diagnosis_and_port_records() {
+        let diagnosis = parse_record(0xF80C, &device_diagnosis_record()).unwrap();
+        assert_eq!(diagnosis["entries"][0]["severity"], "maintenance-required");
+        assert_eq!(diagnosis["entries"][0]["channelErrorType"], "0x0001");
+        assert_eq!(
+            diagnosis["entries"][1]["extendedChannelErrorType"],
+            "0x8003"
+        );
+        assert_eq!(
+            diagnosis["entries"][1]["extendedChannelAddValue"],
+            "0x12345678"
+        );
+        assert_eq!(diagnosis["entries"][2]["data"], "AABB");
+
+        let real = parse_record(0x802A, &port_data_real_record()).unwrap();
+        assert_eq!(real["ports"][0]["portId"], "port-001");
+        assert_eq!(
+            real["ports"][0]["peers"][0]["macAddress"],
+            "00:11:22:33:44:55"
+        );
+        assert_eq!(real["ports"][0]["linkState"]["port"], "forwarding");
+        assert_eq!(real["ports"][0]["linkState"]["link"], "up");
+        assert_eq!(real["ports"][0]["mediaTypeName"], "copper");
+
+        let check = parse_record(0x802B, &port_data_check_record()).unwrap();
+        assert_eq!(check["checks"][0]["blocks"][0]["blockType"], 0x020C);
+
+        let statistics = parse_record(0x8072, &port_statistics_record()).unwrap();
+        assert_eq!(statistics["statistics"][0]["counters"]["ifInOctets"], 1);
+        assert_eq!(statistics["statistics"][0]["counters"]["ifOutErrors"], 6);
+
+        assert!(parse_record(0xF80C, &[0, 0]).is_err());
+        assert!(parse_record(0x802A, &[0, 0]).is_err());
+        assert!(parse_record(0x802B, &[0, 0]).is_err());
+        assert!(parse_record(0x8072, &[0, 0]).is_err());
+        assert!(
+            parse_record(0xF80C, &[]).unwrap()["entries"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            parse_record(0x802A, &[]).unwrap()["ports"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            parse_record(0x802B, &[]).unwrap()["checks"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            parse_record(0x8072, &[]).unwrap()["statistics"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn diagnosis_supports_version_zero_api_and_qualified_channel_details() {
+        let mut payload = Vec::new();
+        payload.extend(1_u16.to_be_bytes());
+        payload.extend(2_u16.to_be_bytes());
+        payload.extend(3_u16.to_be_bytes());
+        payload.extend(0x0200_u16.to_be_bytes());
+        payload.extend(0x8003_u16.to_be_bytes());
+        payload.extend(7_u16.to_be_bytes());
+        payload.extend(0x0600_u16.to_be_bytes());
+        payload.extend(0x1234_u16.to_be_bytes());
+        payload.extend(0xABCD_u16.to_be_bytes());
+        payload.extend(0x1234_5678_u32.to_be_bytes());
+        payload.extend(0x8765_4321_u32.to_be_bytes());
+
+        let parsed = parse_device_diagnosis(&block_record(0x0010, (1, 0), &payload)).unwrap();
+        assert_eq!(parsed["entries"][0]["api"], 0);
+        assert_eq!(parsed["entries"][0]["severity"], "qualified");
+        assert_eq!(
+            parsed["entries"][0]["qualifiedChannelQualifier"],
+            "0x87654321"
+        );
+    }
+
+    #[test]
+    fn diagnosis_rejects_unsupported_truncated_and_incomplete_records() {
+        assert!(
+            parse_device_diagnosis(&block_record(0x0011, (1, 0), &[]))
+                .unwrap_err()
+                .contains("unsupported block")
+        );
+
+        let mut truncated = block_record(0x0010, (1, 0), &[0; 10]);
+        truncated[2..4].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(
+            parse_device_diagnosis(&truncated)
+                .unwrap_err()
+                .contains("record was truncated")
+        );
+
+        let mut incomplete = vec![0; 8];
+        incomplete.extend(0x8000_u16.to_be_bytes());
+        incomplete.push(1);
+        assert!(
+            parse_device_diagnosis(&block_record(0x0010, (1, 0), &incomplete))
+                .unwrap_err()
+                .contains("item list was truncated")
+        );
+    }
+
+    #[test]
+    fn port_data_rejects_unsupported_truncated_oversized_and_trailing_data() {
+        assert!(
+            parse_port_data_real(&block_record(0x020E, (1, 0), &[]))
+                .unwrap_err()
+                .contains("unsupported block")
+        );
+
+        let mut truncated = port_data_real_record();
+        truncated[2..4].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(
+            parse_port_data_real(&truncated)
+                .unwrap_err()
+                .contains("record was truncated")
+        );
+
+        for (offset, value, detail) in [
+            (12, 65, "port identifier was oversized"),
+            (21, 17, "peer count was oversized"),
+            (24, 65, "peer port identifier was oversized"),
+            (33, 65, "peer chassis identifier was oversized"),
+        ] {
+            let mut oversized = port_data_real_record();
+            oversized[offset] = value;
+            let error = parse_port_data_real(&oversized).unwrap_err();
+            assert!(error.contains(detail), "{error}");
+        }
+
+        let mut trailing = port_data_real_record();
+        trailing.push(0);
+        let length = u16::from_be_bytes(trailing[2..4].try_into().unwrap()) + 1;
+        trailing[2..4].copy_from_slice(&length.to_be_bytes());
+        assert!(
+            parse_port_data_real(&trailing)
+                .unwrap_err()
+                .contains("trailing bytes")
+        );
+    }
+
+    #[test]
+    fn port_data_preserves_numeric_state_and_media_codes() {
+        let mut record = port_data_real_record();
+        for (code, port_state, link_state, media) in [
+            (0, Some("unknown"), None, None),
+            (1, Some("disabled/discarding"), Some("up"), Some("copper")),
+            (2, Some("blocking"), Some("down"), Some("fiber-optic")),
+            (3, Some("listening"), Some("testing"), Some("radio")),
+            (4, Some("learning"), Some("unknown"), None),
+            (5, Some("forwarding"), Some("dormant"), None),
+            (6, Some("broken"), Some("notpresent"), None),
+            (7, None, Some("lowerlayerdown"), None),
+        ] {
+            record[64..66].fill(code);
+            record[68..72].copy_from_slice(&u32::from(code).to_be_bytes());
+            let parsed = parse_port_data_real(&record).unwrap();
+            let port = &parsed["ports"][0];
+            assert_eq!(
+                port["linkState"],
+                json!({"port": port_state, "portCode": code, "link": link_state, "linkCode": code})
+            );
+            assert_eq!(port["mediaType"], code);
+            assert_eq!(port["mediaTypeName"], json!(media));
+        }
+    }
+
+    #[test]
+    fn port_check_accepts_zero_padding_and_bounds_nested_blocks() {
+        let mut padded_payload = vec![0; 6];
+        padded_payload.extend([0, 0]);
+        let parsed = parse_port_data_check(&block_record(0x0200, (1, 0), &padded_payload)).unwrap();
+        assert!(parsed["checks"][0]["blocks"].as_array().unwrap().is_empty());
+
+        let mut aligned_payload = vec![0; 6];
+        aligned_payload.extend(block_record(0x020C, (1, 0), &[]));
+        aligned_payload.push(0);
+        let parsed =
+            parse_port_data_check(&block_record(0x0200, (1, 0), &aligned_payload)).unwrap();
+        assert_eq!(parsed["checks"][0]["blocks"][0]["blockType"], 0x020C);
+
+        let mut truncated_child_payload = vec![0; 6];
+        truncated_child_payload.extend([0x02, 0x0C, 0, 10, 1, 0]);
+        assert!(
+            parse_port_data_check(&block_record(0x0200, (1, 0), &truncated_child_payload))
+                .unwrap_err()
+                .contains("truncated child block")
+        );
+
+        let mut nonzero_padding = vec![0; 6];
+        nonzero_padding.extend([0xAA]);
+        assert!(
+            parse_port_data_check(&block_record(0x0200, (1, 0), &nonzero_padding))
+                .unwrap_err()
+                .contains("trailing bytes")
+        );
+    }
+
+    #[test]
+    fn port_check_rejects_unsupported_and_truncated_outer_blocks() {
+        let mut truncated = port_data_check_record();
+        truncated.pop();
+        for record in [truncated, block_record(0x0200, (1, 0), &[0; 5])] {
+            assert!(
+                parse_port_data_check(&record)
+                    .unwrap_err()
+                    .contains("record was truncated")
+            );
+        }
+        assert!(
+            parse_port_data_check(&block_record(0x0200, (1, 1), &[0; 6]))
+                .unwrap_err()
+                .contains("unsupported block")
+        );
+    }
+
+    #[test]
+    fn port_statistics_reads_version_one_status_and_rejects_trailing_data() {
+        let mut payload = 0x1234_u16.to_be_bytes().to_vec();
+        for value in 1_u32..=6 {
+            payload.extend(value.to_be_bytes());
+        }
+        let parsed = parse_port_statistics(&block_record(0x0251, (1, 1), &payload)).unwrap();
+        assert_eq!(parsed["statistics"][0]["counterStatus"], 0x1234);
+
+        let mut trailing = port_statistics_record();
+        trailing.push(0);
+        let length = u16::from_be_bytes(trailing[2..4].try_into().unwrap()) + 1;
+        trailing[2..4].copy_from_slice(&length.to_be_bytes());
+        assert!(
+            parse_port_statistics(&trailing)
+                .unwrap_err()
+                .contains("trailing bytes")
+        );
+        assert!(
+            parse_port_statistics(&block_record(0x0250, (1, 0), &[]))
+                .unwrap_err()
+                .contains("unsupported block")
+        );
+        trailing.truncate(8);
+        assert!(
+            parse_port_statistics(&trailing)
+                .unwrap_err()
+                .contains("record was truncated")
+        );
+    }
+
+    #[test]
+    fn reads_device_health_and_bounded_port_records() {
+        let scan = read_records(
+            RESPONSE_TIMEOUT,
+            &AtomicBool::new(false),
+            |_, request, _, _| {
+                record_reply(request, |target| {
+                    if target.index == 0xF000 {
+                        Ok(identification_record_with_port())
+                    } else {
+                        Ok(record_for_index(target.index))
+                    }
+                })
+            },
+        )
+        .unwrap();
+        assert!(scan.warnings.is_empty());
+        assert!(scan.info.is_empty());
+        assert!(
+            scan.records
+                .iter()
+                .any(|record| record.target.index == 0xF80C)
+        );
+        let ports = scan
+            .records
+            .iter()
+            .filter(|record| matches!(record.target.index, 0x802A | 0x802B | 0x8072))
+            .collect::<Vec<_>>();
+        assert_eq!(ports.len(), 3);
+        assert!(ports.iter().all(|record| {
+            record.target.api == 0 && record.target.slot == 0 && record.target.subslot == 0x8001
+        }));
+    }
+
+    #[test]
+    fn cancellation_after_diagnosis_stops_optional_port_reads() {
+        let cancelled = AtomicBool::new(false);
+        let scan = read_records(RESPONSE_TIMEOUT, &cancelled, |_, request, _, _| {
+            record_reply(request, |target| {
+                let record = if target.index == 0xF000 {
+                    identification_record_with_port()
+                } else {
+                    record_for_index(target.index)
+                };
+                if target.index == 0xF80C {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+                Ok(record)
+            })
+        })
+        .unwrap();
+
+        assert!(
+            scan.warnings
+                .iter()
+                .any(|warning| warning.contains("cancelled"))
+        );
+        assert!(
+            scan.records
+                .iter()
+                .all(|record| !matches!(record.target.index, 0x802A | 0x802B | 0x8072))
+        );
+    }
+
+    #[test]
+    fn optional_record_failures_are_informational() {
+        for failed_port_record in [PORT_DATA_INDEX, PORT_CHECK_INDEX] {
+            let scan = read_records(
+                RESPONSE_TIMEOUT,
+                &AtomicBool::new(false),
+                |_, request, _, _| {
+                    record_reply(request, |target| match target.index {
+                        0xF000 => Ok(identification_record_with_port()),
+                        index if index == DEVICE_DIAGNOSIS_INDEX || index == failed_port_record => {
+                            Err("unsupported record".into())
+                        }
+                        index => Ok(record_for_index(index)),
+                    })
+                },
+            )
+            .unwrap();
+            assert!(scan.warnings.is_empty());
+            assert_eq!(scan.info.len(), 2);
+            for index in [DEVICE_DIAGNOSIS_INDEX, failed_port_record] {
+                assert!(
+                    scan.info
+                        .iter()
+                        .any(|entry| entry.contains(&format!("0x{index:04X}")))
+                );
+            }
+            assert_eq!(
+                scan.records
+                    .iter()
+                    .any(|record| record.target.index == PORT_STATISTICS_INDEX),
+                failed_port_record == PORT_CHECK_INDEX
+            );
+        }
+    }
+
+    #[test]
+    fn device_enrichment_retains_records_and_scopes_advisories_to_target_ip() {
+        let ip = Ipv4Addr::new(192, 0, 2, 1);
+        let mut devices = [crate::contract::Device {
+            mac_address: "00:11:22:33:44:55".into(),
+            ip_addresses: vec![ip.to_string()],
+            ..Default::default()
+        }];
+        let diagnostics = super::super::read_device_records(
+            &mut devices,
+            &BTreeSet::from([ip]),
+            &AtomicBool::new(false),
+            |_, _, _, request, _, _| {
+                record_reply(request, |target| match target.index {
+                    DEVICE_DIAGNOSIS_INDEX => Err("unsupported record".into()),
+                    index => Ok(record_for_index(index)),
+                })
+            },
+        );
+
+        assert!(diagnostics.warnings.is_empty());
+        assert_eq!(diagnostics.info.len(), 1);
+        assert!(diagnostics.info[0].starts_with("192.0.2.1: "));
+        assert!(diagnostics.info[0].contains("0xF80C"));
+        let observation = &devices[0].observations[0];
+        assert_eq!(observation.ip_address.as_deref(), Some("192.0.2.1"));
+        assert_eq!(observation.fields["softwareRevision"], "V1.2.3");
     }
 
     fn record_reply(
@@ -1960,7 +2864,7 @@ mod tests {
                     .iter()
                     .map(|record| record.target.index)
                     .collect::<Vec<_>>(),
-                [0xAFF0, 0xAFF1, 0xAFF2, 0xAFF3, 0xAFF4, 0xAFF5]
+                [0xAFF0, 0xAFF1, 0xAFF2, 0xAFF3, 0xAFF4, 0xAFF5, 0xF80C]
             );
             assert_eq!(scan.records[0].parsed["softwareRevision"], "V1.2.3");
             assert!(

@@ -259,6 +259,7 @@ pub struct GuiApp {
     opcua_password: String,
     arp_enabled: bool,
     profinet_enabled: bool,
+    pn_epm_enabled: bool,
     allow_dcp_source: bool,
     s7_enabled: bool,
     enip_enabled: bool,
@@ -275,6 +276,7 @@ pub struct GuiApp {
     opcua_enabled: bool,
     snmp_enabled: bool,
     lldp_enabled: bool,
+    cdp_enabled: bool,
     controller_url: String,
     enrollment_token: String,
     overwrite_enrollment: bool,
@@ -333,6 +335,7 @@ impl GuiApp {
             opcua_password: String::new(),
             arp_enabled: true,
             profinet_enabled: true,
+            pn_epm_enabled: true,
             allow_dcp_source: false,
             s7_enabled: true,
             enip_enabled: true,
@@ -349,6 +352,7 @@ impl GuiApp {
             opcua_enabled: true,
             snmp_enabled: true,
             lldp_enabled: true,
+            cdp_enabled: true,
             controller_url: String::new(),
             enrollment_token: String::new(),
             overwrite_enrollment: false,
@@ -419,6 +423,7 @@ impl GuiApp {
         let legacy_native_disabled = config.no_protocols.unwrap_or(false);
         self.arp_enabled = !config.no_arp.unwrap_or(false);
         self.profinet_enabled = !config.no_profinet.unwrap_or(false);
+        self.pn_epm_enabled = !config.disable_pn_epm.unwrap_or(false);
         self.allow_dcp_source = config.allow_dcp_source.unwrap_or(false);
         self.s7_enabled = !(legacy_native_disabled || config.no_s7.unwrap_or(false));
         self.enip_enabled = !(legacy_native_disabled || config.no_enip.unwrap_or(false));
@@ -435,6 +440,7 @@ impl GuiApp {
         self.opcua_enabled = !(legacy_native_disabled || config.no_opcua.unwrap_or(false));
         self.snmp_enabled = !config.no_snmp.unwrap_or(false);
         self.lldp_enabled = !config.no_lldp.unwrap_or(false);
+        self.cdp_enabled = !config.no_cdp.unwrap_or(false);
         let mut opcua = config
             .opcua_credentials
             .map(|credentials| credentials.to_vec())
@@ -558,6 +564,7 @@ impl GuiApp {
         config.no_protocols = None;
         config.no_arp = (!self.arp_enabled).then_some(true);
         config.no_profinet = (!self.profinet_enabled).then_some(true);
+        config.disable_pn_epm = (!self.pn_epm_enabled).then_some(true);
         config.allow_dcp_source = self.allow_dcp_source.then_some(true);
         config.no_s7 = (!self.s7_enabled).then_some(true);
         config.no_enip = (!self.enip_enabled).then_some(true);
@@ -574,6 +581,7 @@ impl GuiApp {
         config.no_opcua = (!self.opcua_enabled).then_some(true);
         config.no_snmp = (!self.snmp_enabled).then_some(true);
         config.no_lldp = (!self.lldp_enabled).then_some(true);
+        config.no_cdp = (!self.cdp_enabled).then_some(true);
         config.opcua_credentials = self.opcua_credentials_config();
         config.opcua_username = None;
         config.opcua_password = None;
@@ -1128,6 +1136,7 @@ impl GuiApp {
                             for (label, enabled) in [
                                 ("ARP", &mut self.arp_enabled),
                                 ("PROFINET DCP", &mut self.profinet_enabled),
+                                ("PROFINET PNIO EPM", &mut self.pn_epm_enabled),
                                 ("Allow DCP source", &mut self.allow_dcp_source),
                                 ("S7", &mut self.s7_enabled),
                                 ("EtherNet/IP", &mut self.enip_enabled),
@@ -1144,6 +1153,7 @@ impl GuiApp {
                                 ("OPC UA", &mut self.opcua_enabled),
                                 ("SNMP", &mut self.snmp_enabled),
                                 ("LLDP", &mut self.lldp_enabled),
+                                ("CDP", &mut self.cdp_enabled),
                             ] {
                                 protocol_changed |= ui.toggle_value(enabled, label).changed();
                             }
@@ -2235,6 +2245,7 @@ mod tests {
             no_profinet: Some(true),
             no_snmp: Some(true),
             no_lldp: Some(true),
+            no_cdp: Some(true),
             ..ScannerConfig::default()
         };
         let mut app = GuiApp::new(ScannerConfigs::Single(Box::new(config)));
@@ -2609,6 +2620,24 @@ mod tests {
     }
 
     #[test]
+    fn cdp_toggle_roundtrips_independently_of_legacy_disable() {
+        for (no_cdp, no_protocols) in [(None, None), (Some(true), None), (None, Some(true))] {
+            let config = ScannerConfig {
+                no_cdp,
+                no_protocols,
+                ..ScannerConfig::default()
+            };
+            let mut app = GuiApp::new(ScannerConfigs::Single(Box::new(config)));
+            let disabled = no_cdp.unwrap_or(false);
+            assert_eq!(app.cdp_enabled, !disabled);
+            assert_eq!(app.to_config().no_cdp, disabled.then_some(true));
+            assert_eq!(app.to_config().no_protocols, None);
+            app.cdp_enabled = !app.cdp_enabled;
+            assert_eq!(app.to_config().no_cdp, (!disabled).then_some(true));
+        }
+    }
+
+    #[test]
     fn allow_dcp_source_toggle_roundtrips() {
         for enabled in [false, true] {
             let config = ScannerConfig {
@@ -2620,6 +2649,22 @@ mod tests {
             assert_eq!(app.to_config().allow_dcp_source, enabled.then_some(true));
             app.allow_dcp_source = !enabled;
             assert_eq!(app.to_config().allow_dcp_source, (!enabled).then_some(true));
+        }
+    }
+
+    #[test]
+    fn pn_epm_toggle_roundtrips_independently_of_dcp() {
+        for disabled in [false, true] {
+            let config = ScannerConfig {
+                disable_pn_epm: disabled.then_some(true),
+                ..ScannerConfig::default()
+            };
+            let mut app = GuiApp::new(ScannerConfigs::Single(Box::new(config)));
+            assert_eq!(app.pn_epm_enabled, !disabled);
+            assert!(app.profinet_enabled);
+            assert_eq!(app.to_config().disable_pn_epm, disabled.then_some(true));
+            app.pn_epm_enabled = disabled;
+            assert_eq!(app.to_config().disable_pn_epm, (!disabled).then_some(true));
         }
     }
 

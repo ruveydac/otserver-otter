@@ -89,6 +89,7 @@ pub enum Source {
     Arp,
     Bacnet,
     BeckhoffAds,
+    Cdp,
     Dnp3,
     EthernetIp,
     Http,
@@ -112,6 +113,7 @@ impl Source {
             Self::Arp => "arp",
             Self::Bacnet => "bacnet",
             Self::BeckhoffAds => "beckhoff-ads",
+            Self::Cdp => "cdp",
             Self::Dnp3 => "dnp3",
             Self::EthernetIp => "ethernet-ip",
             Self::Http => "http",
@@ -489,7 +491,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&valid).unwrap(), fixture);
         assert!(validate(&valid).is_ok());
         assert_eq!(valid.devices.len(), 2);
-        assert_eq!(valid.links.len(), 1);
+        assert_eq!(valid.links.len(), 2);
 
         let invalid: ScanExport =
             serde_json::from_str(include_str!("../contracts/otserver-scan-v2-invalid.json"))
@@ -546,6 +548,7 @@ mod tests {
             Source::Arp,
             Source::Bacnet,
             Source::Dnp3,
+            Source::Cdp,
             Source::EthernetIp,
             Source::Iec61850,
             Source::Lldp,
@@ -562,9 +565,10 @@ mod tests {
         .map(Source::label);
         assert_eq!(labels[0], "arp");
         assert_eq!(labels[2], "dnp3");
-        assert_eq!(labels[6], "netbios");
-        assert_eq!(labels[9], "opc-ua");
-        assert_eq!(labels[14], "unknown");
+        assert_eq!(labels[3], "cdp");
+        assert_eq!(labels[7], "netbios");
+        assert_eq!(labels[10], "opc-ua");
+        assert_eq!(labels[15], "unknown");
         let devices = merge_devices(vec![
             Device {
                 mac_address: "invalid".into(),

@@ -340,15 +340,27 @@ fn passive_frame_matches_interface(frame: &[u8], selected_mac: [u8; 6]) -> bool 
         && frame[12..14] == PROFINET_ETHERTYPE
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PnioDiagnostics {
+    pub warnings: Vec<String>,
+    pub info: Vec<String>,
+}
+
+impl PnioDiagnostics {
+    pub fn is_empty(&self) -> bool {
+        self.warnings.is_empty() && self.info.is_empty()
+    }
+}
+
 pub fn enrich_pnio(
     interface: &str,
     source_mac: &str,
     devices: &mut [Device],
     targets: &BTreeSet<Ipv4Addr>,
     cancelled: &AtomicBool,
-) -> Result<Vec<String>, String> {
+) -> Result<PnioDiagnostics, String> {
     if devices.is_empty() || cancelled.load(Ordering::Relaxed) {
-        return Ok(Vec::new());
+        return Ok(PnioDiagnostics::default());
     }
     let source = mac_bytes(source_mac)
         .ok_or_else(|| "A valid source MAC address is required for PNIO reads.".to_string())?;
@@ -384,7 +396,9 @@ pub fn enrich_pnio(
 }
 
 fn attach_pnio_records(device: &mut Device, target_ip: Ipv4Addr, scan: pnio::RecordScan) {
-    let pnio::RecordScan { records, warnings } = scan;
+    let pnio::RecordScan {
+        records, warnings, ..
+    } = scan;
     if records.is_empty() && warnings.is_empty() {
         return;
     }
@@ -456,9 +470,9 @@ fn read_device_records(
         Duration,
         &AtomicBool,
     ) -> Result<(pnio::RpcHeader, Vec<u8>), String>,
-) -> Vec<String> {
+) -> PnioDiagnostics {
     let identities = unique_ip_identities(devices);
-    let mut warnings = Vec::new();
+    let mut diagnostics = PnioDiagnostics::default();
     for device in devices {
         if cancelled.load(Ordering::Relaxed) {
             break;
@@ -466,7 +480,7 @@ fn read_device_records(
         let Some(mac) =
             mac_bytes(&device.mac_address).filter(|mac| *mac != [0; 6] && mac[0] & 1 == 0)
         else {
-            warnings.push(format!(
+            diagnostics.warnings.push(format!(
                 "PROFINET PNIO skipped for {}: no valid unicast MAC address.",
                 device.mac_address
             ));
@@ -484,7 +498,7 @@ fn read_device_records(
             })
             .collect::<BTreeSet<_>>();
         if ips.is_empty() {
-            warnings.push(format!(
+            diagnostics.warnings.push(format!(
                 "PROFINET PNIO skipped for {}: no usable device IPv4 address.",
                 device.mac_address
             ));
@@ -494,13 +508,13 @@ fn read_device_records(
                 break;
             }
             if identities.get(&ip.to_string()) != Some(&device.mac_address) {
-                warnings.push(format!(
+                diagnostics.warnings.push(format!(
                     "PROFINET PNIO skipped for {ip}: multiple MAC addresses claim this IP."
                 ));
                 continue;
             }
             if !targets.contains(&ip) {
-                warnings.push(format!(
+                diagnostics.warnings.push(format!(
                     "PROFINET PNIO skipped for {ip}: outside the selected IP probe scope."
                 ));
                 continue;
@@ -513,20 +527,31 @@ fn read_device_records(
                 },
             ) {
                 Ok(scan) => {
-                    warnings.extend(
-                        scan.warnings
-                            .iter()
-                            .map(|warning| format!("{ip}: {warning}")),
-                    );
+                    append_pnio_diagnostics(&mut diagnostics, ip, &scan);
                     attach_pnio_records(device, ip, scan);
                 }
-                Err(error) => warnings.push(format!(
+                Err(error) => diagnostics.warnings.push(format!(
                     "PROFINET PNIO record scan failed for {ip}: {error}"
                 )),
             }
         }
     }
-    warnings
+    diagnostics
+}
+
+fn append_pnio_diagnostics(
+    diagnostics: &mut PnioDiagnostics,
+    ip: Ipv4Addr,
+    scan: &pnio::RecordScan,
+) {
+    diagnostics.warnings.extend(
+        scan.warnings
+            .iter()
+            .map(|warning| format!("{ip}: {warning}")),
+    );
+    diagnostics
+        .info
+        .extend(scan.info.iter().map(|warning| format!("{ip}: {warning}")));
 }
 
 fn pnio_component(
@@ -632,6 +657,66 @@ fn pnio_physical_entities(records: &[pnio::RecordRead]) -> Value {
             });
         }
     }
+    for record in records
+        .iter()
+        .filter(|record| record.target.index == 0x802A)
+    {
+        for port in record.parsed["ports"].as_array().into_iter().flatten() {
+            let Some(slot) = port["slot"]
+                .as_u64()
+                .and_then(|value| u16::try_from(value).ok())
+            else {
+                continue;
+            };
+            let Some(subslot) = port["subslot"]
+                .as_u64()
+                .and_then(|value| u16::try_from(value).ok())
+            else {
+                continue;
+            };
+            let component = pnio_component(&mut entities, record.target.api, slot, Some(subslot));
+            component["class"] = json!("port");
+            for key in [
+                "portId",
+                "numberOfPeers",
+                "peers",
+                "mauType",
+                "mediaType",
+                "mediaTypeName",
+                "linkState",
+            ] {
+                if let Some(value) = port.get(key) {
+                    component[key] = value.clone();
+                }
+            }
+        }
+    }
+    for record in records
+        .iter()
+        .filter(|record| record.target.index == 0x802B)
+    {
+        let component = pnio_component(
+            &mut entities,
+            record.target.api,
+            record.target.slot,
+            Some(record.target.subslot),
+        );
+        component["class"] = json!("port");
+        component["portCheck"] = record.parsed["checks"].clone();
+    }
+    for record in records
+        .iter()
+        .filter(|record| record.target.index == 0x8072)
+    {
+        let component = pnio_component(
+            &mut entities,
+            record.target.api,
+            record.target.slot,
+            Some(record.target.subslot),
+        );
+        component["class"] = json!("port");
+        component["statistics"] = record.parsed["statistics"].clone();
+    }
     entities.into_values().collect()
 }
 
@@ -643,13 +728,13 @@ fn enrich_linux_pnio(
     devices: &mut [Device],
     targets: &BTreeSet<Ipv4Addr>,
     cancelled: &AtomicBool,
-) -> Result<Vec<String>, String> {
+) -> Result<PnioDiagnostics, String> {
     use std::io;
     use std::mem::size_of;
     use std::os::fd::AsRawFd;
 
     if devices.is_empty() {
-        return Ok(Vec::new());
+        return Ok(PnioDiagnostics::default());
     }
     let (descriptor, mut address) = crate::discovery::open_raw_socket(interface, 0x0800)?;
     // SAFETY: address is initialized and remains valid for the duration of bind.
@@ -753,7 +838,7 @@ fn enrich_windows_pnio(
     devices: &mut [Device],
     targets: &BTreeSet<Ipv4Addr>,
     cancelled: &AtomicBool,
-) -> Result<Vec<String>, String> {
+) -> Result<PnioDiagnostics, String> {
     Ok(read_device_records(
         devices,
         targets,
@@ -1828,6 +1913,7 @@ mod tests {
                     warnings: vec![
                         "PNIO record 0xAFF1 (API 0, slot 0, subslot 1) failed: timeout".into(),
                     ],
+                    info: vec![],
                 },
             );
         }
@@ -1876,6 +1962,101 @@ mod tests {
     }
 
     #[test]
+    fn pnio_port_records_create_port_entities_with_link_and_statistics() {
+        let mut device = Device {
+            mac_address: "00:11:22:33:44:55".into(),
+            ..Device::default()
+        };
+        attach_pnio_records(
+            &mut device,
+            Ipv4Addr::new(192, 0, 2, 10),
+            pnio::RecordScan {
+                records: vec![
+                    pnio_record(
+                        0,
+                        0,
+                        0x8001,
+                        0x802A,
+                        json!({"ports": [{
+                            "slot": 0, "subslot": 0x8001, "portId": "port-001",
+                            "numberOfPeers": 0, "peers": [], "mauType": 30,
+                            "mediaType": 1, "mediaTypeName": "copper",
+                            "linkState": {
+                                "port": "forwarding", "portCode": 5,
+                                "link": "up", "linkCode": 1,
+                            },
+                        }]}),
+                    ),
+                    pnio_record(
+                        0,
+                        0,
+                        0x8001,
+                        0x802B,
+                        json!({"checks": [{
+                            "blockType": 0x0200, "slot": 0, "subslot": 0x8001,
+                            "blocks": [],
+                        }]}),
+                    ),
+                    pnio_record(
+                        0,
+                        0,
+                        0x8001,
+                        0x8072,
+                        json!({"statistics": [{
+                            "blockType": 0x0251, "counterStatus": null,
+                            "counters": {"ifInOctets": 1},
+                        }]}),
+                    ),
+                    pnio_record(
+                        0,
+                        0,
+                        0x8001,
+                        0x802A,
+                        json!({"ports": [
+                            {"slot": "invalid", "subslot": 1},
+                            {"slot": 0, "subslot": "invalid"},
+                        ]}),
+                    ),
+                ],
+                warnings: vec![],
+                info: vec![],
+            },
+        );
+        let components = device.observations[0].raw["physicalEntities"]
+            .as_array()
+            .unwrap();
+        let port = components
+            .iter()
+            .find(|entity| entity["ref"] == "pnio:0:0:32769")
+            .unwrap();
+        assert_eq!(port["class"], "port");
+        assert_eq!(port["portId"], "port-001");
+        assert_eq!(port["linkState"]["link"], "up");
+        assert_eq!(port["statistics"][0]["counters"]["ifInOctets"], 1);
+        assert_eq!(port["portCheck"][0]["slot"], 0);
+    }
+
+    #[test]
+    fn pnio_record_diagnostics_keep_the_target_ip() {
+        let mut diagnostics = PnioDiagnostics::default();
+        append_pnio_diagnostics(
+            &mut diagnostics,
+            Ipv4Addr::new(192, 0, 2, 10),
+            &pnio::RecordScan {
+                records: vec![],
+                warnings: vec!["primary record failed".into()],
+                info: vec!["optional port record unavailable".into()],
+            },
+        );
+
+        assert_eq!(diagnostics.warnings, ["192.0.2.10: primary record failed"]);
+        assert_eq!(
+            diagnostics.info,
+            ["192.0.2.10: optional port record unavailable"]
+        );
+    }
+
+    #[test]
     fn pnio_module_only_and_empty_records_do_not_supply_device_identity() {
         let mut device = Device::default();
         let target_ip = Ipv4Addr::new(192, 0, 2, 10);
@@ -1896,6 +2077,7 @@ mod tests {
                     }),
                 )],
                 warnings: vec![],
+                info: vec![],
             },
         );
         let observation = &device.observations[0];
@@ -1954,7 +2136,10 @@ mod tests {
             "no EPM response",
         ] {
             assert!(
-                warnings.iter().any(|warning| warning.contains(detail)),
+                warnings
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(detail)),
                 "{warnings:?}"
             );
         }
@@ -1991,6 +2176,22 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_linux_pnio_enrichment_does_not_open_a_socket() {
+        let diagnostics = enrich_linux_pnio(
+            "missing-interface",
+            [0; 6],
+            Ipv4Addr::LOCALHOST,
+            &mut [],
+            &BTreeSet::new(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert!(diagnostics.is_empty());
+    }
+
     #[test]
     fn pnio_failed_records_export_diagnostics_without_claiming_online_identity() {
         let mut device = Device {
@@ -2003,6 +2204,7 @@ mod tests {
             pnio::RecordScan {
                 records: vec![],
                 warnings: vec!["PNIO record 0xAFF0 failed".into()],
+                info: vec![],
             },
         );
         let exported = serde_json::to_value(&device.observations[0]).unwrap();

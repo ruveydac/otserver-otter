@@ -3,7 +3,7 @@ mod controller;
 pub mod gui;
 use clap::{ArgAction, Args, Parser, Subcommand};
 use otserver_otter::contract::{
-    Device, InterfaceRef, ScanExport, ScanInfo, ScannerInfo, Source, merge_devices,
+    Device, InterfaceRef, ScanExport, ScanInfo, ScannerInfo, Source, TopologyLink, merge_devices,
     unique_ip_identities, validate, validate_json,
 };
 use otserver_otter::{discovery, profinet, protocols, snmp};
@@ -97,6 +97,9 @@ pub struct ScanArgs {
     pub no_arp: bool,
     #[arg(long)]
     pub no_profinet: bool,
+    /// Disable PROFINET PNIO EPM and record reads while keeping DCP discovery enabled.
+    #[arg(long)]
+    pub disable_pn_epm: bool,
     #[arg(long)]
     pub allow_dcp_source: bool,
     #[arg(long)]
@@ -129,6 +132,8 @@ pub struct ScanArgs {
     pub no_snmp: bool,
     #[arg(long)]
     pub no_lldp: bool,
+    #[arg(long)]
+    pub no_cdp: bool,
     #[arg(long)]
     pub server_url: Option<String>,
     #[arg(long)]
@@ -210,6 +215,8 @@ pub struct ScannerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_profinet: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_pn_epm: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_dcp_source: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_s7: Option<bool>,
@@ -241,6 +248,8 @@ pub struct ScannerConfig {
     pub no_snmp: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_lldp: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_cdp: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opcua_ports: Option<Vec<u16>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -376,6 +385,7 @@ pub struct BatchResult {
 pub struct ProtocolOptions {
     pub arp: bool,
     pub profinet: bool,
+    pub pn_epm: bool,
     pub s7: bool,
     pub enip: bool,
     pub bacnet: bool,
@@ -390,6 +400,7 @@ pub struct ProtocolOptions {
     pub opcua: bool,
     pub snmp: bool,
     pub lldp: bool,
+    pub cdp: bool,
     pub ads: bool,
 }
 
@@ -398,6 +409,7 @@ impl Default for ProtocolOptions {
         Self {
             arp: true,
             profinet: true,
+            pn_epm: true,
             s7: true,
             enip: true,
             bacnet: true,
@@ -412,6 +424,7 @@ impl Default for ProtocolOptions {
             opcua: true,
             snmp: true,
             lldp: true,
+            cdp: true,
             ads: true,
         }
     }
@@ -817,6 +830,7 @@ pub fn resolve_scan(
     let protocols = ProtocolOptions {
         arp: !(args.no_arp || config.no_arp.unwrap_or(false)),
         profinet: !(args.no_profinet || config.no_profinet.unwrap_or(false)),
+        pn_epm: !(args.disable_pn_epm || config.disable_pn_epm.unwrap_or(false)),
         s7: !(no_native_protocols || args.no_s7 || config.no_s7.unwrap_or(false)),
         enip: !(no_native_protocols || args.no_enip || config.no_enip.unwrap_or(false)),
         bacnet: !(no_native_protocols || args.no_bacnet || config.no_bacnet.unwrap_or(false)),
@@ -832,6 +846,7 @@ pub fn resolve_scan(
         opcua: !(no_native_protocols || args.no_opcua || config.no_opcua.unwrap_or(false)),
         snmp: !(args.no_snmp || config.no_snmp.unwrap_or(false)),
         lldp: !(args.no_lldp || config.no_lldp.unwrap_or(false)),
+        cdp: !(args.no_cdp || config.no_cdp.unwrap_or(false)),
     };
     let opcua = opcua_probe_settings(&config);
     let targets = if args.targets.is_empty() {
@@ -1269,6 +1284,23 @@ pub async fn scan(
     logger: &dyn LogOutput,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<bool, String> {
+    scan_with_cdp_capture(
+        configuration,
+        options,
+        logger,
+        cancelled,
+        otserver_otter::cdp::scan,
+    )
+    .await
+}
+
+async fn scan_with_cdp_capture(
+    configuration: &str,
+    options: &ScanOptions,
+    logger: &dyn LogOutput,
+    cancelled: &Arc<AtomicBool>,
+    capture_cdp: fn(&str, &str, &AtomicBool) -> Result<otserver_otter::cdp::CaptureResult, String>,
+) -> Result<bool, String> {
     let started_at = otserver_otter::now();
     #[cfg(windows)]
     let npcap_active = options.protocols.profinet && profinet::npcap_available();
@@ -1287,19 +1319,21 @@ pub async fn scan(
     } else {
         profinet::interfaces()
     };
-    let source_mac =
-        if (options.protocols.arp || options.protocols.profinet || options.protocols.lldp)
-            && !cancelled.load(Ordering::Relaxed)
-        {
-            scan_source_mac(
-                &options.interface,
-                &options.source_mac,
-                interfaces.as_ref().map_err(Clone::clone)?,
-                logger,
-            )?
-        } else {
-            options.source_mac.clone()
-        };
+    let source_mac = if (options.protocols.arp
+        || options.protocols.profinet
+        || options.protocols.lldp
+        || options.protocols.cdp)
+        && !cancelled.load(Ordering::Relaxed)
+    {
+        scan_source_mac(
+            &options.interface,
+            &options.source_mac,
+            interfaces.as_ref().map_err(Clone::clone)?,
+            logger,
+        )?
+    } else {
+        options.source_mac.clone()
+    };
     let interface = scan_interface_ref(
         &options.interface,
         &source_mac,
@@ -1327,6 +1361,16 @@ pub async fn scan(
         let cancellation = Arc::clone(cancelled);
         Some(tokio::task::spawn_blocking(move || {
             otserver_otter::lldp::scan(&interface, &mac, &cancellation)
+        }))
+    } else {
+        None
+    };
+    let cdp_capture = if options.protocols.cdp && !cancelled.load(Ordering::Relaxed) {
+        let interface = options.interface.clone();
+        let mac = source_mac.clone();
+        let cancellation = Arc::clone(cancelled);
+        Some(tokio::task::spawn_blocking(move || {
+            capture_cdp(&interface, &mac, &cancellation)
         }))
     } else {
         None
@@ -1418,8 +1462,9 @@ pub async fn scan(
         options.protocols.arp,
         options.allow_dcp_source,
     );
-    if options.protocols.profinet && !cancelled.load(Ordering::Relaxed) {
-        logger.log("Reading PROFINET PNIO I&M records for discovered MAC/IP pairs...".into());
+    if options.protocols.profinet && options.protocols.pn_epm && !cancelled.load(Ordering::Relaxed)
+    {
+        logger.log("Reading PROFINET PNIO records for discovered MAC/IP pairs...".into());
         let selected = options.interface.clone();
         let mac = source_mac.clone();
         let targets = probe_targets.clone();
@@ -1432,62 +1477,13 @@ pub async fn scan(
         .await
         .map_err(|error| error.to_string())?;
         devices = enriched;
-        let diagnostics =
-            result.unwrap_or_else(|error| vec![format!("PROFINET PNIO scan skipped: {error}")]);
-        let mut incomplete = false;
-        for warning in &diagnostics {
-            let status = if pnio_no_response(warning) {
-                protocols::ProbeStatus::NoResponse
-            } else {
-                protocols::ProbeStatus::Partial
-            };
-            let formatted = if let Some(target) = pnio_warning_target(warning) {
-                if let Ok(ip) = target.parse::<Ipv4Addr>() {
-                    format_diagnostic(
-                        &ip.to_string(),
-                        None,
-                        "profinet-pnio",
-                        status.label(),
-                        diagnostic_code(warning, status),
-                        "udp/34964 or advertised PNIO endpoint; timeout 2s per RPC exchange",
-                        "record-read",
-                        warning,
-                    )
-                } else {
-                    format_mac_diagnostic(
-                        &target,
-                        "profinet-pnio",
-                        status.label(),
-                        diagnostic_code(warning, status),
-                        "udp/34964 or advertised PNIO endpoint; timeout 2s per RPC exchange",
-                        "record-read",
-                        warning,
-                    )
-                }
-            } else {
-                format_mac_diagnostic(
-                    &source_mac,
-                    "profinet-pnio",
-                    "FAIL",
-                    diagnostic_code(warning, protocols::ProbeStatus::Failure),
-                    "selected interface; RPC timeout 2s",
-                    "prepare",
-                    &format!("Interface-scoped PNIO diagnostic: {warning}"),
-                )
-            };
-            logger.diagnostic(
-                "profinet-pnio",
-                status.label(),
-                diagnostic_code(warning, status),
-            );
-            logger.log(formatted.clone());
-            if status == protocols::ProbeStatus::NoResponse {
-                continue;
-            }
-            incomplete = true;
-            warnings.push(formatted);
-        }
-        protocol_failed |= incomplete;
+        apply_pnio_diagnostics(
+            result,
+            &source_mac,
+            logger,
+            &mut warnings,
+            &mut protocol_failed,
+        );
         logger.devices(configuration, &devices);
     }
     logger.log(format!(
@@ -1535,22 +1531,19 @@ pub async fn scan(
         logger.devices(configuration, &devices);
     }
 
-    if (options.protocols.snmp || options.protocols.lldp) && !cancelled.load(Ordering::Relaxed) {
+    if (options.protocols.snmp || options.protocols.lldp || options.protocols.cdp)
+        && !cancelled.load(Ordering::Relaxed)
+    {
         let snmp_selection = snmp::QuerySelection {
             inventory: options.protocols.snmp,
             lldp: options.protocols.lldp,
+            cdp: options.protocols.cdp,
         };
         logger.log(format!(
-            "Resolved SNMP inventory={} LLDP topology={}.",
-            snmp_selection.inventory, snmp_selection.lldp
+            "Resolved SNMP inventory={}, LLDP topology={}, CDP topology={}.",
+            snmp_selection.inventory, snmp_selection.lldp, snmp_selection.cdp
         ));
-        let label = match (snmp_selection.inventory, snmp_selection.lldp) {
-            (true, true) => "SNMP and LLDP",
-            (true, false) => "SNMP",
-            (false, true) => "LLDP",
-            (false, false) => unreachable!("guard requires one query type"),
-        };
-        logger.log(format!("Querying {label}..."));
+        logger.log("Querying SNMP inventory and enabled neighbor tables...".into());
         let ips = probe_targets
             .iter()
             .map(Ipv4Addr::to_string)
@@ -1642,6 +1635,18 @@ pub async fn scan(
             }
         }
     }
+    if let Some(capture) = cdp_capture {
+        let (captured_devices, captured_links) = apply_cdp_capture(
+            capture.await,
+            &options.interface,
+            logger,
+            &mut warnings,
+            &mut errors,
+            &mut protocol_failed,
+        );
+        devices.extend(captured_devices);
+        links.extend(captured_links);
+    }
     let stopped = cancelled.load(Ordering::Relaxed);
     if stopped {
         warnings
@@ -1686,6 +1691,149 @@ pub async fn scan(
         options.output.display()
     ));
     Ok(scan.scan.partial)
+}
+
+fn apply_pnio_diagnostics(
+    result: Result<profinet::PnioDiagnostics, String>,
+    source_mac: &str,
+    logger: &dyn LogOutput,
+    warnings: &mut Vec<String>,
+    protocol_failed: &mut bool,
+) {
+    let diagnostics = result.unwrap_or_else(|error| profinet::PnioDiagnostics {
+        warnings: vec![format!("PROFINET PNIO scan skipped: {error}")],
+        info: Vec::new(),
+    });
+    let format_pnio = |warning: &str, status: &str, code: &str| {
+        if let Some(target) = pnio_warning_target(warning) {
+            if let Ok(ip) = target.parse::<Ipv4Addr>() {
+                format_diagnostic(
+                    &ip.to_string(),
+                    None,
+                    "profinet-pnio",
+                    status,
+                    code,
+                    "udp/34964 or advertised PNIO endpoint; timeout 2s per RPC exchange",
+                    "record-read",
+                    warning,
+                )
+            } else {
+                format_mac_diagnostic(
+                    &target,
+                    "profinet-pnio",
+                    status,
+                    code,
+                    "udp/34964 or advertised PNIO endpoint; timeout 2s per RPC exchange",
+                    "record-read",
+                    warning,
+                )
+            }
+        } else {
+            format_mac_diagnostic(
+                source_mac,
+                "profinet-pnio",
+                "FAIL",
+                diagnostic_code(warning, protocols::ProbeStatus::Failure),
+                "selected interface; RPC timeout 2s",
+                "prepare",
+                &format!("Interface-scoped PNIO diagnostic: {warning}"),
+            )
+        }
+    };
+    for info in &diagnostics.info {
+        logger.diagnostic("profinet-pnio", "INFO", "optional-record");
+        logger.log(format_pnio(info, "INFO", "optional-record"));
+    }
+    let mut incomplete = false;
+    for warning in &diagnostics.warnings {
+        let status = if pnio_no_response(warning) {
+            protocols::ProbeStatus::NoResponse
+        } else {
+            protocols::ProbeStatus::Partial
+        };
+        let formatted = format_pnio(warning, status.label(), diagnostic_code(warning, status));
+        logger.diagnostic(
+            "profinet-pnio",
+            status.label(),
+            diagnostic_code(warning, status),
+        );
+        logger.log(formatted.clone());
+        if status != protocols::ProbeStatus::NoResponse {
+            incomplete = true;
+            warnings.push(formatted);
+        }
+    }
+    *protocol_failed |= incomplete;
+}
+
+fn apply_cdp_capture(
+    capture: Result<Result<otserver_otter::cdp::CaptureResult, String>, tokio::task::JoinError>,
+    interface: &str,
+    logger: &dyn LogOutput,
+    warnings: &mut Vec<String>,
+    errors: &mut Vec<String>,
+    protocol_failed: &mut bool,
+) -> (Vec<Device>, Vec<TopologyLink>) {
+    match capture {
+        Ok(Ok(result)) => {
+            let devices = result.devices;
+            let links = result.links;
+            for warning in result.warnings {
+                let informational = warning.starts_with("Passive CDP observed the selected link");
+                *protocol_failed |= !informational;
+                let status = if informational { "INFO" } else { "PARTIAL" };
+                let code = if informational {
+                    "capture-window-complete"
+                } else {
+                    diagnostic_code(&warning, protocols::ProbeStatus::Partial)
+                };
+                let diagnostic = format_mac_diagnostic(
+                    "01:00:0c:cc:cc:cc",
+                    "cdp-passive",
+                    status,
+                    code,
+                    &format!("selected interface {interface}; capture window 30s"),
+                    "capture",
+                    &warning,
+                );
+                logger.diagnostic("cdp-passive", status, code);
+                logger.log(diagnostic.clone());
+                warnings.push(diagnostic);
+            }
+            (devices, links)
+        }
+        Ok(Err(error)) => {
+            let code = diagnostic_code(&error, protocols::ProbeStatus::Failure);
+            let diagnostic = format_mac_diagnostic(
+                "01:00:0c:cc:cc:cc",
+                "cdp-passive",
+                "FAIL",
+                code,
+                &format!("selected interface {interface}; capture window 30s"),
+                "capture",
+                &error,
+            );
+            logger.diagnostic("cdp-passive", "FAIL", code);
+            logger.log(diagnostic.clone());
+            errors.push(diagnostic);
+            (Vec::new(), Vec::new())
+        }
+        Err(error) => {
+            let diagnostic = format_mac_diagnostic(
+                "01:00:0c:cc:cc:cc",
+                "cdp-passive",
+                "FAIL",
+                "capture-task-failed",
+                &format!("selected interface {interface}; capture window 30s"),
+                "capture",
+                &error.to_string(),
+            );
+            logger.diagnostic("cdp-passive", "FAIL", "capture-task-failed");
+            logger.log(diagnostic.clone());
+            errors.push(diagnostic);
+            (Vec::new(), Vec::new())
+        }
+    }
 }
 
 pub async fn run_scan_batch(
@@ -2317,6 +2465,7 @@ fn apply_snmp_probe(
             for (enabled, protocol, stage) in [
                 (selection.inventory, "snmp", "inventory"),
                 (selection.lldp, "lldp-snmp", "neighbor-inventory"),
+                (selection.cdp, "cdp-snmp", "neighbor-inventory"),
             ] {
                 if !enabled {
                     continue;
@@ -2392,16 +2541,46 @@ fn apply_snmp_probe(
             },
         ));
     }
+    if selection.cdp {
+        logger.log(format_diagnostic(
+            &ip,
+            result.identity_mac.as_deref(),
+            "cdp-snmp",
+            if result.cdp_complete {
+                "SUCCESS"
+            } else {
+                "PARTIAL"
+            },
+            if result.cdp_complete {
+                "neighbor-inventory-complete"
+            } else {
+                "neighbor-inventory-partial"
+            },
+            snmp_endpoint,
+            "neighbor-inventory",
+            if result.cdp_complete {
+                "SNMP CDP neighbor collection completed."
+            } else {
+                "SNMP CDP neighbor collection was incomplete; successful rows retained."
+            },
+        ));
+    }
     let mut incomplete = selection.inventory && !result.inventory_complete
-        || selection.lldp && !result.lldp_complete;
+        || selection.lldp && !result.lldp_complete
+        || selection.cdp && !result.cdp_complete;
     if selection.inventory && !result.inventory_complete {
         logger.diagnostic("snmp", "PARTIAL", "inventory-partial");
     }
     if selection.lldp && !result.lldp_complete {
         logger.diagnostic("lldp-snmp", "PARTIAL", "neighbor-inventory-partial");
     }
+    if selection.cdp && !result.cdp_complete {
+        logger.diagnostic("cdp-snmp", "PARTIAL", "neighbor-inventory-partial");
+    }
     for warning in result.warnings.drain(..) {
-        let protocol = if warning.contains("LLDP") || warning.contains("lldp") {
+        let protocol = if warning.contains("CDP") || warning.contains("cdp") {
+            "cdp-snmp"
+        } else if warning.contains("LLDP") || warning.contains("lldp") {
             "lldp-snmp"
         } else {
             "snmp"
@@ -2616,6 +2795,7 @@ mod tests {
         ProtocolOptions {
             arp: false,
             profinet: false,
+            pn_epm: false,
             s7: false,
             enip: false,
             bacnet: false,
@@ -2630,7 +2810,27 @@ mod tests {
             opcua: false,
             snmp: false,
             lldp: false,
+            cdp: false,
             ads: false,
+        }
+    }
+
+    #[derive(Default)]
+    struct DiagnosticLogger {
+        messages: std::sync::Mutex<Vec<String>>,
+        diagnostics: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl LogOutput for DiagnosticLogger {
+        fn write(&self, message: String) {
+            self.messages.lock().unwrap().push(message);
+        }
+
+        fn diagnostic(&self, protocol: &str, status: &str, code: &str) {
+            self.diagnostics
+                .lock()
+                .unwrap()
+                .push((protocol.into(), status.into(), code.into()));
         }
     }
 
@@ -2711,6 +2911,7 @@ mod tests {
         assert_eq!(resolved.output, PathBuf::from("configured.json"));
         assert!(resolved.protocols.arp);
         assert!(resolved.protocols.profinet);
+        assert!(resolved.protocols.pn_epm);
         assert!(resolved.allow_dcp_source);
         assert!(!resolved.protocols.s7);
         assert!(!resolved.protocols.enip);
@@ -2723,6 +2924,7 @@ mod tests {
         assert!(!resolved.protocols.opcua);
         assert!(resolved.protocols.snmp);
         assert!(resolved.protocols.lldp);
+        assert!(resolved.protocols.cdp);
         assert_eq!(resolved.snmp[0].username.as_deref(), Some("ops"));
         assert_eq!(resolved.snmp[0].auth_password.as_deref(), Some("secret"));
         let upload = resolved.upload.unwrap();
@@ -2743,6 +2945,22 @@ mod tests {
     }
 
     #[test]
+    fn disable_pn_epm_switch_and_config_keep_dcp_enabled() {
+        let mut cli = args();
+        cli.disable_pn_epm = true;
+        let resolved =
+            resolve_scan(cli, complete_config("Test", "192.0.2.1", "test.json"), None).unwrap();
+        assert!(resolved.protocols.profinet);
+        assert!(!resolved.protocols.pn_epm);
+
+        let mut config = complete_config("Test", "192.0.2.1", "test.json");
+        config.disable_pn_epm = Some(true);
+        let resolved = resolve_scan(args(), config, None).unwrap();
+        assert!(resolved.protocols.profinet);
+        assert!(!resolved.protocols.pn_epm);
+    }
+
+    #[test]
     fn serializes_and_deserializes_config_roundtrip() {
         let config = ScannerConfig {
             name: None,
@@ -2758,6 +2976,7 @@ mod tests {
             no_protocols: None,
             no_arp: Some(true),
             no_profinet: None,
+            disable_pn_epm: None,
             allow_dcp_source: None,
             no_s7: Some(true),
             no_enip: None,
@@ -2774,6 +2993,7 @@ mod tests {
             no_opcua: Some(true),
             no_snmp: Some(true),
             no_lldp: Some(true),
+            no_cdp: Some(true),
             opcua_ports: Some(vec![4840, 4841]),
             opcua_credentials: None,
             opcua_username: Some("opc-user".into()),
@@ -3027,6 +3247,7 @@ mod tests {
             "--allow-dcp-source",
             "--no-arp",
             "--no-profinet",
+            "--disable-pn-epm",
             "--no-s7",
             "--no-enip",
             "--no-bacnet",
@@ -3040,6 +3261,7 @@ mod tests {
             "--no-opcua",
             "--no-snmp",
             "--no-lldp",
+            "--no-cdp",
             "--ignore-self-signed",
             "--http-proxy",
             "http://proxy.example:8080",
@@ -3053,6 +3275,7 @@ mod tests {
         assert!(args.allow_dcp_source);
         assert!(args.no_arp);
         assert!(args.no_profinet);
+        assert!(args.disable_pn_epm);
         assert!(args.no_s7);
         assert!(args.no_enip);
         assert!(args.no_bacnet);
@@ -3066,6 +3289,7 @@ mod tests {
         assert!(args.no_opcua);
         assert!(args.no_snmp);
         assert!(args.no_lldp);
+        assert!(args.no_cdp);
         assert!(args.ignore_self_signed);
         assert_eq!(
             args.http_proxy.as_deref(),
@@ -3096,6 +3320,25 @@ mod tests {
                 !(cli_disabled || config_disabled)
             );
             assert!(options.protocols.s7);
+        }
+    }
+
+    #[test]
+    fn cdp_is_independent_and_enabled_by_default() {
+        for (cli_disabled, config_disabled, legacy_disabled) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let mut cli = args();
+            cli.no_cdp = cli_disabled;
+            let mut config = complete_config("Test", "192.0.2.1", "test.json");
+            config.no_cdp = Some(config_disabled);
+            config.no_protocols = Some(legacy_disabled);
+            let options = resolve_scan(cli, config, None).unwrap();
+            assert_eq!(options.protocols.cdp, !(cli_disabled || config_disabled));
+            assert!(options.protocols.lldp);
         }
     }
 
@@ -3387,6 +3630,7 @@ mod tests {
             warnings: vec![],
             inventory_complete: true,
             lldp_complete: true,
+            cdp_complete: true,
         };
 
         let logger = DeviceLogger::default();
@@ -3400,6 +3644,7 @@ mod tests {
             snmp::QuerySelection {
                 inventory: true,
                 lldp: false,
+                cdp: false,
             },
             Some(Ok(("192.0.2.10".into(), vec![], Ok(result)))),
         ));
@@ -3464,6 +3709,7 @@ mod tests {
             snmp::QuerySelection {
                 inventory: true,
                 lldp: false,
+                cdp: false,
             },
         )
         .await
@@ -3486,6 +3732,7 @@ mod tests {
             snmp::QuerySelection {
                 inventory: true,
                 lldp: false,
+                cdp: false,
             },
             Some(Ok(("127.0.0.1".into(), vec![], Err(error)))),
         ));
@@ -3704,6 +3951,144 @@ mod tests {
         assert!(!pnio_no_response(
             "192.0.2.10: PNIO record 0xAFF0 (API 0, slot 0, subslot 1) failed: response timed out"
         ));
+    }
+
+    #[test]
+    fn pnio_diagnostics_keep_target_scope_and_exclude_expected_timeouts() {
+        let logger = DiagnosticLogger::default();
+        let mut warnings = Vec::new();
+        let mut protocol_failed = false;
+
+        apply_pnio_diagnostics(
+            Ok(profinet::PnioDiagnostics {
+                warnings: vec![
+                    "PROFINET PNIO record scan failed for 192.0.2.10: RPC response timed out"
+                        .into(),
+                    "PROFINET PNIO record scan failed for 00:11:22:33:44:55: record malformed"
+                        .into(),
+                    "PROFINET PNIO scan skipped: no interface".into(),
+                ],
+                info: vec!["Optional DAP record was unavailable".into()],
+            }),
+            "02:00:00:00:00:01",
+            &logger,
+            &mut warnings,
+            &mut protocol_failed,
+        );
+
+        assert!(protocol_failed);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].starts_with("[mac=00:11:22:33:44:55] [profinet-pnio] PARTIAL"));
+        assert!(warnings[1].starts_with("[mac=02:00:00:00:00:01] [profinet-pnio] FAIL"));
+        assert_eq!(
+            *logger.diagnostics.lock().unwrap(),
+            [
+                (
+                    "profinet-pnio".into(),
+                    "INFO".into(),
+                    "optional-record".into()
+                ),
+                (
+                    "profinet-pnio".into(),
+                    "NO_RESPONSE".into(),
+                    "response-timeout".into(),
+                ),
+                (
+                    "profinet-pnio".into(),
+                    "PARTIAL".into(),
+                    "malformed-response".into(),
+                ),
+                (
+                    "profinet-pnio".into(),
+                    "PARTIAL".into(),
+                    "partial-collection".into(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn pnio_setup_errors_become_interface_scoped_failures() {
+        let logger = DiagnosticLogger::default();
+        let mut warnings = Vec::new();
+        let mut protocol_failed = false;
+
+        apply_pnio_diagnostics(
+            Err("interface unavailable".into()),
+            "02:00:00:00:00:01",
+            &logger,
+            &mut warnings,
+            &mut protocol_failed,
+        );
+
+        assert!(protocol_failed);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with("[mac=02:00:00:00:00:01] [profinet-pnio] FAIL"));
+    }
+
+    #[test]
+    fn cdp_capture_results_preserve_neighbors_and_classify_warnings() {
+        let logger = DiagnosticLogger::default();
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+        let mut protocol_failed = false;
+        let (devices, links) = apply_cdp_capture(
+            Ok(Ok(otserver_otter::cdp::CaptureResult {
+                devices: vec![Device::default()],
+                links: Vec::new(),
+                warnings: vec![
+                    "Passive CDP observed the selected link for 1 ms; absence is not proof.".into(),
+                    "Passive CDP capture: operation not permitted".into(),
+                ],
+            })),
+            "eth0",
+            &logger,
+            &mut warnings,
+            &mut errors,
+            &mut protocol_failed,
+        );
+
+        assert_eq!(devices.len(), 1);
+        assert!(links.is_empty());
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].starts_with("[mac=01:00:0c:cc:cc:cc] [cdp-passive] INFO"));
+        assert!(warnings[1].starts_with("[mac=01:00:0c:cc:cc:cc] [cdp-passive] PARTIAL"));
+        assert!(protocol_failed);
+        assert!(errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cdp_capture_and_worker_errors_are_exported() {
+        let logger = DiagnosticLogger::default();
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+        let mut protocol_failed = false;
+
+        let (devices, links) = apply_cdp_capture(
+            Ok(Err("operation not permitted".into())),
+            "eth0",
+            &logger,
+            &mut warnings,
+            &mut errors,
+            &mut protocol_failed,
+        );
+        assert!(devices.is_empty() && links.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("permission-denied"));
+
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        let (devices, links) = apply_cdp_capture(
+            Err(task.await.unwrap_err()),
+            "eth0",
+            &logger,
+            &mut warnings,
+            &mut errors,
+            &mut protocol_failed,
+        );
+        assert!(devices.is_empty() && links.is_empty());
+        assert_eq!(errors.len(), 2);
+        assert!(errors[1].contains("capture-task-failed"));
     }
 
     #[test]
@@ -3986,6 +4371,24 @@ mod tests {
         }
     }
 
+    struct CancelAndResumeOnLog {
+        cancel_trigger: &'static str,
+        resume_trigger: &'static str,
+        cancelled: Arc<AtomicBool>,
+        messages: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl LogOutput for CancelAndResumeOnLog {
+        fn write(&self, message: String) {
+            if message.contains(self.cancel_trigger) {
+                self.cancelled.store(true, Ordering::Relaxed);
+            } else if message.contains(self.resume_trigger) {
+                self.cancelled.store(false, Ordering::Relaxed);
+            }
+            self.messages.lock().unwrap().push(message);
+        }
+    }
+
     fn local_scan_options(output: PathBuf) -> ScanOptions {
         let (interface, source_mac) = profinet::interfaces()
             .unwrap()
@@ -4071,6 +4474,65 @@ mod tests {
         }
         assert!(export.scan.partial);
         assert!(export.devices.is_empty());
+        tokio::fs::remove_file(output).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_scan_exports_cdp_capture_results() {
+        let output = std::env::temp_dir().join(format!("{}.json", Uuid::new_v4()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let logger = CancelOnLog {
+            trigger: "IP protocol targets:",
+            cancelled: Arc::clone(&cancelled),
+            messages: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut options = local_scan_options(output.clone());
+        options.protocols.cdp = true;
+
+        let capture_cdp = |_: &str, _: &str, _: &AtomicBool| {
+            Ok(otserver_otter::cdp::CaptureResult {
+                devices: Vec::new(),
+                links: Vec::new(),
+                warnings: vec!["Passive CDP observed the selected link for 0 ms.".into()],
+            })
+        };
+        assert!(
+            scan_with_cdp_capture("CDP cancel", &options, &logger, &cancelled, capture_cdp)
+                .await
+                .unwrap()
+        );
+        let export: ScanExport =
+            serde_json::from_slice(&tokio::fs::read(&output).await.unwrap()).unwrap();
+        assert!(export.scan.partial);
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(export.warnings.iter().any(|warning| {
+            warning.contains("[cdp-passive] INFO code=capture-window-complete")
+        }));
+        tokio::fs::remove_file(output).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pnio_record_path_runs_after_dcp_setup_is_cancelled() {
+        let output = std::env::temp_dir().join(format!("{}.json", Uuid::new_v4()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let logger = CancelAndResumeOnLog {
+            cancel_trigger: "Scanning PROFINET DCP;",
+            resume_trigger: "Unique devices after Layer 2 discovery:",
+            cancelled: Arc::clone(&cancelled),
+            messages: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut options = local_scan_options(output.clone());
+        options.protocols.profinet = true;
+        options.protocols.pn_epm = true;
+        options.allow_dcp_source = true;
+
+        scan("PNIO dispatch", &options, &logger, &cancelled)
+            .await
+            .unwrap();
+        assert!(logger.messages.lock().unwrap().iter().any(|message| {
+            message.contains("Reading PROFINET PNIO records for discovered MAC/IP pairs")
+        }));
+        assert!(!cancelled.load(Ordering::Relaxed));
         tokio::fs::remove_file(output).await.unwrap();
     }
 
@@ -4770,6 +5232,7 @@ mod tests {
             warnings,
             inventory_complete,
             lldp_complete,
+            cdp_complete: true,
         };
         let logger = CapturingLogger::default();
         let mut devices = vec![Device {
@@ -4807,6 +5270,7 @@ mod tests {
             snmp::QuerySelection {
                 inventory: true,
                 lldp: true,
+                cdp: false,
             },
             Some(Ok((
                 "192.0.2.10".into(),
@@ -4844,6 +5308,7 @@ mod tests {
             snmp::QuerySelection {
                 inventory: false,
                 lldp: false,
+                cdp: false,
             },
             Some(Ok((
                 "192.0.2.11".into(),
@@ -4863,6 +5328,7 @@ mod tests {
             snmp::QuerySelection {
                 inventory: true,
                 lldp: false,
+                cdp: false,
             },
             Some(Ok((
                 "192.0.2.12".into(),
@@ -4887,6 +5353,7 @@ mod tests {
             snmp::QuerySelection {
                 inventory: true,
                 lldp: false,
+                cdp: false,
             },
             None,
         ));
@@ -4901,6 +5368,7 @@ mod tests {
             snmp::QuerySelection {
                 inventory: true,
                 lldp: true,
+                cdp: false,
             },
         )
         .await;
@@ -4918,10 +5386,85 @@ mod tests {
             snmp::QuerySelection {
                 inventory: true,
                 lldp: true,
+                cdp: false,
             },
             Some(Ok(("192.0.2.20".into(), attempts, Err(error)))),
         ));
         assert_eq!(warnings.len(), 3);
+    }
+
+    #[test]
+    fn cdp_mib_diagnostics_reflect_neighbor_completeness() {
+        let result = |cdp_complete, warnings| snmp::ResultData {
+            identity_mac: Some("00:11:22:33:44:55".into()),
+            observation: None,
+            interfaces: Vec::new(),
+            ports: Vec::new(),
+            links: Vec::new(),
+            warnings,
+            inventory_complete: true,
+            lldp_complete: true,
+            cdp_complete,
+        };
+        let selection = snmp::QuerySelection {
+            inventory: false,
+            lldp: false,
+            cdp: true,
+        };
+        let logger = DiagnosticLogger::default();
+        let mut devices = Vec::new();
+        let mut links = Vec::new();
+        let mut unresolved = Vec::new();
+        let mut warnings = Vec::new();
+
+        assert!(!apply_snmp_probe(
+            "Line A",
+            &mut devices,
+            &mut links,
+            &mut unresolved,
+            &mut warnings,
+            &logger,
+            selection,
+            Some(Ok((
+                "192.0.2.10".into(),
+                Vec::new(),
+                Ok(result(true, Vec::new())),
+            ))),
+        ));
+        assert!(apply_snmp_probe(
+            "Line A",
+            &mut devices,
+            &mut links,
+            &mut unresolved,
+            &mut warnings,
+            &logger,
+            selection,
+            Some(Ok((
+                "192.0.2.11".into(),
+                Vec::new(),
+                Ok(result(false, vec!["CDP neighbor table incomplete".into()])),
+            ))),
+        ));
+
+        let logs = logger.messages.lock().unwrap();
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("SUCCESS code=neighbor-inventory-complete"))
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("PARTIAL code=neighbor-inventory-partial"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("[cdp-snmp]"))
+        );
+        assert!(logger.diagnostics.lock().unwrap().contains(&(
+            "cdp-snmp".into(),
+            "PARTIAL".into(),
+            "neighbor-inventory-partial".into(),
+        )));
     }
 
     #[tokio::test]
@@ -4956,6 +5499,7 @@ mod tests {
             snmp::QuerySelection {
                 inventory: true,
                 lldp: true,
+                cdp: false,
             },
             Some(Err(snmp_error)),
         ));
@@ -5182,6 +5726,7 @@ mod tests {
                     protocols: ProtocolOptions {
                         arp: false,
                         profinet: false,
+                        pn_epm: false,
                         s7: false,
                         enip: false,
                         bacnet: false,
@@ -5196,6 +5741,7 @@ mod tests {
                         opcua: false,
                         snmp: false,
                         lldp: false,
+                        cdp: false,
                         ads: false,
                     },
                     allow_dcp_source: false,
@@ -5233,6 +5779,7 @@ mod tests {
         scan.no_profinet = true;
         scan.no_snmp = true;
         scan.no_lldp = true;
+        scan.no_cdp = true;
 
         let result = run_cli_with_configs(
             Cli {
@@ -5265,6 +5812,7 @@ mod tests {
         scan.no_profinet = true;
         scan.no_snmp = true;
         scan.no_lldp = true;
+        scan.no_cdp = true;
         let configs = ScannerConfigs::Multiple(vec![
             ScannerConfig {
                 name: Some("valid".into()),
