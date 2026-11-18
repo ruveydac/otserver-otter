@@ -375,6 +375,10 @@ mod tests {
     }
 
     fn advertisement(version: u8) -> Vec<u8> {
+        advertisement_with(version, &[])
+    }
+
+    fn advertisement_with(version: u8, extra: &[(u16, &[u8])]) -> Vec<u8> {
         let mut packet = vec![version, 180, 0, 0];
         tlv(1, b"switch-1", &mut packet);
         tlv(3, b"GigabitEthernet1/1", &mut packet);
@@ -383,6 +387,9 @@ mod tests {
         tlv(11, &[1], &mut packet);
         if version == 2 {
             tlv(20, b"switch-1.example", &mut packet);
+        }
+        for (kind, value) in extra {
+            tlv(*kind, value, &mut packet);
         }
         let mut sum = packet.chunks(2).fold(0_u32, |sum, chunk| {
             sum + u32::from(u16::from_be_bytes([chunk[0], *chunk.get(1).unwrap_or(&0)]))
@@ -437,6 +444,59 @@ mod tests {
     }
 
     #[test]
+    fn parses_supported_inventory_tlvs_and_addresses() {
+        let mut address = 1_u32.to_be_bytes().to_vec();
+        address.extend([1, 1, 0xcc, 0, 4, 192, 0, 2, 10]);
+        let frame = advertisement_with(
+            2,
+            &[
+                (2, &address),
+                (4, &[0, 0, 0, 7]),
+                (5, b"IOS-XE"),
+                (9, b"engineering"),
+                (16, &[0, 50]),
+                (17, &[0, 0, 5, 220]),
+                (21, &[1, 2, 3]),
+                (22, &address),
+                (23, b"cabinet 4"),
+                (25, &[4, 5]),
+                (26, &[6, 7]),
+                (7, &[8]),
+                (8, &[9]),
+                (12, &[10]),
+                (13, &[11]),
+                (14, &[12]),
+                (15, &[13]),
+                (18, &[14]),
+                (19, &[15]),
+                (24, &[16]),
+            ],
+        );
+        let (device, _) = parse(&frame, "02:00:00:00:00:02").unwrap();
+        let inventory = &device.observations[0].raw["inventory"];
+
+        assert_eq!(inventory["addresses"][0]["address"], "C000020A");
+        assert_eq!(inventory["managementAddresses"][0]["protocol"], "CC");
+        assert_eq!(inventory["capabilities"], 7);
+        assert_eq!(inventory["softwareVersion"], "IOS-XE");
+        assert_eq!(inventory["vtpDomain"], "engineering");
+        assert_eq!(inventory["powerConsumption"], 50);
+        assert_eq!(inventory["mtu"], 1500);
+        assert_eq!(inventory["systemObjectIdHex"], "010203");
+        assert_eq!(inventory["location"], "cabinet 4");
+        assert_eq!(inventory["tlv25"], "0405");
+        assert_eq!(inventory["tlv26"], "0607");
+    }
+
+    #[test]
+    fn address_decoder_rejects_invalid_counts_and_lengths() {
+        assert_eq!(decode_addresses(&[0, 0, 0, 0]), Some(Vec::new()));
+        assert!(decode_addresses(&[0, 0, 0, 65]).is_none());
+        assert!(decode_addresses(&[0, 0, 0, 1]).is_none());
+        assert!(decode_addresses(&[0, 0, 0, 0, 0]).is_none());
+    }
+
+    #[test]
     fn validates_snap_envelope_and_vlan_tags() {
         let mut frame = advertisement(2);
         assert!(is_cdp_frame(&frame));
@@ -450,11 +510,53 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_cdp_snap_and_out_of_bounds_lengths() {
+        assert!(!is_cdp_frame(&[]));
+
+        let mut frame = advertisement(2);
+        frame[0] = 2;
+        assert!(!is_cdp_frame(&frame));
+
+        let mut frame = advertisement(2);
+        frame[12..14].copy_from_slice(&1501_u16.to_be_bytes());
+        assert!(!is_cdp_frame(&frame));
+
+        let mut frame = advertisement(2);
+        frame[12..14].copy_from_slice(&1500_u16.to_be_bytes());
+        assert!(!is_cdp_frame(&frame));
+    }
+
+    #[test]
+    fn scan_reports_capture_setup_failures_and_honors_early_cancellation() {
+        let cancelled = AtomicBool::new(true);
+        let empty = scan("missing", "invalid", &cancelled).unwrap();
+        assert!(empty.devices.is_empty() && empty.links.is_empty());
+
+        let cancelled = AtomicBool::new(false);
+        assert!(scan("missing", "invalid", &cancelled).is_err());
+
+        let result = scan("otter-missing-interface", "02:00:00:00:00:02", &cancelled).unwrap();
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("Passive CDP capture:"))
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("absence of advertisements"))
+        );
+    }
+
+    #[test]
     fn cache_honors_ttl_withdrawal_updates_and_neighbor_limit() {
         let mut cache = Neighbors::new();
         let mut frame = advertisement(2);
         let local = "02:00:00:00:00:02";
         let now = Instant::now();
+        assert!(retain_frame(&mut cache, &[], local, now));
         assert!(retain_frame(&mut cache, &frame, local, now));
         assert_eq!(cache.len(), 1);
         frame[23] = 0;

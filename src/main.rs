@@ -3,7 +3,7 @@ mod controller;
 pub mod gui;
 use clap::{ArgAction, Args, Parser, Subcommand};
 use otserver_otter::contract::{
-    Device, InterfaceRef, ScanExport, ScanInfo, ScannerInfo, Source, merge_devices,
+    Device, InterfaceRef, ScanExport, ScanInfo, ScannerInfo, Source, TopologyLink, merge_devices,
     unique_ip_identities, validate, validate_json,
 };
 use otserver_otter::{discovery, profinet, protocols, snmp};
@@ -1460,71 +1460,13 @@ pub async fn scan(
         .await
         .map_err(|error| error.to_string())?;
         devices = enriched;
-        let diagnostics = result.unwrap_or_else(|error| profinet::PnioDiagnostics {
-            warnings: vec![format!("PROFINET PNIO scan skipped: {error}")],
-            info: Vec::new(),
-        });
-        let format_pnio = |warning: &str, status: &str, code: &str| {
-            if let Some(target) = pnio_warning_target(warning) {
-                if let Ok(ip) = target.parse::<Ipv4Addr>() {
-                    format_diagnostic(
-                        &ip.to_string(),
-                        None,
-                        "profinet-pnio",
-                        status,
-                        code,
-                        "udp/34964 or advertised PNIO endpoint; timeout 2s per RPC exchange",
-                        "record-read",
-                        warning,
-                    )
-                } else {
-                    format_mac_diagnostic(
-                        &target,
-                        "profinet-pnio",
-                        status,
-                        code,
-                        "udp/34964 or advertised PNIO endpoint; timeout 2s per RPC exchange",
-                        "record-read",
-                        warning,
-                    )
-                }
-            } else {
-                format_mac_diagnostic(
-                    &source_mac,
-                    "profinet-pnio",
-                    "FAIL",
-                    diagnostic_code(warning, protocols::ProbeStatus::Failure),
-                    "selected interface; RPC timeout 2s",
-                    "prepare",
-                    &format!("Interface-scoped PNIO diagnostic: {warning}"),
-                )
-            }
-        };
-        for info in &diagnostics.info {
-            logger.diagnostic("profinet-pnio", "INFO", "optional-record");
-            logger.log(format_pnio(info, "INFO", "optional-record"));
-        }
-        let mut incomplete = false;
-        for warning in &diagnostics.warnings {
-            let status = if pnio_no_response(warning) {
-                protocols::ProbeStatus::NoResponse
-            } else {
-                protocols::ProbeStatus::Partial
-            };
-            let formatted = format_pnio(warning, status.label(), diagnostic_code(warning, status));
-            logger.diagnostic(
-                "profinet-pnio",
-                status.label(),
-                diagnostic_code(warning, status),
-            );
-            logger.log(formatted.clone());
-            if status == protocols::ProbeStatus::NoResponse {
-                continue;
-            }
-            incomplete = true;
-            warnings.push(formatted);
-        }
-        protocol_failed |= incomplete;
+        apply_pnio_diagnostics(
+            result,
+            &source_mac,
+            logger,
+            &mut warnings,
+            &mut protocol_failed,
+        );
         logger.devices(configuration, &devices);
     }
     logger.log(format!(
@@ -1677,76 +1619,16 @@ pub async fn scan(
         }
     }
     if let Some(capture) = cdp_capture {
-        match capture.await {
-            Ok(Ok(result)) => {
-                devices.extend(result.devices);
-                links.extend(result.links);
-                for warning in result.warnings {
-                    let informational =
-                        warning.starts_with("Passive CDP observed the selected link");
-                    protocol_failed |= !informational;
-                    let status = if informational { "INFO" } else { "PARTIAL" };
-                    let code = if informational {
-                        "capture-window-complete"
-                    } else {
-                        diagnostic_code(&warning, protocols::ProbeStatus::Partial)
-                    };
-                    let diagnostic = format_mac_diagnostic(
-                        "01:00:0c:cc:cc:cc",
-                        "cdp-passive",
-                        status,
-                        code,
-                        &format!(
-                            "selected interface {}; capture window 30s",
-                            options.interface
-                        ),
-                        "capture",
-                        &warning,
-                    );
-                    logger.diagnostic("cdp-passive", status, code);
-                    logger.log(diagnostic.clone());
-                    warnings.push(diagnostic);
-                }
-            }
-            Ok(Err(error)) => {
-                let diagnostic = format_mac_diagnostic(
-                    "01:00:0c:cc:cc:cc",
-                    "cdp-passive",
-                    "FAIL",
-                    diagnostic_code(&error, protocols::ProbeStatus::Failure),
-                    &format!(
-                        "selected interface {}; capture window 30s",
-                        options.interface
-                    ),
-                    "capture",
-                    &error,
-                );
-                logger.diagnostic(
-                    "cdp-passive",
-                    "FAIL",
-                    diagnostic_code(&error, protocols::ProbeStatus::Failure),
-                );
-                logger.log(diagnostic.clone());
-                errors.push(diagnostic);
-            }
-            Err(error) => {
-                let diagnostic = format_mac_diagnostic(
-                    "01:00:0c:cc:cc:cc",
-                    "cdp-passive",
-                    "FAIL",
-                    "capture-task-failed",
-                    &format!(
-                        "selected interface {}; capture window 30s",
-                        options.interface
-                    ),
-                    "capture",
-                    &error.to_string(),
-                );
-                logger.diagnostic("cdp-passive", "FAIL", "capture-task-failed");
-                logger.log(diagnostic.clone());
-                errors.push(diagnostic);
-            }
-        }
+        let (captured_devices, captured_links) = apply_cdp_capture(
+            capture.await,
+            &options.interface,
+            logger,
+            &mut warnings,
+            &mut errors,
+            &mut protocol_failed,
+        );
+        devices.extend(captured_devices);
+        links.extend(captured_links);
     }
     let stopped = cancelled.load(Ordering::Relaxed);
     if stopped {
@@ -1792,6 +1674,149 @@ pub async fn scan(
         options.output.display()
     ));
     Ok(scan.scan.partial)
+}
+
+fn apply_pnio_diagnostics(
+    result: Result<profinet::PnioDiagnostics, String>,
+    source_mac: &str,
+    logger: &dyn LogOutput,
+    warnings: &mut Vec<String>,
+    protocol_failed: &mut bool,
+) {
+    let diagnostics = result.unwrap_or_else(|error| profinet::PnioDiagnostics {
+        warnings: vec![format!("PROFINET PNIO scan skipped: {error}")],
+        info: Vec::new(),
+    });
+    let format_pnio = |warning: &str, status: &str, code: &str| {
+        if let Some(target) = pnio_warning_target(warning) {
+            if let Ok(ip) = target.parse::<Ipv4Addr>() {
+                format_diagnostic(
+                    &ip.to_string(),
+                    None,
+                    "profinet-pnio",
+                    status,
+                    code,
+                    "udp/34964 or advertised PNIO endpoint; timeout 2s per RPC exchange",
+                    "record-read",
+                    warning,
+                )
+            } else {
+                format_mac_diagnostic(
+                    &target,
+                    "profinet-pnio",
+                    status,
+                    code,
+                    "udp/34964 or advertised PNIO endpoint; timeout 2s per RPC exchange",
+                    "record-read",
+                    warning,
+                )
+            }
+        } else {
+            format_mac_diagnostic(
+                source_mac,
+                "profinet-pnio",
+                "FAIL",
+                diagnostic_code(warning, protocols::ProbeStatus::Failure),
+                "selected interface; RPC timeout 2s",
+                "prepare",
+                &format!("Interface-scoped PNIO diagnostic: {warning}"),
+            )
+        }
+    };
+    for info in &diagnostics.info {
+        logger.diagnostic("profinet-pnio", "INFO", "optional-record");
+        logger.log(format_pnio(info, "INFO", "optional-record"));
+    }
+    let mut incomplete = false;
+    for warning in &diagnostics.warnings {
+        let status = if pnio_no_response(warning) {
+            protocols::ProbeStatus::NoResponse
+        } else {
+            protocols::ProbeStatus::Partial
+        };
+        let formatted = format_pnio(warning, status.label(), diagnostic_code(warning, status));
+        logger.diagnostic(
+            "profinet-pnio",
+            status.label(),
+            diagnostic_code(warning, status),
+        );
+        logger.log(formatted.clone());
+        if status != protocols::ProbeStatus::NoResponse {
+            incomplete = true;
+            warnings.push(formatted);
+        }
+    }
+    *protocol_failed |= incomplete;
+}
+
+fn apply_cdp_capture(
+    capture: Result<Result<otserver_otter::cdp::CaptureResult, String>, tokio::task::JoinError>,
+    interface: &str,
+    logger: &dyn LogOutput,
+    warnings: &mut Vec<String>,
+    errors: &mut Vec<String>,
+    protocol_failed: &mut bool,
+) -> (Vec<Device>, Vec<TopologyLink>) {
+    match capture {
+        Ok(Ok(result)) => {
+            let devices = result.devices;
+            let links = result.links;
+            for warning in result.warnings {
+                let informational = warning.starts_with("Passive CDP observed the selected link");
+                *protocol_failed |= !informational;
+                let status = if informational { "INFO" } else { "PARTIAL" };
+                let code = if informational {
+                    "capture-window-complete"
+                } else {
+                    diagnostic_code(&warning, protocols::ProbeStatus::Partial)
+                };
+                let diagnostic = format_mac_diagnostic(
+                    "01:00:0c:cc:cc:cc",
+                    "cdp-passive",
+                    status,
+                    code,
+                    &format!("selected interface {interface}; capture window 30s"),
+                    "capture",
+                    &warning,
+                );
+                logger.diagnostic("cdp-passive", status, code);
+                logger.log(diagnostic.clone());
+                warnings.push(diagnostic);
+            }
+            (devices, links)
+        }
+        Ok(Err(error)) => {
+            let code = diagnostic_code(&error, protocols::ProbeStatus::Failure);
+            let diagnostic = format_mac_diagnostic(
+                "01:00:0c:cc:cc:cc",
+                "cdp-passive",
+                "FAIL",
+                code,
+                &format!("selected interface {interface}; capture window 30s"),
+                "capture",
+                &error,
+            );
+            logger.diagnostic("cdp-passive", "FAIL", code);
+            logger.log(diagnostic.clone());
+            errors.push(diagnostic);
+            (Vec::new(), Vec::new())
+        }
+        Err(error) => {
+            let diagnostic = format_mac_diagnostic(
+                "01:00:0c:cc:cc:cc",
+                "cdp-passive",
+                "FAIL",
+                "capture-task-failed",
+                &format!("selected interface {interface}; capture window 30s"),
+                "capture",
+                &error.to_string(),
+            );
+            logger.diagnostic("cdp-passive", "FAIL", "capture-task-failed");
+            logger.log(diagnostic.clone());
+            errors.push(diagnostic);
+            (Vec::new(), Vec::new())
+        }
+    }
 }
 
 pub async fn run_scan_batch(
@@ -2770,6 +2795,25 @@ mod tests {
             lldp: false,
             cdp: false,
             ads: false,
+        }
+    }
+
+    #[derive(Default)]
+    struct DiagnosticLogger {
+        messages: std::sync::Mutex<Vec<String>>,
+        diagnostics: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl LogOutput for DiagnosticLogger {
+        fn write(&self, message: String) {
+            self.messages.lock().unwrap().push(message);
+        }
+
+        fn diagnostic(&self, protocol: &str, status: &str, code: &str) {
+            self.diagnostics
+                .lock()
+                .unwrap()
+                .push((protocol.into(), status.into(), code.into()));
         }
     }
 
@@ -3890,6 +3934,144 @@ mod tests {
         assert!(!pnio_no_response(
             "192.0.2.10: PNIO record 0xAFF0 (API 0, slot 0, subslot 1) failed: response timed out"
         ));
+    }
+
+    #[test]
+    fn pnio_diagnostics_keep_target_scope_and_exclude_expected_timeouts() {
+        let logger = DiagnosticLogger::default();
+        let mut warnings = Vec::new();
+        let mut protocol_failed = false;
+
+        apply_pnio_diagnostics(
+            Ok(profinet::PnioDiagnostics {
+                warnings: vec![
+                    "PROFINET PNIO record scan failed for 192.0.2.10: RPC response timed out"
+                        .into(),
+                    "PROFINET PNIO record scan failed for 00:11:22:33:44:55: record malformed"
+                        .into(),
+                    "PROFINET PNIO scan skipped: no interface".into(),
+                ],
+                info: vec!["Optional DAP record was unavailable".into()],
+            }),
+            "02:00:00:00:00:01",
+            &logger,
+            &mut warnings,
+            &mut protocol_failed,
+        );
+
+        assert!(protocol_failed);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].starts_with("[mac=00:11:22:33:44:55] [profinet-pnio] PARTIAL"));
+        assert!(warnings[1].starts_with("[mac=02:00:00:00:00:01] [profinet-pnio] FAIL"));
+        assert_eq!(
+            *logger.diagnostics.lock().unwrap(),
+            [
+                (
+                    "profinet-pnio".into(),
+                    "INFO".into(),
+                    "optional-record".into()
+                ),
+                (
+                    "profinet-pnio".into(),
+                    "NO_RESPONSE".into(),
+                    "response-timeout".into(),
+                ),
+                (
+                    "profinet-pnio".into(),
+                    "PARTIAL".into(),
+                    "malformed-response".into(),
+                ),
+                (
+                    "profinet-pnio".into(),
+                    "PARTIAL".into(),
+                    "partial-collection".into(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn pnio_setup_errors_become_interface_scoped_failures() {
+        let logger = DiagnosticLogger::default();
+        let mut warnings = Vec::new();
+        let mut protocol_failed = false;
+
+        apply_pnio_diagnostics(
+            Err("interface unavailable".into()),
+            "02:00:00:00:00:01",
+            &logger,
+            &mut warnings,
+            &mut protocol_failed,
+        );
+
+        assert!(protocol_failed);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with("[mac=02:00:00:00:00:01] [profinet-pnio] FAIL"));
+    }
+
+    #[test]
+    fn cdp_capture_results_preserve_neighbors_and_classify_warnings() {
+        let logger = DiagnosticLogger::default();
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+        let mut protocol_failed = false;
+        let (devices, links) = apply_cdp_capture(
+            Ok(Ok(otserver_otter::cdp::CaptureResult {
+                devices: vec![Device::default()],
+                links: Vec::new(),
+                warnings: vec![
+                    "Passive CDP observed the selected link for 1 ms; absence is not proof.".into(),
+                    "Passive CDP capture: operation not permitted".into(),
+                ],
+            })),
+            "eth0",
+            &logger,
+            &mut warnings,
+            &mut errors,
+            &mut protocol_failed,
+        );
+
+        assert_eq!(devices.len(), 1);
+        assert!(links.is_empty());
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].starts_with("[mac=01:00:0c:cc:cc:cc] [cdp-passive] INFO"));
+        assert!(warnings[1].starts_with("[mac=01:00:0c:cc:cc:cc] [cdp-passive] PARTIAL"));
+        assert!(protocol_failed);
+        assert!(errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cdp_capture_and_worker_errors_are_exported() {
+        let logger = DiagnosticLogger::default();
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+        let mut protocol_failed = false;
+
+        let (devices, links) = apply_cdp_capture(
+            Ok(Err("operation not permitted".into())),
+            "eth0",
+            &logger,
+            &mut warnings,
+            &mut errors,
+            &mut protocol_failed,
+        );
+        assert!(devices.is_empty() && links.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("permission-denied"));
+
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        let (devices, links) = apply_cdp_capture(
+            Err(task.await.unwrap_err()),
+            "eth0",
+            &logger,
+            &mut warnings,
+            &mut errors,
+            &mut protocol_failed,
+        );
+        assert!(devices.is_empty() && links.is_empty());
+        assert_eq!(errors.len(), 2);
+        assert!(errors[1].contains("capture-task-failed"));
     }
 
     #[test]

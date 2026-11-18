@@ -527,14 +527,7 @@ fn read_device_records(
                 },
             ) {
                 Ok(scan) => {
-                    diagnostics.warnings.extend(
-                        scan.warnings
-                            .iter()
-                            .map(|warning| format!("{ip}: {warning}")),
-                    );
-                    diagnostics
-                        .info
-                        .extend(scan.info.iter().map(|warning| format!("{ip}: {warning}")));
+                    append_pnio_diagnostics(&mut diagnostics, ip, &scan);
                     attach_pnio_records(device, ip, scan);
                 }
                 Err(error) => diagnostics.warnings.push(format!(
@@ -544,6 +537,21 @@ fn read_device_records(
         }
     }
     diagnostics
+}
+
+fn append_pnio_diagnostics(
+    diagnostics: &mut PnioDiagnostics,
+    ip: Ipv4Addr,
+    scan: &pnio::RecordScan,
+) {
+    diagnostics.warnings.extend(
+        scan.warnings
+            .iter()
+            .map(|warning| format!("{ip}: {warning}")),
+    );
+    diagnostics
+        .info
+        .extend(scan.info.iter().map(|warning| format!("{ip}: {warning}")));
 }
 
 fn pnio_component(
@@ -1999,6 +2007,16 @@ mod tests {
                             "counters": {"ifInOctets": 1},
                         }]}),
                     ),
+                    pnio_record(
+                        0,
+                        0,
+                        0x8001,
+                        0x802A,
+                        json!({"ports": [
+                            {"slot": "invalid", "subslot": 1},
+                            {"slot": 0, "subslot": "invalid"},
+                        ]}),
+                    ),
                 ],
                 warnings: vec![],
                 info: vec![],
@@ -2016,6 +2034,26 @@ mod tests {
         assert_eq!(port["linkState"]["link"], "up");
         assert_eq!(port["statistics"][0]["counters"]["ifInOctets"], 1);
         assert_eq!(port["portCheck"][0]["slot"], 0);
+    }
+
+    #[test]
+    fn pnio_record_diagnostics_keep_the_target_ip() {
+        let mut diagnostics = PnioDiagnostics::default();
+        append_pnio_diagnostics(
+            &mut diagnostics,
+            Ipv4Addr::new(192, 0, 2, 10),
+            &pnio::RecordScan {
+                records: vec![],
+                warnings: vec!["primary record failed".into()],
+                info: vec!["optional port record unavailable".into()],
+            },
+        );
+
+        assert_eq!(diagnostics.warnings, ["192.0.2.10: primary record failed"]);
+        assert_eq!(
+            diagnostics.info,
+            ["192.0.2.10: optional port record unavailable"]
+        );
     }
 
     #[test]
@@ -2136,6 +2174,22 @@ mod tests {
             .unwrap()
             .is_empty()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_linux_pnio_enrichment_does_not_open_a_socket() {
+        let diagnostics = enrich_linux_pnio(
+            "missing-interface",
+            [0; 6],
+            Ipv4Addr::LOCALHOST,
+            &mut [],
+            &BTreeSet::new(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert!(diagnostics.is_empty());
     }
 
     #[test]

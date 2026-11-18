@@ -548,6 +548,7 @@ mod tests {
             Source::Arp,
             Source::Bacnet,
             Source::Dnp3,
+            Source::Cdp,
             Source::EthernetIp,
             Source::Iec61850,
             Source::Lldp,
@@ -564,9 +565,10 @@ mod tests {
         .map(Source::label);
         assert_eq!(labels[0], "arp");
         assert_eq!(labels[2], "dnp3");
-        assert_eq!(labels[6], "netbios");
-        assert_eq!(labels[9], "opc-ua");
-        assert_eq!(labels[14], "unknown");
+        assert_eq!(labels[3], "cdp");
+        assert_eq!(labels[7], "netbios");
+        assert_eq!(labels[10], "opc-ua");
+        assert_eq!(labels[15], "unknown");
         let devices = merge_devices(vec![
             Device {
                 mac_address: "invalid".into(),
