@@ -2670,6 +2670,10 @@ mod tests {
             ),
             ("1.3.6.1.4.1.9.9.23.1.2.1.1.6.1.2", string("remote-switch")),
             (
+                "1.3.6.1.4.1.9.9.23.1.2.1.1.6.1.2.3",
+                string("remote-switch-secondary-index"),
+            ),
+            (
                 "1.3.6.1.4.1.9.9.23.1.2.1.1.7.1.2",
                 string("GigabitEthernet1/2"),
             ),
@@ -3111,6 +3115,36 @@ mod tests {
         assert!(lldp_only.interfaces.is_empty());
         assert_eq!(lldp_only.links.len(), 1);
         assert_eq!(lldp_only.links[0].raw["version"], "2c");
+
+        let cdp_only = query(
+            "127.0.0.1",
+            None,
+            &settings("2c"),
+            QuerySelection {
+                inventory: false,
+                lldp: false,
+                cdp: true,
+            },
+        )
+        .await
+        .unwrap();
+        let cdp_observation = cdp_only.observation.unwrap();
+        assert_eq!(cdp_observation.source, Source::Cdp);
+        assert_eq!(
+            cdp_observation.raw["subject"],
+            json!({"kind": "endpoint", "ipAddress": "127.0.0.1"})
+        );
+        assert_eq!(
+            cdp_observation.raw["cdpNeighbors"][1]["deviceId"],
+            "remote-switch-secondary-index"
+        );
+        assert!(
+            cdp_observation.raw["cdpNeighbors"][1]
+                .get("interfaceIndex")
+                .is_none()
+        );
+        assert!(cdp_only.links.is_empty());
+
         requested_oids.lock().unwrap().clear();
         *failed_oid.lock().unwrap() = Some("1.3.6.1.2.1.2.2.1.2".into());
         let partial = query(
@@ -3158,6 +3192,59 @@ mod tests {
         );
         assert_eq!(degraded.links.len(), 1);
         assert!(degraded.links[0].raw["remoteDot3"].is_null());
+
+        *failed_oid.lock().unwrap() = Some("1.3.6.1.4.1.9.9.23.1.2.1.1.4".into());
+        let degraded_cdp = query(
+            "127.0.0.1",
+            None,
+            &settings("2c"),
+            QuerySelection {
+                inventory: false,
+                lldp: false,
+                cdp: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!degraded_cdp.cdp_complete);
+        assert!(
+            degraded_cdp
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("SNMP CDP-MIB"))
+        );
+
+        *failed_oid.lock().unwrap() = Some("1.3.6.1.4.1.9.9.23.1.2.1.1.6.1.2".into());
+        let partial_cdp = query(
+            "127.0.0.1",
+            None,
+            &settings("2c"),
+            QuerySelection {
+                inventory: false,
+                lldp: true,
+                cdp: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!partial_cdp.cdp_complete);
+        assert!(partial_cdp.lldp_complete);
+        let observation = partial_cdp.observation.unwrap();
+        assert_eq!(observation.source, Source::Lldp);
+        assert_eq!(
+            observation.raw["cdpNeighbors"][0]["deviceId"],
+            "remote-switch"
+        );
+        assert!(
+            observation.raw["collectionOutcomes"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({
+                    "oid": "1.3.6.1.4.1.9.9.23.1.2.1.1.6",
+                    "outcome": "read-error",
+                    "rows": 1
+                }))
+        );
 
         *failed_oid.lock().unwrap() = Some("1.3.6.1.2.1.1.1.0".into());
         let (attempts, failed) = query_with_attempts(
@@ -3511,6 +3598,33 @@ mod tests {
             MAX_PARTIAL_RESPONSE_ROWS
         );
         assert_eq!(observation.raw["partialResponsesTruncated"], true);
+    }
+
+    #[test]
+    fn cdp_only_partial_query_keeps_endpoint_scoped_evidence() {
+        let rows = Arc::new(Mutex::new(PartialResponses::default()));
+        rows.lock().unwrap().push(json!({"oid": "1.3.6.1.4.1.9"}));
+        let result = partial_or_error(
+            "192.0.2.10",
+            QuerySelection {
+                inventory: false,
+                lldp: false,
+                cdp: true,
+            },
+            &rows,
+            "SNMP CDP walk failed".into(),
+            false,
+            "query-failed",
+        )
+        .unwrap();
+
+        let observation = result.observation.unwrap();
+        assert_eq!(observation.source, Source::Cdp);
+        assert_eq!(
+            observation.raw["subject"],
+            json!({"kind": "endpoint", "ipAddress": "192.0.2.10"})
+        );
+        assert!(!result.cdp_complete);
     }
 
     #[test]

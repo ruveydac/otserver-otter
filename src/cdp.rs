@@ -30,10 +30,19 @@ pub fn scan(
         });
     }
     mac_bytes(local_mac).ok_or("CDP requires the selected interface MAC")?;
+    Ok(collect_neighbors(local_mac, |on_frame| {
+        crate::lldp::capture_passive(interface, CAPTURE_WINDOW, cancelled, on_frame)
+    }))
+}
+
+fn collect_neighbors(
+    local_mac: &str,
+    capture: impl FnOnce(&mut dyn FnMut(&[u8])) -> Result<(), String>,
+) -> CaptureResult {
     let mut neighbors = BTreeMap::new();
     let started = Instant::now();
     let mut limited = false;
-    let result = crate::lldp::capture_passive(interface, CAPTURE_WINDOW, cancelled, |frame| {
+    let result = capture(&mut |frame| {
         if is_cdp_frame(frame) {
             limited |= !retain_frame(&mut neighbors, frame, local_mac, Instant::now());
         }
@@ -56,11 +65,11 @@ pub fn scan(
         .into_values()
         .map(|(device, link, _)| (device, link))
         .unzip();
-    Ok(CaptureResult {
+    CaptureResult {
         devices,
         links,
         warnings,
-    })
+    }
 }
 
 fn expire(neighbors: &mut Neighbors, now: Instant) {
@@ -556,6 +565,12 @@ mod tests {
         assert!(decode_addresses(&[0, 0, 0, 65]).is_none());
         assert!(decode_addresses(&[0, 0, 0, 1]).is_none());
         assert!(decode_addresses(&[0, 0, 0, 0, 0]).is_none());
+        assert!(decode_addresses(&[0, 0]).is_none());
+        assert!(decode_addresses(&[0, 0, 0, 1, 1]).is_none());
+        assert!(decode_addresses(&[0, 0, 0, 1, 1, 2, 0xaa]).is_none());
+        assert!(decode_addresses(&[0, 0, 0, 1, 1, 1, 0xaa]).is_none());
+        assert!(decode_addresses(&[0, 0, 0, 1, 1, 1, 0xaa, 0, 4, 1]).is_none());
+        assert!(decode_addresses(&[0, 0, 0, 0, 0xaa]).is_none());
     }
 
     #[test]
@@ -613,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_honors_ttl_withdrawal_updates_and_neighbor_limit() {
+    fn cache_honors_ttl_withdrawal_and_expiry() {
         let mut cache = Neighbors::new();
         let mut frame = advertisement(2);
         let local = "02:00:00:00:00:02";
@@ -622,28 +637,56 @@ mod tests {
         assert!(retain_frame(&mut cache, &frame, local, now));
         assert_eq!(cache.len(), 1);
         frame[23] = 0;
-        let checksum = {
-            let packet = &mut frame[22..];
-            packet[2..4].fill(0);
-            let mut sum = packet.chunks(2).fold(0_u32, |sum, chunk| {
-                sum + u32::from(u16::from_be_bytes([chunk[0], *chunk.get(1).unwrap_or(&0)]))
-            });
-            while sum >> 16 != 0 {
-                sum = (sum & 0xffff) + (sum >> 16);
-            }
-            !sum as u16
-        };
-        frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+        refresh_checksum(&mut frame);
         assert!(retain_frame(&mut cache, &frame, local, now));
         assert!(cache.is_empty());
-        let frame = advertisement(2);
-        for index in 0..MAX_NEIGHBORS {
-            let mut distinct = frame.clone();
-            distinct[10..12].copy_from_slice(&(index as u16 + 100).to_be_bytes());
-            assert!(retain_frame(&mut cache, &distinct, local, now));
+        retain_frame(&mut cache, &advertisement(2), local, now);
+        expire(&mut cache, now + Duration::from_secs(181));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn capture_keeps_neighbors_and_warns_when_capacity_is_exhausted() {
+        let result = collect_neighbors("02:00:00:00:00:02", |on_frame| {
+            on_frame(&[]);
+            let mut frame = advertisement(2);
+            for index in 0..=MAX_NEIGHBORS as u16 {
+                frame[10..12].copy_from_slice(&(index + 100).to_be_bytes());
+                on_frame(&frame);
+            }
+            Ok(())
+        });
+
+        assert_eq!(result.devices.len(), MAX_NEIGHBORS);
+        assert_eq!(result.links.len(), MAX_NEIGHBORS);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("neighbor limit reached"))
+        );
+    }
+
+    #[test]
+    fn rejects_empty_and_invalid_inventory_text() {
+        for value in [b"".as_slice(), &[0xff]] {
+            assert!(
+                parse(&advertisement_with(2, &[(5, value)]), "02:00:00:00:00:02").is_none(),
+                "{value:?}"
+            );
         }
-        let mut extra = frame;
-        extra[10..12].copy_from_slice(&999_u16.to_be_bytes());
-        assert!(!retain_frame(&mut cache, &extra, local, now));
+    }
+
+    #[test]
+    fn parser_requires_both_identity_fields() {
+        let local = "02:00:00:00:00:02";
+        for field in [26..38, 38..60] {
+            let mut frame = advertisement(2);
+            frame.drain(field);
+            let payload_length = u16::try_from(frame.len() - 14).unwrap();
+            frame[12..14].copy_from_slice(&payload_length.to_be_bytes());
+            refresh_checksum(&mut frame);
+            assert!(parse(&frame, local).is_none());
+        }
     }
 }

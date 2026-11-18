@@ -2488,6 +2488,201 @@ mod tests {
     }
 
     #[test]
+    fn diagnosis_supports_version_zero_api_and_qualified_channel_details() {
+        let mut payload = Vec::new();
+        payload.extend(1_u16.to_be_bytes());
+        payload.extend(2_u16.to_be_bytes());
+        payload.extend(3_u16.to_be_bytes());
+        payload.extend(0x0200_u16.to_be_bytes());
+        payload.extend(0x8003_u16.to_be_bytes());
+        payload.extend(7_u16.to_be_bytes());
+        payload.extend(0x0600_u16.to_be_bytes());
+        payload.extend(0x1234_u16.to_be_bytes());
+        payload.extend(0xABCD_u16.to_be_bytes());
+        payload.extend(0x1234_5678_u32.to_be_bytes());
+        payload.extend(0x8765_4321_u32.to_be_bytes());
+
+        let parsed = parse_device_diagnosis(&block_record(0x0010, (1, 0), &payload)).unwrap();
+        assert_eq!(parsed["entries"][0]["api"], 0);
+        assert_eq!(parsed["entries"][0]["severity"], "qualified");
+        assert_eq!(
+            parsed["entries"][0]["qualifiedChannelQualifier"],
+            "0x87654321"
+        );
+    }
+
+    #[test]
+    fn diagnosis_rejects_unsupported_truncated_and_incomplete_records() {
+        assert!(
+            parse_device_diagnosis(&block_record(0x0011, (1, 0), &[]))
+                .unwrap_err()
+                .contains("unsupported block")
+        );
+
+        let mut truncated = block_record(0x0010, (1, 0), &[0; 10]);
+        truncated[2..4].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(
+            parse_device_diagnosis(&truncated)
+                .unwrap_err()
+                .contains("record was truncated")
+        );
+
+        let mut incomplete = vec![0; 8];
+        incomplete.extend(0x8000_u16.to_be_bytes());
+        incomplete.push(1);
+        assert!(
+            parse_device_diagnosis(&block_record(0x0010, (1, 0), &incomplete))
+                .unwrap_err()
+                .contains("item list was truncated")
+        );
+    }
+
+    #[test]
+    fn port_data_rejects_unsupported_truncated_oversized_and_trailing_data() {
+        assert!(
+            parse_port_data_real(&block_record(0x020E, (1, 0), &[]))
+                .unwrap_err()
+                .contains("unsupported block")
+        );
+
+        let mut truncated = port_data_real_record();
+        truncated[2..4].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(
+            parse_port_data_real(&truncated)
+                .unwrap_err()
+                .contains("record was truncated")
+        );
+
+        for (offset, value, detail) in [
+            (12, 65, "port identifier was oversized"),
+            (21, 17, "peer count was oversized"),
+            (24, 65, "peer port identifier was oversized"),
+            (33, 65, "peer chassis identifier was oversized"),
+        ] {
+            let mut oversized = port_data_real_record();
+            oversized[offset] = value;
+            let error = parse_port_data_real(&oversized).unwrap_err();
+            assert!(error.contains(detail), "{error}");
+        }
+
+        let mut trailing = port_data_real_record();
+        trailing.push(0);
+        let length = u16::from_be_bytes(trailing[2..4].try_into().unwrap()) + 1;
+        trailing[2..4].copy_from_slice(&length.to_be_bytes());
+        assert!(
+            parse_port_data_real(&trailing)
+                .unwrap_err()
+                .contains("trailing bytes")
+        );
+    }
+
+    #[test]
+    fn port_data_preserves_numeric_state_and_media_codes() {
+        let mut record = port_data_real_record();
+        for (code, port_state, link_state, media) in [
+            (0, Some("unknown"), None, None),
+            (1, Some("disabled/discarding"), Some("up"), Some("copper")),
+            (2, Some("blocking"), Some("down"), Some("fiber-optic")),
+            (3, Some("listening"), Some("testing"), Some("radio")),
+            (4, Some("learning"), Some("unknown"), None),
+            (5, Some("forwarding"), Some("dormant"), None),
+            (6, Some("broken"), Some("notpresent"), None),
+            (7, None, Some("lowerlayerdown"), None),
+        ] {
+            record[64..66].fill(code);
+            record[68..72].copy_from_slice(&u32::from(code).to_be_bytes());
+            let parsed = parse_port_data_real(&record).unwrap();
+            let port = &parsed["ports"][0];
+            assert_eq!(
+                port["linkState"],
+                json!({"port": port_state, "portCode": code, "link": link_state, "linkCode": code})
+            );
+            assert_eq!(port["mediaType"], code);
+            assert_eq!(port["mediaTypeName"], json!(media));
+        }
+    }
+
+    #[test]
+    fn port_check_accepts_zero_padding_and_bounds_nested_blocks() {
+        let mut padded_payload = vec![0; 6];
+        padded_payload.extend([0, 0]);
+        let parsed = parse_port_data_check(&block_record(0x0200, (1, 0), &padded_payload)).unwrap();
+        assert!(parsed["checks"][0]["blocks"].as_array().unwrap().is_empty());
+
+        let mut aligned_payload = vec![0; 6];
+        aligned_payload.extend(block_record(0x020C, (1, 0), &[]));
+        aligned_payload.push(0);
+        let parsed =
+            parse_port_data_check(&block_record(0x0200, (1, 0), &aligned_payload)).unwrap();
+        assert_eq!(parsed["checks"][0]["blocks"][0]["blockType"], 0x020C);
+
+        let mut truncated_child_payload = vec![0; 6];
+        truncated_child_payload.extend([0x02, 0x0C, 0, 10, 1, 0]);
+        assert!(
+            parse_port_data_check(&block_record(0x0200, (1, 0), &truncated_child_payload))
+                .unwrap_err()
+                .contains("truncated child block")
+        );
+
+        let mut nonzero_padding = vec![0; 6];
+        nonzero_padding.extend([0xAA]);
+        assert!(
+            parse_port_data_check(&block_record(0x0200, (1, 0), &nonzero_padding))
+                .unwrap_err()
+                .contains("trailing bytes")
+        );
+    }
+
+    #[test]
+    fn port_check_rejects_unsupported_and_truncated_outer_blocks() {
+        let mut truncated = port_data_check_record();
+        truncated.pop();
+        for record in [truncated, block_record(0x0200, (1, 0), &[0; 5])] {
+            assert!(
+                parse_port_data_check(&record)
+                    .unwrap_err()
+                    .contains("record was truncated")
+            );
+        }
+        assert!(
+            parse_port_data_check(&block_record(0x0200, (1, 1), &[0; 6]))
+                .unwrap_err()
+                .contains("unsupported block")
+        );
+    }
+
+    #[test]
+    fn port_statistics_reads_version_one_status_and_rejects_trailing_data() {
+        let mut payload = 0x1234_u16.to_be_bytes().to_vec();
+        for value in 1_u32..=6 {
+            payload.extend(value.to_be_bytes());
+        }
+        let parsed = parse_port_statistics(&block_record(0x0251, (1, 1), &payload)).unwrap();
+        assert_eq!(parsed["statistics"][0]["counterStatus"], 0x1234);
+
+        let mut trailing = port_statistics_record();
+        trailing.push(0);
+        let length = u16::from_be_bytes(trailing[2..4].try_into().unwrap()) + 1;
+        trailing[2..4].copy_from_slice(&length.to_be_bytes());
+        assert!(
+            parse_port_statistics(&trailing)
+                .unwrap_err()
+                .contains("trailing bytes")
+        );
+        assert!(
+            parse_port_statistics(&block_record(0x0250, (1, 0), &[]))
+                .unwrap_err()
+                .contains("unsupported block")
+        );
+        trailing.truncate(8);
+        assert!(
+            parse_port_statistics(&trailing)
+                .unwrap_err()
+                .contains("record was truncated")
+        );
+    }
+
+    #[test]
     fn reads_device_health_and_bounded_port_records() {
         let scan = read_records(
             RESPONSE_TIMEOUT,
@@ -2522,27 +2717,97 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_after_diagnosis_stops_optional_port_reads() {
+        let cancelled = AtomicBool::new(false);
+        let scan = read_records(RESPONSE_TIMEOUT, &cancelled, |_, request, _, _| {
+            record_reply(request, |target| {
+                let record = if target.index == 0xF000 {
+                    identification_record_with_port()
+                } else {
+                    record_for_index(target.index)
+                };
+                if target.index == 0xF80C {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+                Ok(record)
+            })
+        })
+        .unwrap();
+
+        assert!(
+            scan.warnings
+                .iter()
+                .any(|warning| warning.contains("cancelled"))
+        );
+        assert!(
+            scan.records
+                .iter()
+                .all(|record| !matches!(record.target.index, 0x802A | 0x802B | 0x8072))
+        );
+    }
+
+    #[test]
     fn optional_record_failures_are_informational() {
-        let scan = read_records(
-            RESPONSE_TIMEOUT,
+        for failed_port_record in [PORT_DATA_INDEX, PORT_CHECK_INDEX] {
+            let scan = read_records(
+                RESPONSE_TIMEOUT,
+                &AtomicBool::new(false),
+                |_, request, _, _| {
+                    record_reply(request, |target| match target.index {
+                        0xF000 => Ok(identification_record_with_port()),
+                        index if index == DEVICE_DIAGNOSIS_INDEX || index == failed_port_record => {
+                            Err("unsupported record".into())
+                        }
+                        index => Ok(record_for_index(index)),
+                    })
+                },
+            )
+            .unwrap();
+            assert!(scan.warnings.is_empty());
+            assert_eq!(scan.info.len(), 2);
+            for index in [DEVICE_DIAGNOSIS_INDEX, failed_port_record] {
+                assert!(
+                    scan.info
+                        .iter()
+                        .any(|entry| entry.contains(&format!("0x{index:04X}")))
+                );
+            }
+            assert_eq!(
+                scan.records
+                    .iter()
+                    .any(|record| record.target.index == PORT_STATISTICS_INDEX),
+                failed_port_record == PORT_CHECK_INDEX
+            );
+        }
+    }
+
+    #[test]
+    fn device_enrichment_retains_records_and_scopes_advisories_to_target_ip() {
+        let ip = Ipv4Addr::new(192, 0, 2, 1);
+        let mut devices = [crate::contract::Device {
+            mac_address: "00:11:22:33:44:55".into(),
+            ip_addresses: vec![ip.to_string()],
+            ..Default::default()
+        }];
+        let diagnostics = super::super::read_device_records(
+            &mut devices,
+            &BTreeSet::from([ip]),
             &AtomicBool::new(false),
-            |_, request, _, _| {
-                record_reply(request, |target| {
-                    if target.index == 0xF000 {
-                        return Ok(identification_record_with_port());
-                    }
-                    if matches!(target.index, 0xF80C | 0x802A) {
-                        return Err("unsupported record".into());
-                    }
-                    Ok(record_for_index(target.index))
+            |_, _, _, request, _, _| {
+                record_reply(request, |target| match target.index {
+                    DEVICE_DIAGNOSIS_INDEX => Err("unsupported record".into()),
+                    index => Ok(record_for_index(index)),
                 })
             },
-        )
-        .unwrap();
-        assert!(scan.warnings.is_empty());
-        assert_eq!(scan.info.len(), 2);
-        assert!(scan.info.iter().any(|entry| entry.contains("0xF80C")));
-        assert!(scan.info.iter().any(|entry| entry.contains("0x802A")));
+        );
+
+        assert!(diagnostics.warnings.is_empty());
+        assert_eq!(diagnostics.info.len(), 1);
+        assert!(diagnostics.info[0].starts_with("192.0.2.1: "));
+        assert!(diagnostics.info[0].contains("0xF80C"));
+        let observation = &devices[0].observations[0];
+        assert_eq!(observation.ip_address.as_deref(), Some("192.0.2.1"));
+        assert_eq!(observation.fields["softwareRevision"], "V1.2.3");
     }
 
     fn record_reply(

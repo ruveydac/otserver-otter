@@ -29,10 +29,19 @@ pub fn scan(
         });
     }
     mac_bytes(local_mac).ok_or("LLDP requires the selected interface MAC")?;
+    Ok(collect_neighbors(local_mac, |on_frame| {
+        capture_passive(interface, CAPTURE_WINDOW, cancelled, on_frame)
+    }))
+}
+
+fn collect_neighbors(
+    local_mac: &str,
+    capture: impl FnOnce(&mut dyn FnMut(&[u8])) -> Result<(), String>,
+) -> CaptureResult {
     let mut neighbors = BTreeMap::new();
     let started = Instant::now();
     let mut limited = false;
-    let result = capture_passive(interface, CAPTURE_WINDOW, cancelled, |frame| {
+    let result = capture(&mut |frame| {
         limited |= !retain_frame(&mut neighbors, frame, local_mac, Instant::now());
     });
     let mut warnings = Vec::new();
@@ -50,11 +59,11 @@ pub fn scan(
         .into_values()
         .map(|(device, link, _)| (device, link))
         .unzip();
-    Ok(CaptureResult {
+    CaptureResult {
         devices,
         links,
         warnings,
-    })
+    }
 }
 
 fn expire(neighbors: &mut Neighbors, now: Instant) {
@@ -601,6 +610,23 @@ mod tests {
                 .warnings
                 .iter()
                 .all(|warning| !warning.contains("neighbor limit reached"))
+        );
+    }
+
+    #[test]
+    fn interrupted_capture_retains_neighbors_and_reports_the_error() {
+        let result = collect_neighbors("02:00:00:00:00:02", |on_frame| {
+            on_frame(&advertisement());
+            Err("capture interrupted".into())
+        });
+
+        assert_eq!(result.devices.len(), 1);
+        assert_eq!(result.links.len(), 1);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning == "Passive LLDP capture: capture interrupted")
         );
     }
 

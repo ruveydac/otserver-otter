@@ -1284,6 +1284,23 @@ pub async fn scan(
     logger: &dyn LogOutput,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<bool, String> {
+    scan_with_cdp_capture(
+        configuration,
+        options,
+        logger,
+        cancelled,
+        otserver_otter::cdp::scan,
+    )
+    .await
+}
+
+async fn scan_with_cdp_capture(
+    configuration: &str,
+    options: &ScanOptions,
+    logger: &dyn LogOutput,
+    cancelled: &Arc<AtomicBool>,
+    capture_cdp: fn(&str, &str, &AtomicBool) -> Result<otserver_otter::cdp::CaptureResult, String>,
+) -> Result<bool, String> {
     let started_at = otserver_otter::now();
     #[cfg(windows)]
     let npcap_active = options.protocols.profinet && profinet::npcap_available();
@@ -1353,7 +1370,7 @@ pub async fn scan(
         let mac = source_mac.clone();
         let cancellation = Arc::clone(cancelled);
         Some(tokio::task::spawn_blocking(move || {
-            otserver_otter::cdp::scan(&interface, &mac, &cancellation)
+            capture_cdp(&interface, &mac, &cancellation)
         }))
     } else {
         None
@@ -4354,6 +4371,24 @@ mod tests {
         }
     }
 
+    struct CancelAndResumeOnLog {
+        cancel_trigger: &'static str,
+        resume_trigger: &'static str,
+        cancelled: Arc<AtomicBool>,
+        messages: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl LogOutput for CancelAndResumeOnLog {
+        fn write(&self, message: String) {
+            if message.contains(self.cancel_trigger) {
+                self.cancelled.store(true, Ordering::Relaxed);
+            } else if message.contains(self.resume_trigger) {
+                self.cancelled.store(false, Ordering::Relaxed);
+            }
+            self.messages.lock().unwrap().push(message);
+        }
+    }
+
     fn local_scan_options(output: PathBuf) -> ScanOptions {
         let (interface, source_mac) = profinet::interfaces()
             .unwrap()
@@ -4439,6 +4474,65 @@ mod tests {
         }
         assert!(export.scan.partial);
         assert!(export.devices.is_empty());
+        tokio::fs::remove_file(output).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_scan_exports_cdp_capture_results() {
+        let output = std::env::temp_dir().join(format!("{}.json", Uuid::new_v4()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let logger = CancelOnLog {
+            trigger: "IP protocol targets:",
+            cancelled: Arc::clone(&cancelled),
+            messages: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut options = local_scan_options(output.clone());
+        options.protocols.cdp = true;
+
+        let capture_cdp = |_: &str, _: &str, _: &AtomicBool| {
+            Ok(otserver_otter::cdp::CaptureResult {
+                devices: Vec::new(),
+                links: Vec::new(),
+                warnings: vec!["Passive CDP observed the selected link for 0 ms.".into()],
+            })
+        };
+        assert!(
+            scan_with_cdp_capture("CDP cancel", &options, &logger, &cancelled, capture_cdp)
+                .await
+                .unwrap()
+        );
+        let export: ScanExport =
+            serde_json::from_slice(&tokio::fs::read(&output).await.unwrap()).unwrap();
+        assert!(export.scan.partial);
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(export.warnings.iter().any(|warning| {
+            warning.contains("[cdp-passive] INFO code=capture-window-complete")
+        }));
+        tokio::fs::remove_file(output).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pnio_record_path_runs_after_dcp_setup_is_cancelled() {
+        let output = std::env::temp_dir().join(format!("{}.json", Uuid::new_v4()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let logger = CancelAndResumeOnLog {
+            cancel_trigger: "Scanning PROFINET DCP;",
+            resume_trigger: "Unique devices after Layer 2 discovery:",
+            cancelled: Arc::clone(&cancelled),
+            messages: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut options = local_scan_options(output.clone());
+        options.protocols.profinet = true;
+        options.protocols.pn_epm = true;
+        options.allow_dcp_source = true;
+
+        scan("PNIO dispatch", &options, &logger, &cancelled)
+            .await
+            .unwrap();
+        assert!(logger.messages.lock().unwrap().iter().any(|message| {
+            message.contains("Reading PROFINET PNIO records for discovered MAC/IP pairs")
+        }));
+        assert!(!cancelled.load(Ordering::Relaxed));
         tokio::fs::remove_file(output).await.unwrap();
     }
 
@@ -5297,6 +5391,80 @@ mod tests {
             Some(Ok(("192.0.2.20".into(), attempts, Err(error)))),
         ));
         assert_eq!(warnings.len(), 3);
+    }
+
+    #[test]
+    fn cdp_mib_diagnostics_reflect_neighbor_completeness() {
+        let result = |cdp_complete, warnings| snmp::ResultData {
+            identity_mac: Some("00:11:22:33:44:55".into()),
+            observation: None,
+            interfaces: Vec::new(),
+            ports: Vec::new(),
+            links: Vec::new(),
+            warnings,
+            inventory_complete: true,
+            lldp_complete: true,
+            cdp_complete,
+        };
+        let selection = snmp::QuerySelection {
+            inventory: false,
+            lldp: false,
+            cdp: true,
+        };
+        let logger = DiagnosticLogger::default();
+        let mut devices = Vec::new();
+        let mut links = Vec::new();
+        let mut unresolved = Vec::new();
+        let mut warnings = Vec::new();
+
+        assert!(!apply_snmp_probe(
+            "Line A",
+            &mut devices,
+            &mut links,
+            &mut unresolved,
+            &mut warnings,
+            &logger,
+            selection,
+            Some(Ok((
+                "192.0.2.10".into(),
+                Vec::new(),
+                Ok(result(true, Vec::new())),
+            ))),
+        ));
+        assert!(apply_snmp_probe(
+            "Line A",
+            &mut devices,
+            &mut links,
+            &mut unresolved,
+            &mut warnings,
+            &logger,
+            selection,
+            Some(Ok((
+                "192.0.2.11".into(),
+                Vec::new(),
+                Ok(result(false, vec!["CDP neighbor table incomplete".into()])),
+            ))),
+        ));
+
+        let logs = logger.messages.lock().unwrap();
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("SUCCESS code=neighbor-inventory-complete"))
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("PARTIAL code=neighbor-inventory-partial"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("[cdp-snmp]"))
+        );
+        assert!(logger.diagnostics.lock().unwrap().contains(&(
+            "cdp-snmp".into(),
+            "PARTIAL".into(),
+            "neighbor-inventory-partial".into(),
+        )));
     }
 
     #[tokio::test]
