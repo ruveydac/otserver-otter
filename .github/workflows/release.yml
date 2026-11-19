@@ -6,7 +6,7 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   verify:
@@ -16,6 +16,10 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - name: Verify stable release tag on main
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          git merge-base --is-ancestor HEAD origin/main
       - run: rustup component add rustfmt clippy
       - run: cargo fmt -- --check
       - run: cargo check --locked
@@ -24,10 +28,7 @@ jobs:
       - run: ./lab/test.sh
 
   controller:
-    needs: verify
     uses: ./.github/workflows/controller.yml
-    with:
-      management_ref: ${{ vars.OTTER_MANAGEMENT_REF }}
 
   build-linux:
     needs: [verify, controller]
@@ -193,6 +194,8 @@ jobs:
 
   release:
     needs: verify-signed-binaries
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v5

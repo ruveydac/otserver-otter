@@ -546,9 +546,12 @@ Its `tests/int/otter-client.int.spec.ts` also accepts an existing build via `OTT
 runs the HTTPS lab, and runs the entire management integration suite with the real client enabled.
 It owns a disposable Docker/Podman MongoDB replica set and must never reuse operator database URLs.
 Reports live under `lab/artifacts/controller.*/` and record both source revisions plus the client
-binary digest. Remote-management CI, including Otter release/tag runs, defaults to OTserver `main`;
-`management_ref` or the `OTTER_MANAGEMENT_REF` repository variable overrides it. Release/tag runs
-require this exact-pair gate.
+binary digest. PRs, main and release tags use the management SHA committed in
+`.github/workflows/controller.yml`. Update the pin by PR. Manual paired runs accept an explicit
+40-character management SHA; only the weekly compatibility check follows management `main`.
+Release/tag runs require the baseline pair, and only stable tags on main's history can publish.
+Keep `contracts/scanner-config-fields.json` in sync with serialized `ScannerConfig` field names;
+the Rust roundtrip test checks the fixture and management checks profile/credential coverage.
 
 On Windows, the Fox TLS retry test requires a process context that can acquire Schannel outbound
 credentials. A restricted sandbox may return `SEC_E_NO_CREDENTIALS` before sending ClientHello;

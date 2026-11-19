@@ -108,8 +108,10 @@ export NODE_ENV=test
 
 # Run the whole management suite: UI controls, authorization, schedules, imports, workers,
 # migrations, and the real Rust REST client (which normally skips without OTTER_CLIENT_BIN).
+coverage=()
+if [[ ${OTTER_MANAGEMENT_COVERAGE:-0} == 1 ]]; then coverage=(--coverage); fi
 step management pnpm --dir "$MANAGEMENT" test:int \
-  --reporter=default --reporter=junit --outputFile.junit="$ARTIFACTS/management.junit.xml"
+  "${coverage[@]}" --reporter=default --reporter=junit --outputFile.junit="$ARTIFACTS/management.junit.xml"
 step management-report python3 -I - "$ARTIFACTS/management.junit.xml" <<'PY'
 import sys
 import xml.etree.ElementTree as ET

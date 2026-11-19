@@ -2962,8 +2962,11 @@ mod tests {
 
     #[test]
     fn serializes_and_deserializes_config_roundtrip() {
+        use otserver_otter::protocols::{OpcuaCredential, OpcuaCredentials};
+
+        // Populate every field: management checks these wire names against its profile fields.
         let config = ScannerConfig {
-            name: None,
+            name: Some("test".into()),
             targets: Some(vec!["192.168.1.0/24".into()]),
             interface: Some("eth0".into()),
             source_mac: Some("00:11:22:33:44:55".into()),
@@ -2973,15 +2976,15 @@ mod tests {
                 community: Some("lab-public".into()),
                 ..snmp::Settings::default()
             })),
-            no_protocols: None,
+            no_protocols: Some(false),
             no_arp: Some(true),
-            no_profinet: None,
-            disable_pn_epm: None,
-            allow_dcp_source: None,
+            no_profinet: Some(false),
+            disable_pn_epm: Some(false),
+            allow_dcp_source: Some(false),
             no_s7: Some(true),
-            no_enip: None,
+            no_enip: Some(false),
             no_bacnet: Some(true),
-            no_fins: None,
+            no_fins: Some(false),
             no_fox: Some(true),
             no_dnp3: Some(true),
             no_iec61850: Some(true),
@@ -2995,7 +2998,7 @@ mod tests {
             no_lldp: Some(true),
             no_cdp: Some(true),
             opcua_ports: Some(vec![4840, 4841]),
-            opcua_credentials: None,
+            opcua_credentials: Some(OpcuaCredentials::Single(OpcuaCredential::default())),
             opcua_username: Some("opc-user".into()),
             opcua_password: Some("opc-password".into()),
             ads_source_net_id: Some("10.0.0.1.1.1".into()),
@@ -3008,6 +3011,12 @@ mod tests {
             site: Some("site-1".into()),
             api_key: Some("key-123".into()),
         };
+        let wire = serde_json::to_value(&config).unwrap();
+        let mut names: Vec<_> = wire.as_object().unwrap().keys().cloned().collect();
+        names.sort_unstable();
+        let expected: Vec<String> =
+            serde_json::from_str(include_str!("../contracts/scanner-config-fields.json")).unwrap();
+        assert_eq!(names, expected);
         let configs = ScannerConfigs::Single(Box::new(config));
         let bytes = serde_json::to_vec_pretty(&configs).unwrap();
         let parsed = parse_config(&bytes).unwrap();

@@ -4,16 +4,18 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: '23 5 * * 1'
   workflow_dispatch:
     inputs:
       management_ref:
-        description: 'OTserver branch, tag, or SHA (defaults to OTTER_MANAGEMENT_REF, then main)'
+        description: 'Full management commit SHA for a paired change (defaults to the tested baseline)'
         type: string
         required: false
   workflow_call:
     inputs:
       management_ref:
-        description: 'OTserver branch, tag, or SHA (defaults to OTTER_MANAGEMENT_REF, then main)'
+        description: 'Full management commit SHA (defaults to the tested baseline)'
         type: string
         required: false
 
@@ -27,8 +29,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      MANAGEMENT_REF: ${{ inputs.management_ref || vars.OTTER_MANAGEMENT_REF || 'main' }}
+      MANAGEMENT_REF: ${{ github.event_name == 'schedule' && 'main' || inputs.management_ref || '5474ae11cc22b20fbc020594cd913d8f3e6cc272' }}
     steps:
+      - name: Require a reproducible management revision
+        if: github.event_name != 'schedule'
+        run: '[[ "$MANAGEMENT_REF" =~ ^[0-9a-f]{40}$ ]]'
       - name: Checkout OTserver management
         uses: actions/checkout@v6
         with:

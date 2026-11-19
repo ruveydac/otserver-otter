@@ -1,0 +1,20 @@
+{
+  "name": "Required CI",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": { "ref_name": { "include": ["refs/heads/main"], "exclude": [] } },
+  "rules": [
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": true,
+        "required_status_checks": [
+          { "context": "Otter", "integration_id": 15368 },
+          { "context": "Otter Windows", "integration_id": 15368 },
+          { "context": "Otter lab", "integration_id": 15368 },
+          { "context": "Full remote management", "integration_id": 15368 }
+        ]
+      }
+    }
+  ]
+}
