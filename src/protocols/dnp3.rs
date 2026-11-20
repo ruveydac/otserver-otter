@@ -1059,6 +1059,151 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reassembly_rejects_invalid_continuations_and_oversized_fragments() {
+        let mut segment = None;
+        let mut fragment = None;
+        assert!(
+            reassemble(&mut segment, &mut fragment, &[])
+                .unwrap_err()
+                .contains("empty DNP3 user data")
+        );
+        assert!(
+            reassemble(&mut segment, &mut fragment, &[TL_FIN | TL_FIR])
+                .unwrap_err()
+                .contains("empty DNP3 application fragment")
+        );
+
+        let mut segment = None;
+        let mut fragment = None;
+        assert!(
+            reassemble(
+                &mut segment,
+                &mut fragment,
+                &[TL_FIN | TL_FIR, 0x01, RESPONSE, 0, 0]
+            )
+            .unwrap_err()
+            .contains("continuation without a first frame")
+        );
+
+        for continuation in [
+            vec![TL_FIN | TL_FIR | 1, 0x01, UNSOLICITED, 0, 0],
+            vec![TL_FIN | TL_FIR | 1, 0x01, RESPONSE],
+        ] {
+            let mut segment = None;
+            let mut fragment = None;
+            assert!(
+                reassemble(
+                    &mut segment,
+                    &mut fragment,
+                    &[TL_FIN | TL_FIR, AL_FIR, RESPONSE, 0, 0]
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert!(
+                reassemble(&mut segment, &mut fragment, &continuation)
+                    .unwrap_err()
+                    .contains("mismatched DNP3 application fragment")
+            );
+        }
+
+        let mut segment = None;
+        let mut fragment = Some(vec![RESPONSE; 65_535]);
+        assert!(
+            reassemble(
+                &mut segment,
+                &mut fragment,
+                &[TL_FIN | TL_FIR, 0x01, RESPONSE, 0, 0, 1]
+            )
+            .unwrap_err()
+            .contains("oversized DNP3 response")
+        );
+
+        let mut buffer = None;
+        assert!(fold(&mut buffer, false, &[1]).is_err());
+        let mut buffer = Some(vec![1]);
+        assert!(fold(&mut buffer, true, &[2]).is_err());
+        let mut buffer = Some(vec![0; 65_535]);
+        assert!(fold(&mut buffer, false, &[1]).is_err());
+    }
+
+    #[test]
+    fn range_and_attribute_bounds_reject_truncation() {
+        assert_eq!(range(0, 1, &[0, 0, 0]), None);
+        assert_eq!(range(0, 1, &[2, 0, 1, 0]), None);
+        assert_eq!(range(0, 0, &[]), None);
+        assert_eq!(range(1, 0, &[0, 0]), None);
+        assert_eq!(range(0, 0x10, &[0, 0]), None);
+
+        assert_eq!(attribute_end(&[1, 3, b'S', b'N', b'1'], 0), Some(5));
+        assert_eq!(attribute_end(&[1, 3, b'S'], 0), None);
+        let mut extended = vec![255, 0];
+        extended.extend([b'X'; 256]);
+        assert_eq!(attribute_end(&extended, 0), Some(258));
+        assert_eq!(attribute_end(&[255, 2, b'X'], 0), None);
+    }
+
+    #[test]
+    fn rejects_application_continuations_after_a_short_first_fragment() {
+        let mut segment = None;
+        let mut fragment = None;
+        assert!(
+            reassemble(
+                &mut segment,
+                &mut fragment,
+                &[TL_FIN | TL_FIR, AL_FIR, RESPONSE, 0]
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            reassemble(
+                &mut segment,
+                &mut fragment,
+                &[TL_FIN | TL_FIR | 1, AL_FIN | 1, RESPONSE, 0, 1]
+            )
+            .unwrap_err()
+            .contains("mismatched DNP3 application fragment")
+        );
+    }
+
+    #[tokio::test]
+    async fn ignores_connections_without_link_replies_and_rejects_mixed_sequences() {
+        assert!(!exchanges(&[]).await.unwrap().link);
+
+        assert!(
+            exchanges(&[
+                frame(
+                    USER_DATA,
+                    MASTER,
+                    OUTSTATION,
+                    &[TL_FIR, AL_FIR, RESPONSE, 0, 0]
+                ),
+                frame(
+                    USER_DATA,
+                    1024,
+                    1,
+                    &[TL_FIN | TL_FIR, AL_FIR | AL_FIN, RESPONSE, 0, 0]
+                ),
+            ])
+            .await
+            .unwrap_err()
+            .contains("mixed DNP3 address pairs")
+        );
+        assert!(
+            exchanges(&[frame(
+                USER_DATA,
+                MASTER,
+                OUTSTATION,
+                &[TL_FIN | TL_FIR, AL_FIR | AL_FIN | 1, RESPONSE, 0, 0]
+            )])
+            .await
+            .unwrap_err()
+            .contains("mismatched DNP3 application sequence")
+        );
+    }
+
     #[tokio::test]
     async fn keeps_reading_after_link_replies_and_unsolicited_reports() {
         let pdu = identity_pdu();
@@ -1107,6 +1252,61 @@ mod tests {
         assert_eq!(finding.raw["response"], json!(hex(&pdu)));
         assert!(finding.warnings.is_empty());
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ignores_an_endpoint_that_closes_before_its_first_link_reply() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, PORT))
+            .await
+            .unwrap();
+        let (result, ()) = timeout(TIMEOUT * 3, async {
+            tokio::join!(probe(Ipv4Addr::LOCALHOST), async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                // Drain the request so closing the socket produces EOF rather than a reset.
+                stream
+                    .read_exact(&mut vec![0; request().len()])
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+            })
+        })
+        .await
+        .expect("DNP3 early-close exchange timed out");
+
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn uses_product_name_when_device_name_is_not_a_string() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, PORT))
+            .await
+            .unwrap();
+        let mut pdu = identity_pdu();
+        pdu.splice(8..20, [2, 1, 1]);
+        let responder = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            outstation(stream, OUTSTATION, vec![reply_frame(&pdu)]).await;
+        });
+
+        let finding = probe(Ipv4Addr::LOCALHOST).await.unwrap().unwrap();
+
+        assert_eq!(finding.raw["deviceName"], 1);
+        assert_eq!(finding.fields["model"], "FB3000");
+        assert_eq!(finding.fields["name"], "FB3000");
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ignores_a_connection_refused_before_dnp3_exchange() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, PORT))
+            .await
+            .unwrap();
+        drop(listener);
+
+        assert!(probe(Ipv4Addr::LOCALHOST).await.unwrap().is_none());
     }
 
     #[tokio::test]

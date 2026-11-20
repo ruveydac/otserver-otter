@@ -247,6 +247,26 @@ mod tests {
     }
 
     #[test]
+    fn keeps_the_first_active_workstation_server_and_workgroup_names() {
+        let finding = parse(
+            &response(&[
+                ("WORKSTATION-A", 0x00, 0x0400),
+                ("WORKSTATION-B", 0x00, 0x0400),
+                ("SERVER-A", 0x20, 0x0400),
+                ("SERVER-B", 0x20, 0x0400),
+                ("GROUP-A", 0x00, 0x8400),
+                ("GROUP-B", 0x00, 0x8400),
+            ]),
+            [0x12, 0x34],
+        )
+        .unwrap();
+
+        assert_eq!(finding.fields["name"], "WORKSTATION-A");
+        assert_eq!(finding.raw["workgroup"], "GROUP-A");
+        assert_eq!(finding.raw["names"].as_array().unwrap().len(), 6);
+    }
+
+    #[test]
     fn accepts_echoed_question_and_compressed_answer_name() {
         let bytes = response(&[("PLC", 0, 0x0400)]);
         let mut compressed = bytes[..12].to_vec();
@@ -281,6 +301,40 @@ mod tests {
         assert!(parse(&extra, [0x12, 0x34]).is_err());
         extra.resize(MAX_RESPONSE + 1, 0);
         assert!(parse(&extra, [0x12, 0x34]).is_err());
+    }
+
+    #[test]
+    fn rejects_each_invalid_node_status_table_length() {
+        let valid = response(&[]);
+
+        let mut mismatched_record_length = valid.clone();
+        mismatched_record_length[54..56].copy_from_slice(&46_u16.to_be_bytes());
+        assert!(
+            parse(&mismatched_record_length, [0x12, 0x34])
+                .err()
+                .unwrap()
+                .contains("name table or statistics length")
+        );
+
+        let mut empty_data = valid.clone();
+        empty_data.truncate(56);
+        empty_data[54..56].copy_from_slice(&0_u16.to_be_bytes());
+        assert!(
+            parse(&empty_data, [0x12, 0x34])
+                .err()
+                .unwrap()
+                .contains("name table or statistics length")
+        );
+
+        let mut malformed_statistics = valid;
+        malformed_statistics.truncate(56 + 46);
+        malformed_statistics[54..56].copy_from_slice(&46_u16.to_be_bytes());
+        assert!(
+            parse(&malformed_statistics, [0x12, 0x34])
+                .err()
+                .unwrap()
+                .contains("name table or statistics length")
+        );
     }
 
     #[test]

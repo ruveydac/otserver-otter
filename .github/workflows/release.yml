@@ -24,6 +24,7 @@ jobs:
       - run: cargo fmt -- --check
       - run: cargo check --locked
       - run: cargo test --locked
+        timeout-minutes: 15
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: ./lab/test.sh
 
@@ -75,6 +76,7 @@ jobs:
         with:
           fetch-depth: 0
       - run: cargo test --locked
+        timeout-minutes: 15
       - run: cargo build --locked --release
       - run: .\target\release\otserver-otter.exe --version
       - uses: actions/upload-artifact@v7

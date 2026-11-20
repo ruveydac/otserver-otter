@@ -406,6 +406,7 @@ pub async fn probe(
             ams_port,
             READ_DEVICE_INFO,
             cancelled,
+            crate::traffic::wait(),
         )
         .await
         {
@@ -500,6 +501,7 @@ pub async fn probe(
             ams_port,
             READ_STATE,
             cancelled,
+            crate::traffic::wait(),
         )
         .await
         {
@@ -804,6 +806,7 @@ async fn request(
     target_port: u16,
     command: u16,
     cancelled: &AtomicBool,
+    wait_for_pacing: impl Future<Output = ()>,
 ) -> Result<AdsReply, String> {
     if cancelled.load(Ordering::Relaxed) {
         return Err("cancelled".into());
@@ -825,7 +828,7 @@ async fn request(
     frame.extend_from_slice(&[0, 0]);
     frame.extend_from_slice(&(AMS_HEADER_LENGTH as u32).to_le_bytes());
     frame.extend_from_slice(&header.encode());
-    crate::traffic::wait().await;
+    wait_for_pacing.await;
     if cancelled.load(Ordering::Relaxed) {
         return Err("cancelled".into());
     }
@@ -894,6 +897,7 @@ fn validate_response(request: &AmsHeader, response: &AmsHeader) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tokio::net::TcpListener;
 
     fn server_info_response(net_id: [u8; 6]) -> Vec<u8> {
@@ -1133,6 +1137,280 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn response_correlation_rejects_each_mismatched_header_field() {
+        let request = AmsHeader {
+            target_net_id: [1, 2, 3, 4, 1, 1],
+            target_port: 851,
+            source_net_id: [192, 0, 2, 10, 1, 1],
+            source_port: 32_768,
+            command: READ_DEVICE_INFO,
+            state_flags: AMS_REQUEST,
+            data_length: 0,
+            error_code: 0,
+            invoke_id: 1,
+        };
+        let response = AmsHeader {
+            target_net_id: request.source_net_id,
+            target_port: request.source_port,
+            source_net_id: request.target_net_id,
+            source_port: request.target_port,
+            state_flags: AMS_RESPONSE,
+            ..request
+        };
+
+        for response in [
+            AmsHeader {
+                target_net_id: [0; 6],
+                ..response
+            },
+            AmsHeader {
+                target_port: 1,
+                ..response
+            },
+            AmsHeader {
+                source_net_id: [0; 6],
+                ..response
+            },
+            AmsHeader {
+                source_port: 1,
+                ..response
+            },
+            AmsHeader {
+                command: READ_STATE,
+                ..response
+            },
+            AmsHeader {
+                state_flags: AMS_REQUEST,
+                ..response
+            },
+            AmsHeader {
+                invoke_id: 2,
+                ..response
+            },
+        ] {
+            assert!(validate_response(&request, &response).is_err());
+        }
+    }
+
+    #[test]
+    fn cancellation_marks_only_pending_endpoint_operations() {
+        let mut finding = new_finding([10, 0, 0, 1, 1, 1], json!({"outcome": "configured"}));
+        finding.raw["endpoints"] = json!([
+            {
+                "amsPort": 851,
+                "deviceInfo": {"outcome": "pending"},
+                "readState": {"outcome": "not-attempted"}
+            },
+            {
+                "amsPort": 801,
+                "deviceInfo": {"outcome": "success"},
+                "readState": {"outcome": "success"}
+            }
+        ]);
+
+        mark_cancelled(&mut finding);
+
+        assert_eq!(
+            finding.raw["endpoints"][0]["deviceInfo"]["outcome"],
+            "cancelled"
+        );
+        assert_eq!(
+            finding.raw["endpoints"][0]["readState"]["outcome"],
+            "cancelled"
+        );
+        assert_eq!(
+            finding.raw["endpoints"][1]["deviceInfo"]["outcome"],
+            "success"
+        );
+        assert_eq!(
+            finding.raw["endpoints"][1]["readState"]["outcome"],
+            "success"
+        );
+        assert_eq!(finding.raw["collectionStatus"], "cancelled");
+    }
+
+    #[test]
+    fn runtime_fields_are_scoped_to_plc_ams_ports() {
+        let info = DeviceInfo::decode(&info_response_data()).unwrap();
+        let mut finding = new_finding([10, 0, 0, 1, 1, 1], json!({}));
+
+        add_device_info_raw(&mut finding, 10_000, &info);
+        assert!(finding.raw.get("runtimeCandidates").is_none());
+        add_device_info_raw(&mut finding, 851, &info);
+        add_device_info_raw(&mut finding, 801, &info);
+
+        assert_eq!(
+            finding.raw["runtimeCandidates"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(finding.raw["runtimePrimaryAmsPort"], 851);
+        assert_eq!(finding.fields["runtimeName"], "TwinCAT PLC 1");
+        assert_eq!(finding.fields["runtimeVersion"], "3.1.4021");
+    }
+
+    #[tokio::test]
+    async fn probe_keeps_cancellation_during_device_info_without_warning() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, ADS_TCP_PORT))
+            .await
+            .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let server_cancelled = cancelled.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0; 6];
+            stream.read_exact(&mut prefix).await.unwrap();
+            let mut body = vec![0; u32::from_le_bytes(prefix[2..].try_into().unwrap()) as usize];
+            stream.read_exact(&mut body).await.unwrap();
+            let request = AmsHeader::decode(&body[..AMS_HEADER_LENGTH]).unwrap();
+            assert_eq!(request.command, READ_DEVICE_INFO);
+            server_cancelled.store(true, Ordering::Relaxed);
+        });
+        let target = Ipv4Addr::LOCALHOST;
+        let settings = ProbeSettings {
+            target_net_ids: BTreeMap::from([(target, [10, 0, 0, 1, 1, 1])]),
+            source_net_id: Some([192, 0, 2, 10, 1, 1]),
+            ams_ports: vec![851],
+        };
+
+        let finding = probe(target, &settings, &cancelled, |_| {})
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(finding.raw["sourceNetIdOrigin"], "configured");
+        assert_eq!(
+            finding.raw["endpoints"][0]["deviceInfo"]["outcome"],
+            "error"
+        );
+        assert_eq!(
+            finding.raw["endpoints"][0]["readState"]["outcome"],
+            "cancelled"
+        );
+        assert_eq!(finding.raw["collectionStatus"], "cancelled");
+        assert!(
+            finding
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("ReadDeviceInfo exchange failed"))
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_marks_read_state_cancelled_when_connection_closes_after_cancellation() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, ADS_TCP_PORT))
+            .await
+            .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let server_cancelled = cancelled.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for command in [READ_DEVICE_INFO, READ_STATE] {
+                let mut prefix = [0; 6];
+                stream.read_exact(&mut prefix).await.unwrap();
+                let mut body =
+                    vec![0; u32::from_le_bytes(prefix[2..].try_into().unwrap()) as usize];
+                stream.read_exact(&mut body).await.unwrap();
+                let request = AmsHeader::decode(&body[..AMS_HEADER_LENGTH]).unwrap();
+                assert_eq!(request.command, command);
+                if command == READ_STATE {
+                    server_cancelled.store(true, Ordering::Relaxed);
+                    return;
+                }
+                stream.write_all(&info_response(request)).await.unwrap();
+            }
+        });
+        let target = Ipv4Addr::LOCALHOST;
+        let settings = ProbeSettings {
+            target_net_ids: BTreeMap::from([(target, [10, 0, 0, 1, 1, 1])]),
+            ams_ports: vec![851],
+            ..ProbeSettings::default()
+        };
+
+        let finding = probe(target, &settings, &cancelled, |_| {})
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            finding.raw["endpoints"][0]["deviceInfo"]["outcome"],
+            "success"
+        );
+        assert_eq!(
+            finding.raw["endpoints"][0]["readState"]["outcome"],
+            "cancelled"
+        );
+        assert_eq!(finding.raw["collectionStatus"], "cancelled");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_does_not_send_after_cancellation() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+        });
+        let mut stream = TcpStream::connect(address).await.unwrap();
+
+        assert!(matches!(
+            request(
+                &mut stream,
+                [10, 0, 0, 1, 1, 1],
+                [192, 0, 2, 10, 1, 1],
+                851,
+                READ_DEVICE_INFO,
+                &AtomicBool::new(true),
+                crate::traffic::wait(),
+            )
+            .await,
+            Err(error) if error.contains("cancelled")
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_stops_after_cancellation_during_traffic_wait() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (mut stream, (mut peer, _)) = timeout(IO_TIMEOUT, async {
+            tokio::try_join!(TcpStream::connect(address), listener.accept())
+        })
+        .await
+        .expect("ADS loopback connection timed out")
+        .unwrap();
+        let cancelled = AtomicBool::new(false);
+
+        let result = timeout(
+            IO_TIMEOUT,
+            request(
+                &mut stream,
+                [10, 0, 0, 1, 1, 1],
+                [192, 0, 2, 10, 1, 1],
+                851,
+                READ_DEVICE_INFO,
+                &cancelled,
+                async {
+                    tokio::task::yield_now().await;
+                    cancelled.store(true, Ordering::Relaxed);
+                },
+            ),
+        )
+        .await
+        .expect("ADS request did not stop after cancellation");
+        assert_eq!(result.err().as_deref(), Some("cancelled"));
+
+        drop(stream);
+        let bytes = timeout(IO_TIMEOUT, peer.read(&mut [0]))
+            .await
+            .expect("ADS peer did not receive EOF")
+            .unwrap();
+        assert_eq!(bytes, 0, "ADS sent data after cancellation");
     }
 
     #[tokio::test]
@@ -1450,5 +1728,191 @@ mod tests {
             .await
             .contains("lengths disagree")
         );
+    }
+
+    #[test]
+    fn rejects_non_decimal_netids_and_short_ams_headers() {
+        assert!(
+            ProbeSettings::from_config(Some("1.a.3.4.5.6"), &BTreeMap::new(), &[])
+                .unwrap_err()
+                .contains("decimal octets")
+        );
+        assert!(AmsHeader::decode(&[0; AMS_HEADER_LENGTH - 1]).is_err());
+        assert!(parse_server_info_response(&[0; 23]).is_err());
+    }
+
+    #[test]
+    fn runtime_version_is_retained_when_device_name_is_empty() {
+        let mut data = info_response_data();
+        data[8..].fill(b' ');
+        let info = DeviceInfo::decode(&data).unwrap();
+        let mut finding = new_finding([10, 0, 0, 1, 1, 1], json!({}));
+
+        add_device_info_raw(&mut finding, 851, &info);
+
+        assert!(!finding.fields.contains_key("runtimeName"));
+        assert_eq!(finding.fields["runtimeVersion"], "3.1.4021");
+        assert_eq!(finding.raw["runtimePrimaryAmsPort"], 851);
+    }
+
+    #[test]
+    fn endpoint_helpers_tolerate_missing_or_unmatched_entries() {
+        let mut finding = new_finding([10, 0, 0, 1, 1, 1], json!({}));
+        replace_endpoint(&mut finding, 851, json!({"amsPort": 801}));
+        assert!(finding.raw["endpoints"].as_array().unwrap().is_empty());
+
+        finding.raw["endpoints"] = Value::Null;
+        replace_endpoint(&mut finding, 851, json!({"amsPort": 851}));
+        mark_cancelled(&mut finding);
+        assert_eq!(finding.raw["collectionStatus"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn discovery_stops_before_sending_when_cancelled() {
+        assert!(
+            discover(Ipv4Addr::LOCALHOST, &AtomicBool::new(true))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_stops_before_the_first_ams_endpoint_when_cancelled() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, ADS_TCP_PORT))
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut byte = [0];
+            assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+        });
+        let target = Ipv4Addr::LOCALHOST;
+        let settings = ProbeSettings {
+            source_net_id: Some([192, 0, 2, 10, 1, 1]),
+            target_net_ids: BTreeMap::from([(target, [10, 0, 0, 1, 1, 1])]),
+            ams_ports: vec![851],
+        };
+        let cancelled = AtomicBool::new(false);
+        let mut checkpoints = 0;
+
+        let finding = probe(target, &settings, &cancelled, |_| {
+            checkpoints += 1;
+            if checkpoints == 2 {
+                cancelled.store(true, Ordering::Relaxed);
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(checkpoints, 3);
+        assert_eq!(finding.raw["collectionStatus"], "cancelled");
+        assert!(finding.raw["endpoints"].as_array().unwrap().is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_stops_after_a_device_info_transport_failure() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, ADS_TCP_PORT))
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0; 6];
+            stream.read_exact(&mut prefix).await.unwrap();
+            let mut body = vec![0; u32::from_le_bytes(prefix[2..].try_into().unwrap()) as usize];
+            stream.read_exact(&mut body).await.unwrap();
+            assert_eq!(
+                AmsHeader::decode(&body[..AMS_HEADER_LENGTH])
+                    .unwrap()
+                    .command,
+                READ_DEVICE_INFO
+            );
+        });
+        let target = Ipv4Addr::LOCALHOST;
+        let settings = ProbeSettings {
+            target_net_ids: BTreeMap::from([(target, [10, 0, 0, 1, 1, 1])]),
+            ams_ports: vec![851],
+            ..ProbeSettings::default()
+        };
+
+        let finding = probe(target, &settings, &AtomicBool::new(false), |_| {})
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            finding.raw["endpoints"][0]["deviceInfo"]["outcome"],
+            "error"
+        );
+        assert_eq!(
+            finding.raw["endpoints"][0]["readState"]["outcome"],
+            "not-attempted"
+        );
+        assert_eq!(finding.raw["collectionStatus"], "transport-error");
+        assert!(
+            finding
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("ReadDeviceInfo exchange failed"))
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_retains_read_state_ams_errors() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, ADS_TCP_PORT))
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for command in [READ_DEVICE_INFO, READ_STATE] {
+                let mut prefix = [0; 6];
+                stream.read_exact(&mut prefix).await.unwrap();
+                let mut body =
+                    vec![0; u32::from_le_bytes(prefix[2..].try_into().unwrap()) as usize];
+                stream.read_exact(&mut body).await.unwrap();
+                let request = AmsHeader::decode(&body[..AMS_HEADER_LENGTH]).unwrap();
+                assert_eq!(request.command, command);
+                let response = if command == READ_DEVICE_INFO {
+                    info_response(request)
+                } else {
+                    let header = AmsHeader {
+                        target_net_id: request.source_net_id,
+                        target_port: request.source_port,
+                        source_net_id: request.target_net_id,
+                        source_port: request.target_port,
+                        state_flags: AMS_RESPONSE,
+                        error_code: 0x1234,
+                        ..request
+                    };
+                    tcp_frame(header, &[])
+                };
+                stream.write_all(&response).await.unwrap();
+            }
+        });
+        let target = Ipv4Addr::LOCALHOST;
+        let settings = ProbeSettings {
+            target_net_ids: BTreeMap::from([(target, [10, 0, 0, 1, 1, 1])]),
+            ams_ports: vec![851],
+            ..ProbeSettings::default()
+        };
+
+        let finding = probe(target, &settings, &AtomicBool::new(false), |_| {})
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            finding.raw["endpoints"][0]["readState"]["outcome"],
+            "ams-error"
+        );
+        assert_eq!(finding.raw["endpoints"][0]["readState"]["code"], 0x1234);
+        assert_eq!(finding.raw["collectionStatus"], "complete");
+        server.await.unwrap();
     }
 }

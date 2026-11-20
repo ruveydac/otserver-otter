@@ -216,6 +216,12 @@ mod tests {
         assert_eq!(values["os.name"], "Windows");
     }
 
+    #[test]
+    fn rejects_non_hello_prefixes_and_missing_response_bodies() {
+        assert!(parse("fox a 1\n{\nhostName=s:station-1\n};;").is_none());
+        assert!(parse("fox a 0\nhostName=s:station-1\n};;").is_none());
+    }
+
     #[tokio::test]
     async fn reads_fragmented_fox_response() {
         let (mut client, mut server) = tokio::io::duplex(256);
@@ -291,6 +297,13 @@ mod tests {
                 .is_none()
         );
         assert!(super::finding(Ipv4Addr::LOCALHOST, vec![(1911, Err("failed".into()))]).is_err());
+        assert!(matches!(
+            super::finding(
+                Ipv4Addr::LOCALHOST,
+                vec![(1911, Ok(Some(("not a Fox reply".into(), false))))],
+            ),
+            Err(error) if error.contains("valid Fox hello reply")
+        ));
     }
 
     #[tokio::test]
@@ -315,11 +328,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completes_tls_fallback_and_reads_the_fox_reply() {
+        let identity =
+            native_tls::Identity::from_pkcs12(include_bytes!("fixtures/https-identity.p12"), "")
+                .unwrap();
+        let acceptor =
+            tokio_native_tls::TlsAcceptor::from(native_tls::TlsAcceptor::new(identity).unwrap());
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let responder = tokio::spawn(async move {
+            let (mut plain, _) = listener.accept().await.unwrap();
+            let mut hello = [0; HELLO.len()];
+            plain.read_exact(&mut hello).await.unwrap();
+            assert_eq!(hello, HELLO);
+            plain.write_all(b"not a Fox response\n};;\n").await.unwrap();
+            drop(plain);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(stream).await.unwrap();
+            let mut hello = [0; HELLO.len()];
+            stream.read_exact(&mut hello).await.unwrap();
+            assert_eq!(hello, HELLO);
+            stream
+                .write_all(b"fox a 0\n{\nhostName=s:secure-plc\n};;\n")
+                .await
+                .unwrap();
+        });
+
+        let result = exchange(Ipv4Addr::LOCALHOST, port).await.unwrap();
+
+        assert_eq!(
+            result,
+            Some(("fox a 0\n{\nhostName=s:secure-plc\n};;\n".into(), true))
+        );
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn rejects_incomplete_and_oversized_responses() {
         let (mut client, mut server) = tokio::io::duplex(128);
         tokio::spawn(async move {
             let mut hello = vec![0; HELLO.len()];
             server.read_exact(&mut hello).await.unwrap();
+            server.write_all(b"fox a 0\n{").await.unwrap();
         });
         assert!(
             request(&mut client)

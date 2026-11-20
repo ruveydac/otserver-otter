@@ -522,6 +522,9 @@ Any failed stage fails the gate; preserve stage logs, MongoDB logs, and manageme
 
 ## Checks
 
+CI and release workflows limit each `cargo test --locked` step to 15 minutes so a stalled test
+fails without consuming the entire job budget.
+
 ```bash
 cargo fmt -- --check
 python3 -B databases/test_generate_database.py

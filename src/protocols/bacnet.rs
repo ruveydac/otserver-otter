@@ -464,6 +464,62 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_bvlc_headers_and_truncated_network_routes() {
+        let valid = [0x81, 0x0a, 0, 9, 1, 0, 0x30, 1, 0x0c];
+        assert!(apdu(&valid[..8]).is_none());
+        for (index, value) in [(0, 0x82), (1, 0x08), (4, 2), (5, 0x80)] {
+            let mut packet = valid;
+            packet[index] = value;
+            assert!(apdu(&packet).is_none(), "header byte {index}");
+        }
+        let mut bad_length = valid;
+        bad_length[2] = 8;
+        assert!(apdu(&bad_length).is_none());
+
+        let truncated_route = [0x81, 0x0a, 0, 10, 1, 0x28, 0, 0, 0, 0];
+        assert!(apdu(&truncated_route).is_none());
+        let valid_route = [0x81, 0x0a, 0, 11, 1, 0x20, 0, 0, 0, 0, 0x30];
+        assert_eq!(apdu(&valid_route), Some(&[0x30][..]));
+    }
+
+    #[test]
+    fn decodes_extended_property_ids_and_array_index_tags() {
+        let extended = response(0x101, 1, false);
+        assert_eq!(decode(&extended, 0x101, 1), Some(json!("PLC")));
+
+        let mut array_index = response(0x4b, 1, true);
+        array_index.insert(16, 0x20);
+        let length = array_index.len() as u16;
+        array_index[2..4].copy_from_slice(&length.to_be_bytes());
+        assert_eq!(decode(&array_index, 0x4b, 1), Some(json!(42)));
+
+        let mut real = response(120, 1, false);
+        real.truncate(17);
+        real.extend([0x94, 0, 0, 0, 1, 0x3f]);
+        let length = real.len() as u16;
+        real[2..4].copy_from_slice(&length.to_be_bytes());
+        assert!(decode(&real, 120, 1).is_some());
+    }
+
+    #[test]
+    fn rejects_mismatched_ack_service_and_object_tags() {
+        let valid = response(0x4d, 3, false);
+        for (index, value) in [
+            (6, 0x38),
+            (7, 4),
+            (8, 0x0d),
+            (9, 0x19),
+            (10, 0),
+            (14, 0x09),
+            (14, 0x29),
+        ] {
+            let mut malformed = valid.clone();
+            malformed[index] = value;
+            assert!(decode(&malformed, 0x4d, 3).is_none(), "byte {index}");
+        }
+    }
+
+    #[test]
     fn preserves_bacnet_error_reject_and_abort_reasons() {
         let mut error = vec![0x81, 0x0a, 0, 13, 1, 4, 0x50, 7, 0x0c, 0x91, 2, 0x91, 5];
         assert_eq!(
@@ -603,6 +659,63 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_object_value_and_closing_tags() {
+        let valid = response(0x4d, 3, false);
+        for (index, value) in [
+            (9, 0x04),
+            (9, 0x1c),
+            (9, 0x0d),
+            (14, 0x09),
+            (14, 0x29),
+            (15, 0x4c),
+            (16, 0x2e),
+            (16, 0x4e),
+            (16, 0x3f),
+            (17, 0x7d),
+            (17, 0x7e),
+            (17, 0x7f),
+            (23, 0x2f),
+            (23, 0x4f),
+            (23, 0x3e),
+        ] {
+            let mut malformed = valid.clone();
+            malformed[index] = value;
+            assert!(
+                decode(&malformed, 0x4d, 3).is_none(),
+                "byte {index} = {value:#04x}"
+            );
+        }
+
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        let length = trailing.len() as u16;
+        trailing[2..4].copy_from_slice(&length.to_be_bytes());
+        assert!(decode(&trailing, 0x4d, 3).is_none());
+
+        let mut wrong_type = valid.clone();
+        wrong_type.truncate(17);
+        wrong_type.extend([0x21, 42, 0x3f]);
+        let length = wrong_type.len() as u16;
+        wrong_type[2..4].copy_from_slice(&length.to_be_bytes());
+        assert!(decode(&wrong_type, 0x4d, 3).is_none());
+
+        let mut wrong_object_type = response(0x4b, 3, true);
+        wrong_object_type[18] = 0;
+        assert!(decode(&wrong_object_type, 0x4b, 3).is_none());
+    }
+
+    #[test]
+    fn rejects_odd_length_utf16_string_values() {
+        let mut utf16 = response(0x4d, 1, false);
+        utf16[18] = 1;
+        utf16.splice(20..23, []);
+        let length = utf16.len() as u16;
+        utf16[2..4].copy_from_slice(&length.to_be_bytes());
+
+        assert_eq!(decode(&utf16, 0x4d, 1), None);
+    }
+
+    #[test]
     fn rejects_wrong_object_instance_type_and_unclosed_values() {
         let response = response(0x4d, 3, false);
         assert!(decode_for(&response, 0x4d, 3, Some(42)).is_some());
@@ -614,5 +727,40 @@ mod tests {
         *bad.last_mut().unwrap() = 0;
         assert!(decode(&bad, 0x4d, 3).is_none());
         assert!(decode(&response, 120, 3).is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_an_error_pdu_as_the_initial_device_instance() {
+        let _network = crate::network_test_lock().await;
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 47808)).await.unwrap();
+        let responder = tokio::spawn(async move {
+            let mut request = [0; 32];
+            let (_, peer) = socket.recv_from(&mut request).await.unwrap();
+            let response = [0x81, 0x0a, 0, 9, 1, 4, 0x60, request[8], 0x11];
+            socket.send_to(&response, peer).await.unwrap();
+        });
+
+        match probe(Ipv4Addr::LOCALHOST).await {
+            Err(error) => assert!(error.contains("invalid response")),
+            Ok(_) => panic!("expected an invalid initial response"),
+        }
+        responder.await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn reports_connection_refused_for_a_closed_udp_endpoint() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        drop(socket);
+        let client = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+        client.connect((Ipv4Addr::LOCALHOST, port)).await.unwrap();
+
+        assert!(
+            exchange(&client, 0x4b, 1, None)
+                .await
+                .unwrap_err()
+                .contains("connection refused")
+        );
     }
 }
