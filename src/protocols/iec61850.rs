@@ -449,8 +449,10 @@ mod tests {
     };
     use iec61850_server::{IedServer, IedServerConfig, ServerHandle};
     use std::sync::Arc;
-    use tokio::io::AsyncWriteExt;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::time::timeout;
 
     fn attribute<'a>(
         model: &'a IedModel,
@@ -578,7 +580,7 @@ mod tests {
     fn model_with_logical_device_count(count: usize) -> Arc<IedModel> {
         let mut builder = IedModelBuilder::new("LIMITS");
         for index in 0..count {
-            let device = LogicalDeviceBuilder::new(&format!("LD{index:02}"))
+            let device = LogicalDeviceBuilder::new(format!("LD{index:02}"))
                 .add_ln(LogicalNodeBuilder::lln0().build().unwrap())
                 .build()
                 .unwrap();
@@ -591,7 +593,7 @@ mod tests {
         let mut device =
             LogicalDeviceBuilder::new("LD0").add_ln(LogicalNodeBuilder::lln0().build().unwrap());
         for index in 0..count {
-            let node = LogicalNodeBuilder::new("", "X", &index.to_string())
+            let node = LogicalNodeBuilder::new("", "X", index.to_string())
                 .build()
                 .unwrap();
             device = device.add_ln(node);
@@ -608,7 +610,7 @@ mod tests {
     fn model_with_variable_count(count: usize) -> Arc<IedModel> {
         let mut node = LogicalNodeBuilder::lln0();
         for index in 0..count {
-            node = node.add_do(cdc::sps(&format!("D{index:04}"), CdcOptions::NONE));
+            node = node.add_do(cdc::sps(format!("D{index:04}"), CdcOptions::NONE));
         }
         let device = LogicalDeviceBuilder::new("LD0")
             .add_ln(node.build().unwrap())
@@ -705,17 +707,29 @@ mod tests {
     async fn malformed_transport_is_not_classified_as_absent_service() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let responder = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            stream.write_all(&[0, 0, 0, 0]).await.unwrap();
-        });
+        let (result, _peer) = timeout(Duration::from_secs(5), async {
+            tokio::join!(probe(Ipv4Addr::LOCALHOST, port), async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut header = [0; 4];
+                stream.read_exact(&mut header).await.unwrap();
+                let length = usize::from(u16::from_be_bytes([header[2], header[3]]));
+                assert!(length > header.len(), "missing COTP connection request");
+                stream
+                    .read_exact(&mut vec![0; length - header.len()])
+                    .await
+                    .unwrap();
+                stream.write_all(&[0, 0, 0, 0]).await.unwrap();
+                // Keep the socket open until the probe has classified the malformed reply.
+                stream
+            })
+        })
+        .await
+        .expect("IEC 61850 malformed transport exchange timed out");
 
-        let error = probe(Ipv4Addr::LOCALHOST, port)
-            .await
+        let error = result
             .err()
             .expect("malformed transport response should fail");
-        assert!(error.contains("IEC 61850"));
-        responder.await.unwrap();
+        assert!(error.contains("invalid tpkt header"), "{error}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

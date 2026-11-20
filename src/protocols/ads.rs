@@ -406,6 +406,7 @@ pub async fn probe(
             ams_port,
             READ_DEVICE_INFO,
             cancelled,
+            crate::traffic::wait(),
         )
         .await
         {
@@ -500,6 +501,7 @@ pub async fn probe(
             ams_port,
             READ_STATE,
             cancelled,
+            crate::traffic::wait(),
         )
         .await
         {
@@ -804,6 +806,7 @@ async fn request(
     target_port: u16,
     command: u16,
     cancelled: &AtomicBool,
+    wait_for_pacing: impl Future<Output = ()>,
 ) -> Result<AdsReply, String> {
     if cancelled.load(Ordering::Relaxed) {
         return Err("cancelled".into());
@@ -825,7 +828,7 @@ async fn request(
     frame.extend_from_slice(&[0, 0]);
     frame.extend_from_slice(&(AMS_HEADER_LENGTH as u32).to_le_bytes());
     frame.extend_from_slice(&header.encode());
-    crate::traffic::wait().await;
+    wait_for_pacing.await;
     if cancelled.load(Ordering::Relaxed) {
         return Err("cancelled".into());
     }
@@ -1363,6 +1366,7 @@ mod tests {
                 851,
                 READ_DEVICE_INFO,
                 &AtomicBool::new(true),
+                crate::traffic::wait(),
             )
             .await,
             Err(error) if error.contains("cancelled")
@@ -1374,21 +1378,16 @@ mod tests {
     async fn request_stops_after_cancellation_during_traffic_wait() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut byte = [0];
-            assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
-        });
-        let mut stream = TcpStream::connect(address).await.unwrap();
-        crate::traffic::wait().await;
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let signal = cancelled.clone();
-        let canceller = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-            signal.store(true, Ordering::Relaxed);
-        });
+        let (mut stream, (mut peer, _)) = timeout(IO_TIMEOUT, async {
+            tokio::try_join!(TcpStream::connect(address), listener.accept())
+        })
+        .await
+        .expect("ADS loopback connection timed out")
+        .unwrap();
+        let cancelled = AtomicBool::new(false);
 
-        assert!(matches!(
+        let result = timeout(
+            IO_TIMEOUT,
             request(
                 &mut stream,
                 [10, 0, 0, 1, 1, 1],
@@ -1396,12 +1395,22 @@ mod tests {
                 851,
                 READ_DEVICE_INFO,
                 &cancelled,
-            )
-            .await,
-            Err(error) if error.contains("cancelled")
-        ));
-        canceller.await.unwrap();
-        server.await.unwrap();
+                async {
+                    tokio::task::yield_now().await;
+                    cancelled.store(true, Ordering::Relaxed);
+                },
+            ),
+        )
+        .await
+        .expect("ADS request did not stop after cancellation");
+        assert_eq!(result.err().as_deref(), Some("cancelled"));
+
+        drop(stream);
+        let bytes = timeout(IO_TIMEOUT, peer.read(&mut [0]))
+            .await
+            .expect("ADS peer did not receive EOF")
+            .unwrap();
+        assert_eq!(bytes, 0, "ADS sent data after cancellation");
     }
 
     #[tokio::test]
@@ -1741,7 +1750,7 @@ mod tests {
 
         add_device_info_raw(&mut finding, 851, &info);
 
-        assert!(finding.fields.get("runtimeName").is_none());
+        assert!(!finding.fields.contains_key("runtimeName"));
         assert_eq!(finding.fields["runtimeVersion"], "3.1.4021");
         assert_eq!(finding.raw["runtimePrimaryAmsPort"], 851);
     }

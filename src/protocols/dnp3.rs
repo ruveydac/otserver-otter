@@ -1260,12 +1260,21 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, PORT))
             .await
             .unwrap();
-        let responder = tokio::spawn(async move {
-            let (_stream, _) = listener.accept().await.unwrap();
-        });
+        let (result, ()) = timeout(TIMEOUT * 3, async {
+            tokio::join!(probe(Ipv4Addr::LOCALHOST), async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                // Drain the request so closing the socket produces EOF rather than a reset.
+                stream
+                    .read_exact(&mut vec![0; request().len()])
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+            })
+        })
+        .await
+        .expect("DNP3 early-close exchange timed out");
 
-        assert!(probe(Ipv4Addr::LOCALHOST).await.unwrap().is_none());
-        responder.await.unwrap();
+        assert!(result.unwrap().is_none());
     }
 
     #[tokio::test]
