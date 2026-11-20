@@ -345,6 +345,135 @@ mod tests {
     }
 
     #[test]
+    fn validates_smb1_header_identity_and_size_limits() {
+        let valid = negotiate_fixture(true);
+        let mut mismatches = Vec::new();
+        let mut bytes = valid.clone();
+        bytes[..4].copy_from_slice(b"BAD!");
+        mismatches.push(bytes);
+        let mut bytes = valid.clone();
+        bytes[4] = 0x73;
+        mismatches.push(bytes);
+        let mut bytes = valid.clone();
+        bytes[9] &= !0x80;
+        mismatches.push(bytes);
+        let mut bytes = valid.clone();
+        bytes[12] = 1;
+        mismatches.push(bytes);
+        let mut bytes = valid.clone();
+        bytes[24] = 1;
+        mismatches.push(bytes);
+        let mut bytes = valid.clone();
+        bytes[26] = 1;
+        mismatches.push(bytes);
+        let mut bytes = valid.clone();
+        bytes[28] = 1;
+        mismatches.push(bytes);
+        let mut bytes = valid.clone();
+        bytes[30] = 1;
+        mismatches.push(bytes);
+        for bytes in mismatches {
+            assert!(validate_header(&bytes, 0x72, 0).is_err());
+        }
+
+        let mut oversized = valid;
+        oversized.resize(65_537, 0);
+        assert!(validate_header(&oversized, 0x72, 0).is_err());
+        assert!(validate_header(&negotiate_fixture(true)[..34], 0x72, 0).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_oem_strings() {
+        let mut bytes = vec![b'A'; 2049];
+        bytes.push(0);
+        assert!(
+            string(&bytes, &mut 0, false)
+                .unwrap_err()
+                .contains("oversized")
+        );
+    }
+
+    #[test]
+    fn handles_rejected_and_incomplete_negotiate_variants() {
+        let mut rejected = negotiate_fixture(true);
+        rejected[5..9].copy_from_slice(&0xc000_0022_u32.to_le_bytes());
+        assert!(
+            parse_negotiation(&rejected, 445)
+                .err()
+                .unwrap()
+                .contains("rejected")
+        );
+
+        let mut no_dialect = header(0x72, 0, true);
+        no_dialect[9] |= 0x80;
+        no_dialect.extend_from_slice(&[1, 0xff, 0xff, 0, 0]);
+        assert!(parse_negotiation(&no_dialect, 445).unwrap().is_none());
+
+        let mut missing_unicode_flag = negotiate_fixture(true);
+        missing_unicode_flag[11] &= !0x08;
+        assert!(
+            parse_negotiation(&missing_unicode_flag, 445)
+                .err()
+                .unwrap()
+                .contains("extended-security")
+        );
+
+        let mut short_server_guid = negotiate_fixture(true);
+        short_server_guid.truncate(84);
+        short_server_guid[67..69].copy_from_slice(&15_u16.to_le_bytes());
+        assert!(
+            parse_negotiation(&short_server_guid, 445)
+                .err()
+                .unwrap()
+                .contains("extended-security")
+        );
+
+        let mut unsupported_challenge_length = negotiate_fixture(false);
+        unsupported_challenge_length[66] = 7;
+        assert!(
+            parse_negotiation(&unsupported_challenge_length, 445)
+                .err()
+                .unwrap()
+                .contains("challenge length")
+        );
+
+        let mut challenge_past_payload = negotiate_fixture(false);
+        challenge_past_payload.truncate(73);
+        challenge_past_payload[66] = 8;
+        challenge_past_payload[67..69].copy_from_slice(&4_u16.to_le_bytes());
+        assert!(
+            parse_negotiation(&challenge_past_payload, 445)
+                .err()
+                .unwrap()
+                .contains("challenge length")
+        );
+    }
+
+    #[test]
+    fn rejects_bad_unicode_alignment_and_unparsed_session_data() {
+        let mut misaligned = identity_fixture(true);
+        let token_length = usize::from(ntlm::u16le(&misaligned, 39).unwrap());
+        let padding = 43 + token_length;
+        assert_eq!((43 + token_length) % 2, 1);
+        misaligned[padding] = 1;
+        assert!(
+            identity(&misaligned)
+                .unwrap_err()
+                .contains("string alignment")
+        );
+
+        let mut trailing_data = identity_fixture(true);
+        trailing_data.extend([0, 0, b'X']);
+        let byte_count = ntlm::u16le(&trailing_data, 41).unwrap() + 3;
+        trailing_data[41..43].copy_from_slice(&byte_count.to_le_bytes());
+        assert!(
+            identity(&trailing_data)
+                .unwrap_err()
+                .contains("unexpected SMB1 session data")
+        );
+    }
+
+    #[test]
     fn classic_security_retains_domain_but_never_infers_an_os() {
         let finding = parse_negotiation(&negotiate_fixture(false), 445)
             .unwrap()
@@ -369,6 +498,58 @@ mod tests {
         assert_eq!(fields["operatingSystem"], "Windows 10.0");
         assert!(raw["ntlm"].get("reportedVersion").is_none());
         assert!(!fields.contains_key("name"));
+    }
+
+    #[test]
+    fn handles_unaligned_and_missing_legacy_server_strings() {
+        let mut challenge = vec![0; 32];
+        challenge[..8].copy_from_slice(b"NTLMSSP\0");
+        challenge[8] = 2;
+        challenge[20] = 1;
+        challenge.push(0);
+
+        let bytes = identity_fixture_with(&challenge, true);
+        let (fields, raw) = identity(&bytes).unwrap();
+        assert_eq!(raw["serverStrings"]["nativeOs"], "Windows 10.0");
+        assert_eq!(fields["operatingSystem"], "Windows 10.0");
+
+        let mut without_strings = bytes;
+        let token_length = usize::from(ntlm::u16le(&without_strings, 39).unwrap());
+        without_strings.truncate(43 + token_length);
+        without_strings[41..43].copy_from_slice(&(token_length as u16).to_le_bytes());
+        let (fields, raw) = identity(&without_strings).unwrap();
+        assert!(raw["serverStrings"].as_object().unwrap().is_empty());
+        assert!(!fields.contains_key("operatingSystem"));
+    }
+
+    #[test]
+    fn does_not_infer_os_from_non_windows_native_os() {
+        let mut challenge = vec![0; 32];
+        challenge[..8].copy_from_slice(b"NTLMSSP\0");
+        challenge[8] = 2;
+        challenge[20] = 1;
+        challenge.push(0);
+        let mut bytes = identity_fixture_with(&challenge, true);
+        let windows: Vec<u8> = "Windows 10.0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let start = bytes
+            .windows(windows.len())
+            .position(|value| value == windows.as_slice())
+            .unwrap();
+        bytes[start] = b'L';
+
+        let (fields, raw) = identity(&bytes).unwrap();
+        assert_eq!(raw["serverStrings"]["nativeOs"], "Lindows 10.0");
+        assert!(!fields.contains_key("operatingSystem"));
+    }
+
+    #[test]
+    fn builds_session_setup_without_unicode() {
+        let request = session_setup(123, false);
+        assert_eq!(ntlm::u16le(&request, 10).unwrap() & 0x8000, 0);
+        assert_eq!(ntlm::u32le(&request, 53).unwrap(), 0x8000_0040);
     }
 
     #[test]
@@ -464,6 +645,67 @@ mod tests {
             assert_eq!(finding.raw["authenticationCompleted"], false);
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn reports_connection_refusal_without_attempting_smb1_authentication() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let number = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(
+            exchange(Ipv4Addr::LOCALHOST, number)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_none_when_peer_closes_or_does_not_offer_a_dialect() {
+        for no_dialect in [false, true] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let number = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                request(&mut stream).await;
+                if no_dialect {
+                    let mut response = header(0x72, 0, true);
+                    response[9] |= 0x80;
+                    response.extend_from_slice(&[1, 0xff, 0xff, 0, 0]);
+                    smb::send(&mut stream, &response).await.unwrap();
+                }
+            });
+
+            assert!(
+                exchange(Ipv4Addr::LOCALHOST, number)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn retains_negotiation_when_identity_request_exceeds_server_receive_limit() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let number = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            request(&mut stream).await;
+            let mut reply = negotiate_fixture(true);
+            reply[40..44].copy_from_slice(&1_u32.to_le_bytes());
+            smb::send(&mut stream, &reply).await.unwrap();
+            assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
+        });
+
+        let finding = exchange(Ipv4Addr::LOCALHOST, number)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(finding.raw["smbVersion"], 1);
+        assert!(finding.warnings[0].contains("exceeds the server's receive limit"));
+        server.await.unwrap();
     }
 
     #[tokio::test]

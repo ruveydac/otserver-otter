@@ -557,6 +557,35 @@ mod tests {
     }
 
     #[test]
+    fn list_identity_rejects_each_invalid_encapsulation_field() {
+        let context = &LIST_IDENTITY[12..20];
+        let mut responses = Vec::new();
+
+        let mut bad_command = identity_response();
+        bad_command[0] = 0x64;
+        responses.push(bad_command);
+
+        let mut bad_length = identity_response();
+        bad_length[2..4].copy_from_slice(&43_u16.to_le_bytes());
+        responses.push(bad_length);
+
+        let mut bad_sender_context = identity_response();
+        bad_sender_context[20] = 1;
+        responses.push(bad_sender_context);
+
+        let mut bad_status = identity_response();
+        bad_status[4] = 1;
+        responses.push(bad_status);
+
+        for response in responses {
+            assert_eq!(
+                parse(&response, context).unwrap_err(),
+                "invalid List Identity response"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_malformed_cpf_items_and_identity_fields() {
         let context = &LIST_IDENTITY[12..20];
 
@@ -586,6 +615,16 @@ mod tests {
                 .contains("List Identity item")
         );
 
+        let mut short_identity = identity_response();
+        short_identity[28..30].copy_from_slice(&33_u16.to_le_bytes());
+        short_identity.truncate(63);
+        short_identity[2..4].copy_from_slice(&39_u16.to_le_bytes());
+        assert!(
+            parse(&short_identity, context)
+                .unwrap_err()
+                .contains("List Identity item")
+        );
+
         let mut bad_version = identity_response();
         bad_version[32..34].copy_from_slice(&[1, 1]);
         assert!(
@@ -609,6 +648,21 @@ mod tests {
     }
 
     #[test]
+    fn accepts_list_identity_without_a_product_name() {
+        let mut response = identity_response();
+        response[2..4].copy_from_slice(&40_u16.to_le_bytes());
+        response[28..30].copy_from_slice(&34_u16.to_le_bytes());
+        response[62] = 0;
+        response.truncate(64);
+
+        let (fields, raw) = parse(&response, &LIST_IDENTITY[12..20]).unwrap();
+
+        assert_eq!(raw["productName"], Value::Null);
+        assert!(!fields.contains_key("model"));
+        assert!(!fields.contains_key("name"));
+    }
+
+    #[test]
     fn cip_rejects_bad_cpf_service_status_lengths_and_truncated_attributes() {
         let mut response = vec![0; 24];
         response.extend([
@@ -625,10 +679,126 @@ mod tests {
         let mut identity = vec![0; 15];
         identity[14] = 9;
         assert!(decode_cip(1, None, &identity).is_none());
+        assert!(decode_cip(0xf5, Some(5), &[0; 21]).is_none());
+        assert!(decode_cip(0xf5, Some(6), &[0]).is_none());
         assert!(decode_cip(0xf5, Some(6), &[9, 0, b'A']).is_none());
         let mut config = vec![0; 22];
         config[20] = 1;
         assert!(decode_cip(0xf5, Some(5), &config).is_none());
+    }
+
+    #[test]
+    fn cip_payload_rejects_each_malformed_cpf_and_cip_shape() {
+        let mut valid = vec![0; 24];
+        valid.extend([
+            0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0xb2, 0, 4, 0, 0x8e, 0, 0, 0,
+        ]);
+        assert!(cip_payload(&valid, 0x0e).is_ok());
+
+        for index in [24, 30] {
+            let mut malformed = valid.clone();
+            malformed[index] = 1;
+            assert!(cip_payload(&malformed, 0x0e).is_err());
+        }
+
+        let mut bad_size = valid.clone();
+        bad_size[38..40].copy_from_slice(&3_u16.to_le_bytes());
+        assert!(cip_payload(&bad_size, 0x0e).is_err());
+
+        let mut short_cip = valid.clone();
+        short_cip[38..40].copy_from_slice(&3_u16.to_le_bytes());
+        short_cip.truncate(43);
+        assert!(cip_payload(&short_cip, 0x0e).is_err());
+
+        let mut bad_service = valid.clone();
+        bad_service[40] = 0x8f;
+        assert!(cip_payload(&bad_service, 0x0e).is_err());
+
+        let mut bad_status = valid;
+        bad_status[41] = 1;
+        assert!(cip_payload(&bad_status, 0x0e).is_err());
+    }
+
+    #[tokio::test]
+    async fn encapsulation_rejects_mismatched_and_oversized_headers() {
+        let _network = crate::network_test_lock().await;
+        let context = [1, 2, 3, 4, 5, 6, 7, 8];
+        let mut valid = [0; 24];
+        valid[..2].copy_from_slice(&0x65_u16.to_le_bytes());
+        valid[4..8].copy_from_slice(&42_u32.to_le_bytes());
+        valid[12..20].copy_from_slice(&context);
+        let mut replies = Vec::new();
+
+        let mut bad = valid;
+        bad[0] ^= 1;
+        replies.push(bad);
+        let mut bad = valid;
+        bad[8] = 1;
+        replies.push(bad);
+        let mut bad = valid;
+        bad[12] ^= 1;
+        replies.push(bad);
+        let mut bad = valid;
+        bad[20] = 1;
+        replies.push(bad);
+        let mut bad = valid;
+        bad[4] ^= 1;
+        replies.push(bad);
+        let mut oversized = valid;
+        oversized[2..4].copy_from_slice(&4097_u16.to_le_bytes());
+        replies.push(oversized);
+
+        for reply in replies {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let responder = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 24];
+                stream.read_exact(&mut request).await.unwrap();
+                let mut body = vec![0; u16::from_le_bytes([request[2], request[3]]) as usize];
+                stream.read_exact(&mut body).await.unwrap();
+                stream.write_all(&reply).await.unwrap();
+            });
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            let error = encapsulation(&mut stream, 0x65, 42, &[1, 0, 0, 0], context)
+                .await
+                .unwrap_err();
+            assert!(error.contains("mismatched/oversized"), "{error}");
+            responder.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cip_registration_rejects_invalid_body_and_zero_session() {
+        let _network = crate::network_test_lock().await;
+
+        for (session, body, expected) in [
+            (42_u32, [0, 0, 0, 0], "invalid RegisterSession response"),
+            (0, [1, 0, 0, 0], "zero CIP session"),
+        ] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 44818))
+                .await
+                .unwrap();
+            let responder = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 24];
+                stream.read_exact(&mut request).await.unwrap();
+                let mut request_body =
+                    vec![0; u16::from_le_bytes([request[2], request[3]]) as usize];
+                stream.read_exact(&mut request_body).await.unwrap();
+
+                let mut response = [0; 24];
+                response[..2].copy_from_slice(&request[..2]);
+                response[2..4].copy_from_slice(&4_u16.to_le_bytes());
+                response[4..8].copy_from_slice(&session.to_le_bytes());
+                response[12..20].copy_from_slice(&request[12..20]);
+                stream.write_all(&response).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            });
+
+            assert_eq!(cip_reads(Ipv4Addr::LOCALHOST).await.unwrap_err(), expected);
+            responder.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -685,6 +855,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cip_reads_classify_malformed_and_unsupported_responses() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 44818))
+            .await
+            .unwrap();
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = [0; 24];
+            stream.read_exact(&mut header).await.unwrap();
+            let mut body = vec![0; u16::from_le_bytes([header[2], header[3]]) as usize];
+            stream.read_exact(&mut body).await.unwrap();
+
+            let mut register = [0; 24];
+            register[..2].copy_from_slice(&header[..2]);
+            register[2..4].copy_from_slice(&4_u16.to_le_bytes());
+            register[4..8].copy_from_slice(&42_u32.to_le_bytes());
+            register[12..20].copy_from_slice(&header[12..20]);
+            stream.write_all(&register).await.unwrap();
+            stream.write_all(&[1, 0, 0, 0]).await.unwrap();
+
+            for status in [0, 0x08] {
+                stream.read_exact(&mut header).await.unwrap();
+                let mut body = vec![0; u16::from_le_bytes([header[2], header[3]]) as usize];
+                stream.read_exact(&mut body).await.unwrap();
+
+                let service = body[16];
+                let cip = [service | 0x80, 0, status, 0];
+                let mut cpf = body[..14].to_vec();
+                cpf.extend((cip.len() as u16).to_le_bytes());
+                cpf.extend(cip);
+
+                let mut response = [0; 24];
+                response[..2].copy_from_slice(&header[..2]);
+                response[2..4].copy_from_slice(&(cpf.len() as u16).to_le_bytes());
+                response[4..8].copy_from_slice(&42_u32.to_le_bytes());
+                response[12..20].copy_from_slice(&header[12..20]);
+                stream.write_all(&response).await.unwrap();
+                stream.write_all(&cpf).await.unwrap();
+            }
+        });
+
+        let records = cip_reads(Ipv4Addr::LOCALHOST).await.unwrap();
+
+        assert_eq!(records[0]["outcome"], "malformed");
+        assert_eq!(records[1]["outcome"], "unsupported");
+        assert_eq!(records[2]["outcome"], "read-error");
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn probes_tcp_and_udp_identity() {
         let _network = crate::network_test_lock().await;
         let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 44818))
@@ -736,6 +956,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cip_identity_disagreements_remain_warnings_not_overrides() {
+        let _network = crate::network_test_lock().await;
+        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 44818))
+            .await
+            .unwrap();
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 44818)).await.unwrap();
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            let mut request = [0; 24];
+            stream.read_exact(&mut request).await.unwrap();
+            let mut list_identity = identity_response();
+            list_identity[12..20].copy_from_slice(&request[12..20]);
+            stream.write_all(&list_identity).await.unwrap();
+
+            let (mut cip, _) = tcp.accept().await.unwrap();
+            let mut header = [0; 24];
+            cip.read_exact(&mut header).await.unwrap();
+            let mut body = vec![0; u16::from_le_bytes([header[2], header[3]]) as usize];
+            cip.read_exact(&mut body).await.unwrap();
+            let mut register = [0; 24];
+            register[..2].copy_from_slice(&0x65_u16.to_le_bytes());
+            register[2..4].copy_from_slice(&4_u16.to_le_bytes());
+            register[4..8].copy_from_slice(&42_u32.to_le_bytes());
+            register[12..20].copy_from_slice(&header[12..20]);
+            cip.write_all(&register).await.unwrap();
+            cip.write_all(&[1, 0, 0, 0]).await.unwrap();
+
+            cip.read_exact(&mut header).await.unwrap();
+            let mut body = vec![0; u16::from_le_bytes([header[2], header[3]]) as usize];
+            cip.read_exact(&mut body).await.unwrap();
+            let value = [
+                1, 0, 14, 0, 158, 0, 3, 7, 0, 0, 42, 0, 0, 0, 3, b'P', b'L', b'C',
+            ];
+            let mut cip_response = vec![0x81, 0, 0, 0];
+            cip_response.extend(value);
+            let mut cpf = body[..14].to_vec();
+            cpf.extend((cip_response.len() as u16).to_le_bytes());
+            cpf.extend(cip_response);
+            let mut response = [0; 24];
+            response[..2].copy_from_slice(&0x6f_u16.to_le_bytes());
+            response[2..4].copy_from_slice(&(cpf.len() as u16).to_le_bytes());
+            response[4..8].copy_from_slice(&42_u32.to_le_bytes());
+            response[12..20].copy_from_slice(&header[12..20]);
+            cip.write_all(&response).await.unwrap();
+            cip.write_all(&cpf).await.unwrap();
+
+            let mut request = [0; 24];
+            let (_, peer) = udp.recv_from(&mut request).await.unwrap();
+            let mut response = identity_response();
+            response[12..20].copy_from_slice(&request[12..20]);
+            udp.send_to(&response, peer).await.unwrap();
+        });
+
+        let finding = probe(Ipv4Addr::LOCALHOST).await.unwrap().unwrap();
+        assert_eq!(finding.fields["model"], "PLC1");
+        assert_eq!(
+            finding.fields["serialNumber"],
+            finding.raw["cipReads"][0]["value"]["serialNumber"]
+        );
+        assert!(
+            finding.warnings.iter().any(|warning| {
+                warning.contains("CIP Identity differs from ListIdentity for deviceType")
+            }),
+            "{:?}",
+            finding.warnings
+        );
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn udp_identity_survives_an_unavailable_tcp_listener() {
         let _network = crate::network_test_lock().await;
         let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 44818)).await.unwrap();
@@ -762,10 +1052,11 @@ mod tests {
         let _network = crate::network_test_lock().await;
 
         match probe(Ipv4Addr::LOCALHOST).await {
-            Err(error) => assert!(
-                error.contains(" tcp:") || error.contains(" udp:"),
-                "{error}"
-            ),
+            Err(error) => {
+                let has_tcp = error.contains(" tcp:");
+                let has_udp = error.contains(" udp:");
+                assert!(has_tcp || has_udp, "{error}");
+            }
             Ok(None) => {}
             Ok(Some(_)) => panic!("closed ports cannot return an identity"),
         }
@@ -811,6 +1102,57 @@ mod tests {
         let error = udp(Ipv4Addr::LOCALHOST, &LIST_IDENTITY).await.unwrap_err();
 
         assert_eq!(error, "too many uncorrelated ListIdentity responses");
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_distinguishes_silence_from_rejected_responses_at_deadline() {
+        let _network = crate::network_test_lock().await;
+
+        for rejected in [false, true] {
+            let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 44818)).await.unwrap();
+            let responder = tokio::spawn(async move {
+                let mut request = [0; 24];
+                let (_, peer) = socket.recv_from(&mut request).await.unwrap();
+                if rejected {
+                    socket.send_to(&[0; 26], peer).await.unwrap();
+                }
+                tokio::time::sleep(TIMEOUT + std::time::Duration::from_millis(100)).await;
+            });
+
+            let result = udp(Ipv4Addr::LOCALHOST, &LIST_IDENTITY).await;
+            if rejected {
+                assert_eq!(
+                    result.unwrap_err(),
+                    "malformed or uncorrelated ListIdentity response"
+                );
+            } else {
+                assert!(result.unwrap().is_none());
+            }
+            responder.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_reader_rejects_encapsulation_lengths_over_the_response_limit() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 44818))
+            .await
+            .unwrap();
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 24];
+            stream.read_exact(&mut request).await.unwrap();
+            let mut header = [0; 24];
+            header[0] = 0x63;
+            header[2..4].copy_from_slice(&65_512_u16.to_le_bytes());
+            stream.write_all(&header).await.unwrap();
+        });
+
+        assert_eq!(
+            tcp(Ipv4Addr::LOCALHOST, &LIST_IDENTITY).await.unwrap_err(),
+            "oversized response"
+        );
         responder.await.unwrap();
     }
 

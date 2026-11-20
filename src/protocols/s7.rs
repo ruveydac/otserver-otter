@@ -558,6 +558,7 @@ mod tests {
             data_length as u8,
         ];
         frame[2..4].copy_from_slice(&(length as u16).to_be_bytes());
+        frame[15..17].copy_from_slice(&(data_length as u16).to_be_bytes());
         frame.extend(parameter);
         frame.extend([0xff, 9]);
         frame.extend((payload.len() as u16).to_be_bytes());
@@ -621,6 +622,48 @@ mod tests {
         let mut wrong_index = identity;
         wrong_index[3] = 2;
         assert!(szl(&wrong_index, 0x1c).is_err());
+    }
+
+    #[test]
+    fn records_malformed_identity_szl_without_losing_hardware_identity() {
+        let (hardware, mut identity) = identities();
+        identity[1] = 0x11;
+
+        let finding = parse(&hardware, &identity).unwrap();
+
+        assert_eq!(finding.fields["firmwareVersion"], "3.2.1");
+        assert!(!finding.fields.contains_key("serialNumber"));
+        assert_eq!(finding.raw["collectionOutcomes"][1]["outcome"], "malformed");
+        assert_eq!(
+            finding.warnings,
+            ["S7 SZL 001C: unexpected S7 SZL identity"]
+        );
+    }
+
+    #[test]
+    fn uses_identity_and_hardware_model_fallback_records() {
+        let empty = parse(&[], &[]).unwrap();
+        assert!(!empty.fields.contains_key("model"));
+        assert_eq!(
+            empty.raw["collectionOutcomes"][0]["outcome"],
+            "not-collected"
+        );
+
+        let (hardware, mut identity) = identities();
+        identity[42..44].copy_from_slice(&7_u16.to_be_bytes());
+        let identity_fallback = parse(&hardware, &identity).unwrap();
+        assert_eq!(identity_fallback.fields["model"], "S7-1500");
+        assert_eq!(identity_fallback.raw["fieldSources"]["model"]["record"], 7);
+
+        let (mut hardware, mut identity) = identities();
+        hardware[8..10].copy_from_slice(&99_u16.to_be_bytes());
+        identity[42..44].copy_from_slice(&99_u16.to_be_bytes());
+        let hardware_fallback = parse(&hardware, &identity).unwrap();
+        assert_eq!(hardware_fallback.fields["model"], "6ES7-X");
+        assert_eq!(
+            hardware_fallback.raw["fieldSources"]["model"],
+            json!({"szlId":"0x0011","index":0,"record":6})
+        );
     }
 
     #[test]
@@ -691,6 +734,118 @@ mod tests {
         assert!(userdata(&frame).is_err());
     }
 
+    #[test]
+    fn rejects_invalid_userdata_parameters_and_short_sections() {
+        let valid = userdata_frame(&[0, 0x11, 0, 0]);
+        for (offset, value) in [
+            (17, 1),    // wrong parameter prefix
+            (22, 0x44), // wrong function group
+            (22, 0x83), // wrong function
+            (23, 2),    // wrong subfunction
+            (27, 1),    // reserved bytes must be zero
+            (29, 0),    // wrong data prefix
+            (30, 8),    // wrong data type
+        ] {
+            let mut frame = valid.clone();
+            frame[offset] = value;
+            assert!(userdata(&frame).is_err(), "accepted mutation at {offset}");
+        }
+
+        let mut short_parameters = valid.clone();
+        short_parameters[14] = 11;
+        short_parameters.remove(28);
+        let length = short_parameters.len() as u16;
+        short_parameters[2..4].copy_from_slice(&length.to_be_bytes());
+        assert!(userdata(&short_parameters).is_err());
+
+        let mut short_data = valid;
+        short_data[16] = 3;
+        short_data.truncate(32);
+        let length = short_data.len() as u16;
+        short_data[2..4].copy_from_slice(&length.to_be_bytes());
+        assert!(userdata(&short_data).is_err());
+    }
+
+    #[test]
+    fn distinguishes_setup_responses_from_userdata_frames() {
+        assert!(!setup_response(&userdata_frame(&[])));
+        assert_eq!(
+            userdata(&setup_frame()).unwrap_err(),
+            "invalid S7 SZL response"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_s7_headers_and_szl_record_lengths() {
+        let valid = setup_frame();
+        assert!(s7_frame(&valid[..16]).is_err());
+        for (offset, value) in [(0, 2), (3, 19), (4, 3), (7, 0x31)] {
+            let mut frame = valid.clone();
+            frame[offset] = value;
+            assert!(s7_frame(&frame).is_err(), "accepted mutation at {offset}");
+        }
+
+        assert!(szl(&[0, 0x11, 0, 0, 0, 1, 0, 0], 0x11).is_err());
+        assert!(szl(&[0, 0x11, 0, 0, 0, 2, 0, 2], 0x11).is_err());
+    }
+
+    fn userdata_fragment(
+        payload: &[u8],
+        fragment_reference: u8,
+        sequence: u8,
+        last: bool,
+    ) -> Vec<u8> {
+        let mut frame = userdata_frame(payload);
+        frame[24] = sequence;
+        frame[25] = fragment_reference;
+        frame[26] = u8::from(!last);
+        frame
+    }
+
+    async fn read_szl_from_frames(frames: Vec<Vec<u8>>) -> Result<Vec<u8>, String> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(read_tpkt(&mut stream).await, SZL_11);
+            for frame in frames {
+                stream.write_all(&frame).await.unwrap();
+            }
+        });
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let result = read_szl_inner(&mut stream, SZL_11).await;
+        responder.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn validates_fragment_sequence_reference_and_total_szl_size() {
+        let _network = crate::network_test_lock().await;
+        let first = userdata_fragment(&[0; 4], 1, 0, false);
+        let mismatched_reference = userdata_fragment(&[0; 4], 2, 1, true);
+        assert_eq!(
+            read_szl_from_frames(vec![first.clone(), mismatched_reference])
+                .await
+                .unwrap_err(),
+            "mismatched S7 userdata fragment"
+        );
+
+        let mismatched_sequence = userdata_fragment(&[0; 4], 1, 2, true);
+        assert_eq!(
+            read_szl_from_frames(vec![first, mismatched_sequence])
+                .await
+                .unwrap_err(),
+            "mismatched S7 userdata fragment"
+        );
+
+        let first = userdata_fragment(&vec![0; 33_000], 1, 0, false);
+        let second = userdata_fragment(&vec![0; 33_000], 1, 1, true);
+        assert_eq!(
+            read_szl_from_frames(vec![first, second]).await.unwrap_err(),
+            "oversized S7 SZL response"
+        );
+    }
+
     #[tokio::test]
     async fn probes_s7_identity() {
         let _network = crate::network_test_lock().await;
@@ -713,6 +868,28 @@ mod tests {
         assert_eq!(finding.fields["name"], "PLC1");
         assert_eq!(finding.fields["model"], "S7-1500");
         assert_eq!(finding.raw["accessPath"]["slot"], 0);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_a_short_cotp_response_with_a_valid_tpkt_header() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_tpkt(&mut stream).await,
+                connect_request(0x0100, 0x0100)
+            );
+            stream.write_all(&[3, 0, 0, 4]).await.unwrap();
+        });
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        assert!(
+            !negotiate(&mut stream, &connect_request(0x0100, 0x0100))
+                .await
+                .unwrap()
+        );
         responder.await.unwrap();
     }
 
@@ -926,6 +1103,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reports_an_open_port_that_rejects_every_cotp_tsap() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, CONNECT_PORT))
+            .await
+            .unwrap();
+        let responder = tokio::spawn(async move {
+            for (source, destination) in TSAP_PAIRS {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                assert_eq!(
+                    read_tpkt(&mut stream).await,
+                    connect_request(source, destination)
+                );
+                stream.write_all(&[3, 0, 0, 7, 2, 0xe0, 0]).await.unwrap();
+            }
+        });
+
+        let error = probe(Ipv4Addr::LOCALHOST)
+            .await
+            .err()
+            .expect("all tested COTP/TSAP pairings should be rejected");
+        assert_eq!(
+            error,
+            format!(
+                "TCP port {CONNECT_PORT} accepted {} connection(s), but rejected all tested S7 COTP/TSAP pairings.",
+                TSAP_PAIRS.len()
+            )
+        );
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn cotp_peer_that_drops_the_s7_exchange_is_not_s7() {
         let _network = crate::network_test_lock().await;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, CONNECT_PORT))
@@ -963,6 +1171,15 @@ mod tests {
         tokio::spawn(async move {
             let (mut server, _) = listener.accept().await.unwrap();
             server.write_all(&[2, 0, 0, 4]).await.unwrap();
+        });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        assert!(read_frame(&mut client).await.unwrap_err().contains("TPKT"));
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut server, _) = listener.accept().await.unwrap();
+            server.write_all(&[3, 0, 0, 3]).await.unwrap();
         });
         let mut client = TcpStream::connect(address).await.unwrap();
         assert!(read_frame(&mut client).await.unwrap_err().contains("TPKT"));

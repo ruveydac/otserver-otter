@@ -180,9 +180,10 @@ pub(super) fn response_token(bytes: &[u8]) -> Result<&[u8], String> {
         seen |= 1 << (tag - 0xa0);
         if tag == 0xa2 {
             let (tag, value, rest) = tlv(content)?;
-            if tag != 4 || !rest.is_empty() || token.replace(value).is_some() {
+            if tag != 4 || !rest.is_empty() {
                 return Err("invalid SPNEGO response token".into());
             }
+            token = Some(value);
         } else {
             let (inner_tag, value, rest) = tlv(content)?;
             if !rest.is_empty()
@@ -323,6 +324,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_each_mismatched_smb2_header_field() {
+        let valid = response(0, 0);
+        let mut mismatches = Vec::new();
+        let mut bytes = valid.clone();
+        bytes[..4].copy_from_slice(b"BAD!");
+        mismatches.push(bytes);
+        let mut bytes = valid.clone();
+        bytes[4..6].copy_from_slice(&63_u16.to_le_bytes());
+        mismatches.push(bytes);
+        let mut bytes = valid.clone();
+        bytes[12..14].copy_from_slice(&1_u16.to_le_bytes());
+        mismatches.push(bytes);
+        let mut bytes = valid.clone();
+        bytes[16..20].copy_from_slice(&2_u32.to_le_bytes());
+        mismatches.push(bytes);
+        let mut bytes = valid.clone();
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        mismatches.push(bytes);
+        let mut bytes = valid;
+        bytes[24] = 1;
+        mismatches.push(bytes);
+
+        for bytes in mismatches {
+            assert!(validate_header(&bytes, 0, 0).is_err());
+        }
+        assert!(validate_header(&response(0, 0)[..63], 0, 0).is_err());
+    }
+
+    #[test]
     fn parses_only_correlated_challenges_and_rejects_truncation() {
         let token = der(0xa1, &der(0x30, &der(0xa2, &der(4, &ntlm::fixture()))));
         let mut bytes = response(1, 1);
@@ -338,6 +368,65 @@ mod tests {
         assert!(session_identity(&bytes).is_err());
         assert!(response_token(b"NTLMSSP\0").is_err());
         assert!(response_token(&[0xa1, 0x80]).is_err());
+    }
+
+    #[test]
+    fn rejects_spnego_trailing_data_and_malformed_response_tokens() {
+        let token = der(0xa2, &der(4, &ntlm::fixture()));
+        let sequence = der(0x30, &token);
+        let mut outer_with_trailing_data = der(0xa1, &sequence);
+        outer_with_trailing_data.push(0);
+        assert!(response_token(&outer_with_trailing_data).is_err());
+
+        let mut sequence_with_trailing_data = sequence;
+        sequence_with_trailing_data.push(0);
+        assert!(response_token(&der(0xa1, &sequence_with_trailing_data)).is_err());
+
+        assert!(response_token(&der(0xa0, &der(0x30, &token))).is_err());
+        assert!(
+            response_token(&der(
+                0xa1,
+                &der(0x30, &der(0xa2, &der(5, &ntlm::fixture())))
+            ))
+            .is_err()
+        );
+
+        let mut token_with_trailing_data = der(4, &ntlm::fixture());
+        token_with_trailing_data.push(0);
+        assert!(
+            response_token(&der(
+                0xa1,
+                &der(0x30, &der(0xa2, &token_with_trailing_data)),
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_nonchallenge_status_structure_size_and_overlapping_security_buffer() {
+        let token = der(0xa1, &der(0x30, &der(0xa2, &der(4, &ntlm::fixture()))));
+        let mut valid = response(1, 1);
+        valid[8..12].copy_from_slice(&0xc000_0016_u32.to_le_bytes());
+        valid.extend_from_slice(&[9, 0, 0, 0, 72, 0]);
+        valid.extend_from_slice(&(token.len() as u16).to_le_bytes());
+        valid.extend_from_slice(&[0; 8]);
+        valid.extend(token);
+
+        let mut bad_status = valid.clone();
+        bad_status[8..12].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(session_identity(&bad_status).is_err());
+
+        let mut bad_structure_size = valid.clone();
+        bad_structure_size[64] = 8;
+        assert!(session_identity(&bad_structure_size).is_err());
+
+        let mut overlapping_buffer = valid;
+        overlapping_buffer[68..70].copy_from_slice(&71_u16.to_le_bytes());
+        assert!(
+            session_identity(&overlapping_buffer)
+                .unwrap_err()
+                .contains("overlaps")
+        );
     }
 
     #[tokio::test]
@@ -385,7 +474,11 @@ mod tests {
         let token = der(0xa2, &der(4, &ntlm::fixture()));
         for extra in [
             der(0xa0, &der(10, &[2])),
+            der(0xa0, &der(4, &[1])),
+            der(0xa0, &der(10, &[])),
+            der(0xa0, &der(10, &[4])),
             der(0xa1, &der(6, &[1])),
+            der(0xa1, &der(4, &[1])),
             der(0xa3, &der(6, &[1])),
             der(0xa4, &[]),
             token.clone(),
@@ -394,6 +487,11 @@ mod tests {
             content.extend_from_slice(&token);
             assert!(response_token(&der(0xa1, &der(0x30, &content))).is_err());
         }
+        let mut field_with_trailing_data = der(10, &[1]);
+        field_with_trailing_data.push(0);
+        let mut content = der(0xa0, &field_with_trailing_data);
+        content.extend_from_slice(&token);
+        assert!(response_token(&der(0xa1, &der(0x30, &content))).is_err());
         assert!(response_token(&der(0xa1, &der(0x30, &[]))).is_err());
         assert!(response_token(&der(0xa1, &der(0x31, &token))).is_err());
         let mut content = der(0xa0, &der(10, &[1]));
@@ -483,6 +581,93 @@ mod tests {
                 assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
             });
             assert!(exchange(Ipv4Addr::LOCALHOST, number).await.is_err());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_a_bounded_nonempty_negotiate_security_buffer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let number = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            request(&mut stream).await;
+            let mut reply = response(0, 0);
+            reply.resize(129, 0);
+            reply[64] = 65;
+            reply[68..70].copy_from_slice(&DIALECTS[0].to_le_bytes());
+            reply[120..122].copy_from_slice(&128_u16.to_le_bytes());
+            reply[122..124].copy_from_slice(&1_u16.to_le_bytes());
+            reply[128] = 0x7f;
+            send(&mut stream, &reply).await.unwrap();
+            request(&mut stream).await;
+            drop(stream);
+        });
+
+        let finding = exchange(Ipv4Addr::LOCALHOST, number)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(finding.raw["dialect"], DIALECTS[0]);
+        assert_eq!(finding.raw["authenticationCompleted"], false);
+        assert!(finding.warnings[0].contains("identity unavailable"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_other_negotiate_statuses_and_invalid_response_security_buffers() {
+        let mut valid_negotiate = response(0, 0);
+        valid_negotiate.resize(128, 0);
+        valid_negotiate[64] = 65;
+        valid_negotiate[68..70].copy_from_slice(&DIALECTS[0].to_le_bytes());
+
+        let mut rejected = valid_negotiate.clone();
+        rejected[8..12].copy_from_slice(&0xc000_0022_u32.to_le_bytes());
+
+        let mut short = response(0, 0);
+        short.resize(127, 0);
+        short[64] = 65;
+
+        let mut bad_structure_size = valid_negotiate.clone();
+        bad_structure_size[64] = 64;
+
+        let mut overlapping_security_buffer = valid_negotiate.clone();
+        overlapping_security_buffer[120..122].copy_from_slice(&127_u16.to_le_bytes());
+        overlapping_security_buffer[122..124].copy_from_slice(&1_u16.to_le_bytes());
+
+        let mut truncated_security_buffer = valid_negotiate;
+        truncated_security_buffer[120..122].copy_from_slice(&128_u16.to_le_bytes());
+        truncated_security_buffer[122..124].copy_from_slice(&1_u16.to_le_bytes());
+
+        for (reply, expected) in [
+            (rejected, "rejected with NTSTATUS"),
+            (short, "invalid SMB negotiate response"),
+            (bad_structure_size, "invalid SMB negotiate response"),
+            (
+                overlapping_security_buffer,
+                "invalid SMB negotiate security buffer",
+            ),
+            (
+                truncated_security_buffer,
+                "invalid SMB negotiate security buffer",
+            ),
+        ] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let number = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                request(&mut stream).await;
+                send(&mut stream, &reply).await.unwrap();
+                assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                        .await
+                        .is_err(),
+                    "malformed or rejected modern negotiation must not trigger SMB1 fallback"
+                );
+            });
+            let error = exchange(Ipv4Addr::LOCALHOST, number).await.err().unwrap();
+            assert!(error.contains(expected), "{error}");
             server.await.unwrap();
         }
     }

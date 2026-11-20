@@ -213,6 +213,89 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rejects_oversized_responses_and_reserved_pdu_flags() {
+        let oversized = vec![0; 16_385];
+        assert!(
+            parse(&oversized, 135)
+                .err()
+                .unwrap()
+                .contains("mismatched or fragmented")
+        );
+
+        let mut reserved_flags = reply();
+        reserved_flags[3] |= 0x20;
+        assert!(
+            parse(&reserved_flags, 135)
+                .err()
+                .unwrap()
+                .contains("mismatched or fragmented")
+        );
+    }
+
+    #[test]
+    fn validates_rpc_authentication_trailer_fields_and_alignment() {
+        let valid = reply();
+        let trailer = valid.len() - ntlm::fixture().len() - 8;
+        for (offset, value) in [(trailer, 9), (trailer + 2, 4), (trailer + 3, 1)] {
+            let mut bad = valid.clone();
+            bad[offset] = value;
+            assert!(
+                parse(&bad, 135)
+                    .err()
+                    .unwrap()
+                    .contains("mismatched RPC authentication context")
+            );
+        }
+
+        let mut unaligned_trailer = valid.clone();
+        unaligned_trailer.insert(trailer, 0);
+        let length = (unaligned_trailer.len() as u16).to_le_bytes();
+        unaligned_trailer[8..10].copy_from_slice(&length);
+        assert!(
+            parse(&unaligned_trailer, 135)
+                .err()
+                .unwrap()
+                .contains("mismatched RPC authentication context")
+        );
+
+        let mut truncated_trailer = valid;
+        truncated_trailer[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(
+            parse(&truncated_trailer, 135)
+                .err()
+                .unwrap()
+                .contains("truncated RPC auth trailer")
+        );
+    }
+
+    #[test]
+    fn rejects_extra_bind_body_and_nonzero_transfer_syntax_reason() {
+        let mut extra_body = reply();
+        let token_length = usize::from(ntlm::u16le(&extra_body, 10).unwrap());
+        let trailer = extra_body.len() - token_length - 8;
+        extra_body.truncate(trailer);
+        extra_body[10..12].copy_from_slice(&0_u16.to_le_bytes());
+        extra_body.push(0);
+        let length = (extra_body.len() as u16).to_le_bytes();
+        extra_body[8..10].copy_from_slice(&length);
+        assert!(
+            parse(&extra_body, 135)
+                .err()
+                .unwrap()
+                .contains("invalid RPC context result count")
+        );
+
+        let mut rejected_syntax_reason = reply();
+        rejected_syntax_reason[38] = 1;
+        assert!(
+            parse(&rejected_syntax_reason, 135)
+                .err()
+                .unwrap()
+                .contains("unoffered RPC transfer syntax")
+        );
+    }
+
     #[tokio::test]
     async fn reads_split_tcp_response_and_stops_before_auth3() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();

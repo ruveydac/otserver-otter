@@ -291,6 +291,42 @@ mod tests {
         response
     }
 
+    fn tcp_controller_response() -> Vec<u8> {
+        let mut response = vec![0; 16];
+        response[..4].copy_from_slice(b"FINS");
+        response[4..8].copy_from_slice(&114_u32.to_be_bytes());
+        response[8..12].copy_from_slice(&2_u32.to_be_bytes());
+        response.extend(controller_response());
+        response[25] = 5;
+        response[26..28].copy_from_slice(&[5, 1]);
+        response
+    }
+
+    fn tcp_address_response() -> Vec<u8> {
+        let mut response = vec![0; 24];
+        response[..4].copy_from_slice(b"FINS");
+        response[4..8].copy_from_slice(&16_u32.to_be_bytes());
+        response[8..12].copy_from_slice(&1_u32.to_be_bytes());
+        response[19] = 10;
+        response[23] = 1;
+        response
+    }
+
+    async fn tcp_address_error(response: Vec<u8>) -> String {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 9600))
+            .await
+            .unwrap();
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; TCP_ADDRESS_REQUEST.len()];
+            stream.read_exact(&mut request).await.unwrap();
+            stream.write_all(&response).await.unwrap();
+        });
+        let error = tcp(Ipv4Addr::LOCALHOST).await.unwrap_err();
+        responder.await.unwrap();
+        error
+    }
+
     #[test]
     fn parses_controller_identity() {
         let mut response = controller_response();
@@ -314,6 +350,21 @@ mod tests {
     }
 
     #[test]
+    fn keeps_optional_identity_fields_absent_when_controller_data_is_empty() {
+        let mut response = controller_response();
+        response[14..54].fill(0);
+
+        let (fields, raw, warnings) = parse(&response, 0).unwrap();
+
+        assert!(!fields.contains_key("model"));
+        assert!(!fields.contains_key("name"));
+        assert!(!fields.contains_key("firmwareVersion"));
+        assert_eq!(raw["controllerModel"], Value::Null);
+        assert_eq!(raw["controllerVersion"], Value::Null);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
     fn request_and_response_validation_match_fins() {
         assert_eq!(UDP_REQUEST.last(), Some(&0));
         let mut response = vec![0; 106];
@@ -332,6 +383,65 @@ mod tests {
     }
 
     #[test]
+    fn tcp_parser_rejects_invalid_envelopes_and_accepts_correlated_identity() {
+        let valid = tcp_controller_response();
+        assert_eq!(parse(&valid, 16).unwrap().0["model"], "CJ2M-CPU32");
+
+        let mut bad = valid.clone();
+        bad.truncate(15);
+        assert!(parse(&bad, 16).unwrap_err().contains("FINS/TCP"));
+
+        let mut bad = valid.clone();
+        bad[0] = b'X';
+        assert!(parse(&bad, 16).unwrap_err().contains("FINS/TCP"));
+
+        let mut bad = valid.clone();
+        bad[4..8].copy_from_slice(&113_u32.to_be_bytes());
+        assert!(parse(&bad, 16).unwrap_err().contains("FINS/TCP"));
+
+        let mut bad = valid.clone();
+        bad[8..12].copy_from_slice(&1_u32.to_be_bytes());
+        assert!(parse(&bad, 16).unwrap_err().contains("FINS/TCP"));
+
+        let mut bad = valid.clone();
+        bad[12] = 1;
+        assert!(parse(&bad, 16).unwrap_err().contains("FINS/TCP"));
+
+        let mut bad = valid.clone();
+        bad[16] = 0;
+        assert!(
+            parse(&bad, 16)
+                .unwrap_err()
+                .contains("invalid controller response")
+        );
+
+        let mut bad = valid.clone();
+        bad[25] = 4;
+        assert!(
+            parse(&bad, 16)
+                .unwrap_err()
+                .contains("invalid controller response")
+        );
+
+        let mut bad = valid.clone();
+        bad[26] = 4;
+        assert!(
+            parse(&bad, 16)
+                .unwrap_err()
+                .contains("invalid controller response")
+        );
+
+        let mut short_payload = valid;
+        short_payload.truncate(29);
+        short_payload[4..8].copy_from_slice(&21_u32.to_be_bytes());
+        assert!(
+            parse(&short_payload, 16)
+                .unwrap_err()
+                .contains("invalid controller response")
+        );
+    }
+
+    #[test]
     fn validates_routes_and_accepts_short_error_pdus() {
         let mut response = controller_response();
         assert!(validate_route(&response, &UDP_REQUEST).is_ok());
@@ -343,6 +453,59 @@ mod tests {
         assert_eq!(parse(&response, 0).unwrap().1["responseCode"], "0001");
         response[13] = 0;
         assert!(parse(&response, 0).is_err());
+    }
+
+    #[test]
+    fn route_validation_rejects_each_mismatch() {
+        let request = [0x80, 0, 2, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let mut valid = [0; 14];
+        valid[3..6].copy_from_slice(&request[6..9]);
+        valid[6] = request[3];
+        valid[7] = request[4];
+        valid[8] = request[5];
+        valid[9..12].copy_from_slice(&request[9..12]);
+        assert!(validate_route(&valid, &request).is_ok());
+
+        for index in [1, 3, 6, 7, 8, 9] {
+            let mut bad = valid;
+            bad[index] ^= 1;
+            assert!(
+                validate_route(&bad, &request).is_err(),
+                "response byte {index}"
+            );
+        }
+        assert!(validate_route(&valid[..13], &request).is_err());
+        assert!(validate_route(&valid, &request[..11]).is_err());
+
+        let mut routed_request = request;
+        routed_request[4] = 9;
+        let mut bad_unit = valid;
+        bad_unit[7] = 8;
+        assert!(validate_route(&bad_unit, &routed_request).is_err());
+    }
+
+    #[tokio::test]
+    async fn tcp_address_negotiation_rejects_invalid_lengths_status_and_nodes() {
+        let _network = crate::network_test_lock().await;
+        let mut short = b"FINS".to_vec();
+        short.extend(12_u32.to_be_bytes());
+        short.extend([0; 12]);
+        assert!(
+            tcp_address_error(short)
+                .await
+                .contains("invalid signature, status, or node address")
+        );
+
+        for index in [8, 12, 16, 19, 20, 23] {
+            let mut bad = tcp_address_response();
+            bad[index] = if index == 19 || index == 23 { 0 } else { 1 };
+            assert!(
+                tcp_address_error(bad)
+                    .await
+                    .contains("invalid signature, status, or node address"),
+                "response byte {index}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -512,12 +675,22 @@ mod tests {
         let responder = tokio::spawn(async move {
             let mut request = [0; UDP_REQUEST.len()];
             let (_, peer) = socket.recv_from(&mut request).await.unwrap();
-            socket.send_to(&[0; 106], peer).await.unwrap();
+            let mut malformed = controller_response();
+            malformed.truncate(14);
+            socket.send_to(&malformed, peer).await.unwrap();
         });
 
         let error = udp(Ipv4Addr::LOCALHOST).await.unwrap_err();
 
         assert_eq!(error, "malformed or uncorrelated FINS response");
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_treats_silence_as_no_response() {
+        let _network = crate::network_test_lock().await;
+        let _socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 9600)).await.unwrap();
+
+        assert!(udp(Ipv4Addr::LOCALHOST).await.unwrap().is_none());
     }
 }

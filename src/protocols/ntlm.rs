@@ -229,6 +229,21 @@ pub(super) fn fixture() -> Vec<u8> {
 mod tests {
     use super::*;
 
+    fn fixture_with_av_pair(id: u16, value: &[u8]) -> Vec<u8> {
+        let mut bytes = fixture();
+        let mut info = id.to_le_bytes().to_vec();
+        info.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        info.extend_from_slice(value);
+        info.extend_from_slice(&[0; 4]);
+        bytes.truncate(56);
+        bytes.extend_from_slice(&info);
+        let length = info.len() as u16;
+        bytes[40..42].copy_from_slice(&length.to_le_bytes());
+        bytes[42..44].copy_from_slice(&length.to_le_bytes());
+        bytes[44..48].copy_from_slice(&56_u32.to_le_bytes());
+        bytes
+    }
+
     #[test]
     fn reports_build_and_preserves_client_server_ambiguity() {
         let (fields, raw) = challenge(&fixture()).unwrap();
@@ -248,11 +263,52 @@ mod tests {
         for end in 0..bytes.len() {
             assert!(challenge(&bytes[..end]).is_err(), "length {end}");
         }
+        let mut bad_signature = bytes.clone();
+        bad_signature[0] ^= 1;
+        assert!(challenge(&bad_signature).is_err());
+
         for (offset, value) in [(8, 3), (44, 1), (55, 0), (58, 255), (60, 0)] {
             let mut bad = bytes.clone();
             bad[offset] = value;
             assert!(challenge(&bad).is_err(), "offset {offset}");
         }
+
+        let mut oversized = bytes;
+        oversized.resize(65_537, 0);
+        assert!(challenge(&oversized).is_err());
+    }
+
+    #[test]
+    fn detects_optional_target_info_from_legacy_header_fields() {
+        let mut no_info = vec![0; 48];
+        no_info[..8].copy_from_slice(b"NTLMSSP\0");
+        no_info[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        no_info[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        no_info[12..16].copy_from_slice(&[6, 0, 6, 0]);
+        no_info[16..20].copy_from_slice(&32_u32.to_le_bytes());
+        no_info[32..38].copy_from_slice(b"O\0L\0D\0");
+        assert_eq!(challenge(&no_info).unwrap().1["targetName"], "OLD");
+
+        let mut target_after_optional_header = vec![0; 50];
+        target_after_optional_header[..8].copy_from_slice(b"NTLMSSP\0");
+        target_after_optional_header[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        target_after_optional_header[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        target_after_optional_header[12..16].copy_from_slice(&[2, 0, 2, 0]);
+        target_after_optional_header[16..20].copy_from_slice(&48_u32.to_le_bytes());
+        target_after_optional_header[44..48].copy_from_slice(&50_u32.to_le_bytes());
+        target_after_optional_header[48..50].copy_from_slice(b"T\0");
+        assert_eq!(
+            challenge(&target_after_optional_header).unwrap().1["targetName"],
+            "T"
+        );
+
+        let mut empty_target = vec![0; 48];
+        empty_target[..8].copy_from_slice(b"NTLMSSP\0");
+        empty_target[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        empty_target[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        empty_target[16..20].copy_from_slice(&32_u32.to_le_bytes());
+        empty_target[44..48].copy_from_slice(&48_u32.to_le_bytes());
+        assert_eq!(challenge(&empty_target).unwrap().1["targetName"], "");
     }
 
     #[test]
@@ -407,6 +463,15 @@ mod tests {
                 .contains("invalid NTLM AV terminator")
         );
 
+        let mut trailing_after_terminator = fixture.clone();
+        trailing_after_terminator.extend_from_slice(&[0xaa, 0xbb]);
+        trailing_after_terminator[40..44].copy_from_slice(&28_u16.to_le_bytes().repeat(2));
+        assert!(
+            challenge(&trailing_after_terminator)
+                .unwrap_err()
+                .contains("invalid NTLM AV terminator")
+        );
+
         let mut missing_terminator = fixture;
         missing_terminator[40..44].copy_from_slice(&22_u16.to_le_bytes().repeat(2));
         assert!(
@@ -414,5 +479,61 @@ mod tests {
                 .unwrap_err()
                 .contains("missing NTLM AV terminator")
         );
+    }
+
+    #[test]
+    fn rejects_missing_negotiate_flag_and_accepts_disjoint_target_payloads() {
+        let mut missing_flag = fixture();
+        missing_flag[20] &= !1;
+        assert_eq!(
+            challenge(&missing_flag).unwrap_err(),
+            "unsupported NTLM challenge layout"
+        );
+
+        let mut target_after_info = fixture();
+        let target_start = target_after_info.len() as u32;
+        target_after_info[12..16].copy_from_slice(&[2, 0, 2, 0]);
+        target_after_info[16..20].copy_from_slice(&target_start.to_le_bytes());
+        target_after_info.extend_from_slice(b"T\0");
+        assert_eq!(challenge(&target_after_info).unwrap().1["targetName"], "T");
+
+        let mut target_before_info = fixture();
+        let info = target_before_info[56..].to_vec();
+        target_before_info.truncate(56);
+        target_before_info.extend_from_slice(b"T\0");
+        target_before_info.extend_from_slice(&[0; 2]);
+        let info_start = target_before_info.len() as u32;
+        target_before_info.extend_from_slice(&info);
+        target_before_info[12..16].copy_from_slice(&[2, 0, 2, 0]);
+        target_before_info[16..20].copy_from_slice(&56_u32.to_le_bytes());
+        target_before_info[44..48].copy_from_slice(&info_start.to_le_bytes());
+        assert_eq!(challenge(&target_before_info).unwrap().1["targetName"], "T");
+    }
+
+    #[test]
+    fn accepts_valid_fixed_length_attributes_and_omits_empty_computer_names() {
+        for (id, value) in [(6, vec![0; 4]), (7, vec![0; 8]), (10, vec![0; 16])] {
+            assert!(challenge(&fixture_with_av_pair(id, &value)).is_ok());
+        }
+
+        let (fields, raw) = challenge(&fixture_with_av_pair(3, &[])).unwrap();
+        assert!(!fields.contains_key("name"));
+        assert_eq!(raw["names"]["dnsComputerName"], "");
+    }
+
+    #[test]
+    fn rejects_reserved_version_bytes_and_does_not_normalize_zero_major() {
+        let mut invalid_version = fixture();
+        invalid_version[52] = 1;
+        assert_eq!(
+            challenge(&invalid_version).unwrap_err(),
+            "invalid NTLM version"
+        );
+
+        let mut zero_major = fixture();
+        zero_major[48] = 0;
+        let (fields, raw) = challenge(&zero_major).unwrap();
+        assert_eq!(raw["reportedVersion"]["major"], 0);
+        assert!(!fields.contains_key("operatingSystem"));
     }
 }

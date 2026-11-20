@@ -449,16 +449,18 @@ mod tests {
     };
     use iec61850_server::{IedServer, IedServerConfig, ServerHandle};
     use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     fn attribute<'a>(
         model: &'a IedModel,
+        logical_device: &str,
         node: &str,
         object: &str,
         name: &str,
     ) -> &'a DataAttribute {
         let DoChild::Da(attribute) = model
-            .ld_by_inst("LD0")
+            .ld_by_inst(logical_device)
             .unwrap()
             .ln_by_name(node)
             .unwrap()
@@ -521,14 +523,14 @@ mod tests {
             .build()
             .unwrap();
 
-        attribute(&model, "LLN0", "NamPlt", "vendor")
+        attribute(&model, "LD0", "LLN0", "NamPlt", "vendor")
             .store(MmsValue::VisibleString("NamPlt Vendor".into()));
-        attribute(&model, "LLN0", "NamPlt", "swRev")
+        attribute(&model, "LD0", "LLN0", "NamPlt", "swRev")
             .store(MmsValue::VisibleString("SW-LLN0".into()));
         if standard_health {
-            attribute(&model, "LLN0", "Health", "stVal").store(MmsValue::Integer(1));
+            attribute(&model, "LD0", "LLN0", "Health", "stVal").store(MmsValue::Integer(1));
         } else {
-            attribute(&model, "LLN0", "Health", "stVal").store(MmsValue::Boolean(true));
+            attribute(&model, "LD0", "LLN0", "Health", "stVal").store(MmsValue::Boolean(true));
         }
         for (name, value) in [
             ("vendor", "Lab Vendor"),
@@ -538,12 +540,13 @@ mod tests {
             ("swRev", "SW-3"),
             ("location", "Lab / Bay 1"),
         ] {
-            attribute(&model, "LPHD1", "PhyNam", name).store(MmsValue::VisibleString(value.into()));
+            attribute(&model, "LD0", "LPHD1", "PhyNam", name)
+                .store(MmsValue::VisibleString(value.into()));
         }
-        attribute(&model, "LPHD1", "PhyHealth", "stVal").store(MmsValue::Boolean(true));
-        attribute(&model, "XCBR1", "Pos", "stVal").store(Dbpos::On.to_mms_bit_string());
-        attribute(&model, "XCBR1", "BlkOpn", "stVal").store(MmsValue::Boolean(false));
-        attribute(&model, "XCBR1", "BlkCls", "stVal").store(MmsValue::Boolean(false));
+        attribute(&model, "LD0", "LPHD1", "PhyHealth", "stVal").store(MmsValue::Boolean(true));
+        attribute(&model, "LD0", "XCBR1", "Pos", "stVal").store(Dbpos::On.to_mms_bit_string());
+        attribute(&model, "LD0", "XCBR1", "BlkOpn", "stVal").store(MmsValue::Boolean(false));
+        attribute(&model, "LD0", "XCBR1", "BlkCls", "stVal").store(MmsValue::Boolean(false));
         Arc::new(model)
     }
 
@@ -560,6 +563,159 @@ mod tests {
         let handle = server.start().await.unwrap();
         let port = handle.bound_addr.port();
         (handle, port)
+    }
+
+    async fn probe_error(model: Arc<IedModel>) -> String {
+        let (handle, port) = spawn_server(model).await;
+        let error = match probe(Ipv4Addr::LOCALHOST, port).await {
+            Err(error) => error,
+            Ok(_) => panic!("expected an invalid server directory to fail"),
+        };
+        handle.stop().await;
+        error
+    }
+
+    fn model_with_logical_device_count(count: usize) -> Arc<IedModel> {
+        let mut builder = IedModelBuilder::new("LIMITS");
+        for index in 0..count {
+            let device = LogicalDeviceBuilder::new(&format!("LD{index:02}"))
+                .add_ln(LogicalNodeBuilder::lln0().build().unwrap())
+                .build()
+                .unwrap();
+            builder = builder.add_ld(device).unwrap();
+        }
+        Arc::new(builder.build().unwrap())
+    }
+
+    fn model_with_logical_node_count(count: usize) -> Arc<IedModel> {
+        let mut device =
+            LogicalDeviceBuilder::new("LD0").add_ln(LogicalNodeBuilder::lln0().build().unwrap());
+        for index in 0..count {
+            let node = LogicalNodeBuilder::new("", "X", &index.to_string())
+                .build()
+                .unwrap();
+            device = device.add_ln(node);
+        }
+        Arc::new(
+            IedModelBuilder::new("LIMITS")
+                .add_ld(device.build().unwrap())
+                .unwrap()
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn model_with_variable_count(count: usize) -> Arc<IedModel> {
+        let mut node = LogicalNodeBuilder::lln0();
+        for index in 0..count {
+            node = node.add_do(cdc::sps(&format!("D{index:04}"), CdcOptions::NONE));
+        }
+        let device = LogicalDeviceBuilder::new("LD0")
+            .add_ln(node.build().unwrap())
+            .build()
+            .unwrap();
+        Arc::new(
+            IedModelBuilder::new("LIMITS")
+                .add_ld(device)
+                .unwrap()
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn health_only_model() -> Arc<IedModel> {
+        let lln0 = LogicalNodeBuilder::lln0()
+            .add_do(cdc::ens("Health", CdcOptions::NONE))
+            .build()
+            .unwrap();
+        let device = LogicalDeviceBuilder::new("LD0")
+            .add_ln(lln0)
+            .build()
+            .unwrap();
+        let model = IedModelBuilder::new("STATUS")
+            .add_ld(device)
+            .unwrap()
+            .build()
+            .unwrap();
+        attribute(&model, "LD0", "LLN0", "Health", "stVal").store(MmsValue::Integer(2));
+        Arc::new(model)
+    }
+
+    #[test]
+    #[should_panic(expected = "LLN0.Parent.Nested is not a data attribute")]
+    fn attribute_rejects_nested_data_objects() {
+        let parent = DataObjectBuilder::scalar("Parent")
+            .add_sub_do(DataObjectBuilder::scalar("Nested").build().unwrap())
+            .build()
+            .unwrap();
+        let lln0 = LogicalNodeBuilder::lln0().add_do(parent).build().unwrap();
+        let device = LogicalDeviceBuilder::new("LD0")
+            .add_ln(lln0)
+            .build()
+            .unwrap();
+        let model = IedModelBuilder::new("TEST")
+            .add_ld(device)
+            .unwrap()
+            .build()
+            .unwrap();
+        attribute(&model, "LD0", "LLN0", "Parent", "Nested");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejects_excessive_logical_device_directories() {
+        let too_many = model_with_logical_device_count(MAX_LOGICAL_DEVICES + 1);
+        assert!(
+            probe_error(too_many)
+                .await
+                .contains("invalid logical-device count 65")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejects_excessive_logical_nodes_and_variables() {
+        let too_many_nodes = model_with_logical_node_count(MAX_LOGICAL_NODES + 1);
+        assert!(
+            probe_error(too_many_nodes)
+                .await
+                .contains("has too many logical nodes")
+        );
+
+        let too_many_variables = model_with_variable_count(MAX_VARIABLES_PER_NODE + 1);
+        assert!(
+            probe_error(too_many_variables)
+                .await
+                .contains("advertises too many variables")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collects_status_without_nameplate_identity() {
+        let (handle, port) = spawn_server(health_only_model()).await;
+        let finding = probe(Ipv4Addr::LOCALHOST, port).await.unwrap().unwrap();
+
+        assert_eq!(finding.fields["health"], "warning");
+        assert!(!finding.fields.contains_key("vendor"));
+        assert!(!finding.fields.contains_key("name"));
+        assert!(finding.raw["fieldSources"].get("serialNumber").is_none());
+        assert!(finding.raw.get("serialClaim").is_none());
+        handle.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_transport_is_not_classified_as_absent_service() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(&[0, 0, 0, 0]).await.unwrap();
+        });
+
+        let error = probe(Ipv4Addr::LOCALHOST, port)
+            .await
+            .err()
+            .expect("malformed transport response should fail");
+        assert!(error.contains("IEC 61850"));
+        responder.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -632,9 +788,11 @@ mod tests {
         assert!(!finding.fields.contains_key("health"));
         assert_eq!(finding.fields["vendor"], "Lab Vendor");
         assert_eq!(finding.fields["physicalHealth"], true);
+        let warnings = std::iter::once("unrelated warning".to_owned())
+            .chain(finding.warnings.iter().cloned())
+            .collect::<Vec<_>>();
         assert!(
-            finding
-                .warnings
+            warnings
                 .iter()
                 .any(|warning| warning.contains("LLN0.Health.stVal[ST]")
                     && warning.contains("expected health"))
@@ -669,19 +827,8 @@ mod tests {
             ("LD1", "serNum", "SERIAL-B"),
             ("LD1", "model", "Device B"),
         ] {
-            let DoChild::Da(attribute) = model
-                .ld_by_inst(ld)
-                .unwrap()
-                .ln_by_name("LPHD1")
-                .unwrap()
-                .do_by_name("PhyNam")
-                .unwrap()
-                .child_by_name(name)
-                .unwrap()
-            else {
-                panic!("missing identity attribute")
-            };
-            attribute.store(MmsValue::VisibleString(value.into()));
+            attribute(&model, ld, "LPHD1", "PhyNam", name)
+                .store(MmsValue::VisibleString(value.into()));
         }
         let (handle, port) = spawn_server(Arc::new(model)).await;
         let finding = probe(Ipv4Addr::LOCALHOST, port).await.unwrap().unwrap();

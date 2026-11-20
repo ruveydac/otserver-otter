@@ -156,6 +156,20 @@ struct Finding {
     warnings: Vec<String>,
 }
 
+fn ensure_serial_claim(fields: &BTreeMap<String, Value>, raw: &mut serde_json::Map<String, Value>) {
+    if let Some(serial) = fields.get("serialNumber") {
+        raw.entry("serialClaim").or_insert_with(|| {
+            serde_json::json!({
+                "scope": "device",
+                "issuer": fields.get("vendor"),
+                "original": serial,
+                "encoding": "protocol-text",
+                "normalizationVersion": 1,
+            })
+        });
+    }
+}
+
 pub async fn scan(
     target: Ipv4Addr,
     mac: Option<&str>,
@@ -414,17 +428,7 @@ pub async fn scan_with_cancellation(
                                 .collect(),
                         ),
                     );
-                    if let Some(serial) = finding.fields.get("serialNumber") {
-                        raw.entry("serialClaim").or_insert_with(|| {
-                            serde_json::json!({
-                                "scope": "device",
-                                "issuer": finding.fields.get("vendor"),
-                                "original": serial,
-                                "encoding": "protocol-text",
-                                "normalizationVersion": 1,
-                            })
-                        });
-                    }
+                    ensure_serial_claim(&finding.fields, raw);
                 }
                 ports.append(&mut finding.ports);
                 observations.push(Observation {
@@ -622,6 +626,11 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
+
+    async fn mark_polled(polled: std::sync::Arc<AtomicBool>) -> Result<Option<Finding>, String> {
+        polled.store(true, Ordering::Relaxed);
+        Ok(None)
+    }
 
     // Windows itself can answer SMB, RPC, and NetBIOS on loopback, so only a
     // Linux loopback target is genuinely empty.
@@ -886,6 +895,98 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn ads_read_state_warning_is_reported_as_partial_without_cancellation() {
+        let _network = crate::network_test_lock().await;
+        const TCP_PORT: u16 = 48_898;
+        const UDP_PORT: u16 = 48_899;
+        const COOKIE: u32 = 0x7114_6603;
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, UDP_PORT))
+            .await
+            .unwrap();
+        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, TCP_PORT))
+            .await
+            .unwrap();
+        let cancelled = AtomicBool::new(false);
+        let responder = async {
+            let mut request = [0; 24];
+            let (length, peer) = udp.recv_from(&mut request).await.unwrap();
+            assert_eq!(length, request.len());
+            let mut discovery = Vec::from(COOKIE.to_le_bytes());
+            discovery.extend(0_u32.to_le_bytes());
+            discovery.extend(0x8000_0001_u32.to_le_bytes());
+            discovery.extend([127, 0, 0, 1, 1, 1]);
+            discovery.extend(0_u16.to_le_bytes());
+            discovery.extend(0_u32.to_le_bytes());
+            udp.send_to(&discovery, peer).await.unwrap();
+
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            for (expected_command, data) in [
+                (1, {
+                    let mut data = Vec::from([3, 1]);
+                    data.extend(4021_u16.to_le_bytes());
+                    data.extend(b"Test PLC".iter().copied());
+                    data.resize(24, 0);
+                    data
+                }),
+                (4, Vec::from(0_u32.to_le_bytes())),
+            ] {
+                let mut prefix = [0; 6];
+                stream.read_exact(&mut prefix).await.unwrap();
+                let frame_length = u32::from_le_bytes(prefix[2..6].try_into().unwrap()) as usize;
+                let mut request = vec![0; frame_length];
+                stream.read_exact(&mut request).await.unwrap();
+                assert_eq!(
+                    u16::from_le_bytes(request[16..18].try_into().unwrap()),
+                    expected_command
+                );
+
+                let mut frame = prefix.to_vec();
+                frame.extend_from_slice(&request);
+                stream
+                    .write_all(&ads_test_response(&frame, &data))
+                    .await
+                    .unwrap();
+            }
+        };
+        let selection = Selection {
+            s7: false,
+            enip: false,
+            bacnet: false,
+            fins: false,
+            fox: false,
+            dnp3: false,
+            iec61850: false,
+            netbios: false,
+            smb: false,
+            rpc: false,
+            http: false,
+            opcua: false,
+            ads: true,
+        };
+        let settings = opcua::ProbeSettings::default();
+        let ads_settings = AdsSettings::from_config(None, &BTreeMap::new(), &[851]).unwrap();
+        let (result, ()) = tokio::join!(
+            scan_with_cancellation(
+                Ipv4Addr::LOCALHOST,
+                Some("00:11:22:33:44:55"),
+                selection,
+                &settings,
+                &ads_settings,
+                &cancelled,
+            ),
+            responder,
+        );
+
+        assert_eq!(result.observations.len(), 1);
+        assert_eq!(result.outcomes[0].status, ProbeStatus::Partial);
+        assert_eq!(
+            result.observations[0].raw["endpoints"][0]["readState"]["outcome"],
+            "invalid-response"
+        );
+        assert!(!result.outcomes[0].messages.is_empty());
+    }
+
     fn ads_test_response(request: &[u8], data: &[u8]) -> Vec<u8> {
         let request_header = &request[6..38];
         let mut header = Vec::from(&request_header[8..14]);
@@ -959,12 +1060,235 @@ mod tests {
         bacnet_task.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn incomplete_fox_reply_is_a_protocol_failure() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 1911))
+            .await
+            .unwrap();
+        let responder = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+        let selection = Selection {
+            s7: false,
+            enip: false,
+            bacnet: false,
+            fins: false,
+            fox: true,
+            dnp3: false,
+            iec61850: false,
+            netbios: false,
+            smb: false,
+            rpc: false,
+            http: false,
+            opcua: false,
+            ads: false,
+        };
+        let result = scan(
+            Ipv4Addr::LOCALHOST,
+            None,
+            selection,
+            &opcua::ProbeSettings::default(),
+        )
+        .await;
+
+        assert_eq!(result.outcomes.len(), 1);
+        assert_eq!(result.outcomes[0].status, ProbeStatus::NoResponse);
+        assert!(!result.outcomes[0].messages.is_empty());
+        responder.await.unwrap();
+    }
+
+    #[test]
+    fn probe_status_labels_match_diagnostic_contract() {
+        for (status, expected) in [
+            (ProbeStatus::Success, "SUCCESS"),
+            (ProbeStatus::Partial, "PARTIAL"),
+            (ProbeStatus::NoResponse, "NO_RESPONSE"),
+            (ProbeStatus::Failure, "FAIL"),
+            (ProbeStatus::Cancelled, "CANCELLED"),
+        ] {
+            assert_eq!(status.label(), expected);
+        }
+    }
+
+    #[test]
+    fn diagnostic_endpoints_follow_configured_listener_scope() {
+        let target = Ipv4Addr::new(192, 0, 2, 10);
+        let opcua = opcua::ProbeSettings {
+            ports: vec![4840, 48400],
+            ..opcua::ProbeSettings::default()
+        };
+        let ads = AdsSettings::default();
+        assert_eq!(
+            endpoint("opc-ua", target, &opcua, &ads),
+            "opc.tcp/4840,48400"
+        );
+        assert_eq!(
+            endpoint("beckhoff-ads", target, &opcua, &ads),
+            "udp/48899 and tcp/48898 (AMS)"
+        );
+
+        let configured_ads = AdsSettings {
+            target_net_ids: BTreeMap::from([(target, [10, 0, 0, 1, 1, 1])]),
+            ..AdsSettings::default()
+        };
+        assert_eq!(
+            endpoint("beckhoff-ads", target, &opcua, &configured_ads),
+            "tcp/48898 (AMS; configured target NetID)"
+        );
+        assert_eq!(
+            endpoint("unknown", target, &opcua, &ads),
+            "configured endpoint"
+        );
+        assert_eq!(timeout("unknown"), "2s");
+    }
+
+    #[test]
+    fn serial_claims_preserve_protocol_evidence_and_ignore_absent_serials() {
+        let mut raw = serde_json::Map::new();
+        ensure_serial_claim(&BTreeMap::new(), &mut raw);
+        assert!(raw.get("serialClaim").is_none());
+
+        let fields = BTreeMap::from([
+            ("serialNumber".into(), serde_json::json!("SN-1")),
+            ("vendor".into(), serde_json::json!("Example Vendor")),
+        ]);
+        ensure_serial_claim(&fields, &mut raw);
+        assert_eq!(
+            raw["serialClaim"],
+            serde_json::json!({
+                "scope": "device",
+                "issuer": "Example Vendor",
+                "original": "SN-1",
+                "encoding": "protocol-text",
+                "normalizationVersion": 1,
+            })
+        );
+
+        raw["serialClaim"] = serde_json::json!({"scope": "protocol"});
+        ensure_serial_claim(&fields, &mut raw);
+        assert_eq!(raw["serialClaim"]["scope"], "protocol");
+    }
+
+    #[test]
+    fn each_protocol_selection_is_independently_selectable() {
+        let disabled = Selection {
+            s7: false,
+            enip: false,
+            bacnet: false,
+            fins: false,
+            fox: false,
+            dnp3: false,
+            iec61850: false,
+            netbios: false,
+            smb: false,
+            rpc: false,
+            http: false,
+            opcua: false,
+            ads: false,
+        };
+        assert!(!disabled.any());
+
+        let mut selections = [disabled; 13];
+        selections[0].s7 = true;
+        selections[1].enip = true;
+        selections[2].bacnet = true;
+        selections[3].fins = true;
+        selections[4].fox = true;
+        selections[5].dnp3 = true;
+        selections[6].iec61850 = true;
+        selections[7].netbios = true;
+        selections[8].smb = true;
+        selections[9].rpc = true;
+        selections[10].http = true;
+        selections[11].opcua = true;
+        selections[12].ads = true;
+
+        for (selection, expected) in selections.into_iter().zip([
+            vec!["S7"],
+            vec!["EtherNet/IP"],
+            vec!["BACnet"],
+            vec!["FINS"],
+            vec!["Fox"],
+            vec!["DNP3"],
+            vec!["IEC 61850"],
+            vec!["NetBIOS"],
+            vec!["SMB"],
+            vec!["RPC"],
+            vec!["HTTP", "HTTPS"],
+            vec!["OPC UA"],
+            vec!["Beckhoff ADS"],
+        ]) {
+            assert!(selection.any());
+            assert_eq!(selection.labels(), expected);
+        }
+    }
+
+    #[test]
+    fn warning_and_transport_error_classifiers_cover_protocol_wording() {
+        for (message, expected) in [
+            ("Unencrypted channel", true),
+            ("reported value differs from configured value", true),
+            ("property is unavailable", false),
+        ] {
+            assert_eq!(informational_warning(message), expected);
+        }
+
+        for (message, refused, expected_timeout, closed) in [
+            ("connection refused", true, false, false),
+            ("timed out", false, true, false),
+            ("timeout", false, true, false),
+            ("connection reset", false, false, true),
+            ("connection closed", false, false, true),
+            ("peer closed the stream", false, false, true),
+            ("malformed response", false, false, false),
+        ] {
+            assert_eq!(connection_refused(message), refused);
+            assert_eq!(timed_out(message), expected_timeout);
+            assert_eq!(peer_closed(message), closed);
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_probe_is_not_polled_and_enabled_probe_is_collected() {
+        let polled = std::sync::Arc::new(AtomicBool::new(false));
+        let result = probe_if(false, mark_polled(std::sync::Arc::clone(&polled))).await;
+        assert!(matches!(result, Ok(None)));
+        assert!(!polled.load(Ordering::Relaxed));
+        assert!(matches!(
+            probe_if(true, mark_polled(std::sync::Arc::clone(&polled))).await,
+            Ok(None)
+        ));
+        assert!(polled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn probe_results_replace_duplicate_indices() {
+        let completed = Mutex::new(Vec::new());
+        store_probe_result(1, Ok(None), &completed);
+        store_probe_result(2, Err("other probe".into()), &completed);
+        store_probe_result(1, Err("replacement".into()), &completed);
+
+        let completed = completed.lock().unwrap();
+        assert_eq!(completed.len(), 2);
+        assert_eq!(
+            completed[0].1.as_ref().err().map(String::as_str),
+            Some("replacement")
+        );
+        assert_eq!(
+            completed[1].1.as_ref().err().map(String::as_str),
+            Some("other probe")
+        );
+    }
+
     #[test]
     fn diagnostic_stages_identify_each_protocol_exchange() {
         for (protocol, message, expected) in [
             ("s7", "setup communication rejected", "setup-communication"),
             ("s7", "SZL rejected", "szl-read"),
             ("s7", "TSAP rejected", "tsap-negotiate"),
+            ("s7", "COTP rejected", "tsap-negotiate"),
             ("s7", "other", "probe"),
             ("ethernet-ip", "CIP rejected", "cip-read"),
             ("ethernet-ip", "other", "list-identity"),
@@ -983,14 +1307,19 @@ mod tests {
             ("iec61850", "other", "mms-read"),
             ("netbios", "other", "node-status"),
             ("smb", "identity rejected", "session-setup"),
+            ("smb", "NTLM challenge rejected", "session-setup"),
             ("smb", "other", "negotiate"),
             ("rpc", "other", "endpoint-mapper-bind"),
             ("opc-ua", "endpoint rejected", "get-endpoints"),
             ("opc-ua", "session rejected", "activate-session"),
+            ("opc-ua", "authentication rejected", "activate-session"),
             ("opc-ua", "BuildInfo rejected", "read-build-info"),
             ("opc-ua", "asset rejected", "asset-discovery"),
+            ("opc-ua", "alias rejected", "asset-discovery"),
             ("opc-ua", "other", "opc-ua-service"),
             ("http", "body rejected", "read-response-body"),
+            ("http", "other", "get-root"),
+            ("https", "body rejected", "read-response-body"),
             ("https", "other", "get-root"),
             ("beckhoff-ads", "ReadState rejected", "read-state"),
             (

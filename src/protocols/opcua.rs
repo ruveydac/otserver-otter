@@ -960,7 +960,7 @@ mod tests {
         node_manager::memory::{InMemoryNodeManager, SimpleNodeManagerImpl, simple_node_manager},
     };
     use opcua::types::{
-        AccessRestrictionType, Array, DataTypeId, ExpandedNodeId, LocalizedText,
+        AccessRestrictionType, Array, DataTypeId, DataValue, ExpandedNodeId, LocalizedText,
         VariantScalarTypeId, argument::Argument,
     };
     use tokio::io::AsyncReadExt;
@@ -999,6 +999,14 @@ mod tests {
         assert_eq!(
             variant_to_value(&Variant::ExtensionObject(object)),
             json!({ "offsetMinutes": 120, "daylightSavingInOffset": true })
+        );
+        let object = ExtensionObject::from_message(AliasNameDataType {
+            alias_name: QualifiedName::new(2, "not-a-time-zone"),
+            referenced_nodes: None,
+        });
+        assert_eq!(
+            variant_to_value(&Variant::ExtensionObject(object)),
+            Value::Null
         );
     }
 
@@ -1069,6 +1077,46 @@ mod tests {
     }
 
     #[test]
+    fn handles_empty_and_fallback_asset_fields() {
+        assert!(asset_fields(&[]).is_empty());
+
+        let entry = |display_name: &str, identification: Map<String, Value>| AssetEntry {
+            node_id: NodeId::new(2, 300),
+            display_name: display_name.into(),
+            identification,
+            locations: Map::new(),
+            documentation_links: vec![],
+            operation_counters: Map::new(),
+            health: None,
+            health_timestamp: None,
+            read_outcomes: vec![],
+        };
+
+        assert_eq!(
+            asset_fields(&[entry("DeviceSet name", Map::new())])["name"],
+            "DeviceSet name"
+        );
+        assert_eq!(
+            asset_fields(&[entry(
+                "",
+                Map::from_iter([("ProductInstanceUri".into(), json!("urn:lab:asset"))]),
+            )])["name"],
+            "urn:lab:asset"
+        );
+        assert!(
+            !asset_fields(&[entry("", Map::new())]).contains_key("name"),
+            "empty names and product URIs are not exported"
+        );
+        assert!(
+            !asset_fields(&[entry(
+                "",
+                Map::from_iter([("PatchIdentifiers".into(), json!([" ", 12]))]),
+            )])
+            .contains_key("patchIdentifiers")
+        );
+    }
+
+    #[test]
     fn token_labels_are_sorted_and_deduplicated() {
         let endpoint = EndpointDescription::from((
             "opc.tcp://lab:4840",
@@ -1094,6 +1142,20 @@ mod tests {
         assert_eq!(raw["securityMode"], "SignAndEncrypt");
         assert_eq!(raw["certificate"]["outcome"], "limit-reached");
         assert!(raw["certificate"]["hex"].is_null());
+    }
+
+    #[test]
+    fn reports_non_transport_endpoint_failures() {
+        let finding = endpoint_failure_finding(
+            "opc.tcp://127.0.0.1:4840",
+            4840,
+            UaError::new(
+                StatusCode::BadUnexpectedError,
+                std::io::Error::other("invalid endpoint response"),
+            ),
+        )
+        .unwrap();
+        assert!(finding.warnings[0].contains("BadUnexpectedError"));
     }
 
     #[tokio::test]
@@ -1125,6 +1187,23 @@ mod tests {
         require_username: bool,
     }
 
+    #[derive(Default)]
+    struct LabOptions {
+        endpoint_count: Option<usize>,
+        no_user_tokens: bool,
+        omit_asset: bool,
+        empty_asset: bool,
+        unreadable_health: bool,
+        non_numeric_health: bool,
+        absent_documentation_value: bool,
+        reject_alias: bool,
+        malformed_alias_response: bool,
+        duplicate_alias_response: bool,
+        duplicate_manufacturer_reference: bool,
+        extra_asset_references: bool,
+        extra_browse_children: usize,
+    }
+
     fn namespace_metadata(index: u16, uri: &str) -> NamespaceMetadata {
         NamespaceMetadata {
             default_access_restrictions: AccessRestrictionType::empty(),
@@ -1141,11 +1220,25 @@ mod tests {
         }
     }
 
-    fn add_variables(space: &mut AddressSpace, ns: u16) {
+    fn add_variables(
+        space: &mut AddressSpace,
+        ns: u16,
+        absent_documentation_value: bool,
+        non_numeric_health: bool,
+    ) {
         let identification = NodeId::new(ns, 310);
         let string: NodeId = DataTypeId::String.into();
         let localized: NodeId = DataTypeId::LocalizedText.into();
-        let int32: NodeId = DataTypeId::Int32.into();
+        let health_value = if non_numeric_health {
+            Variant::String(UAString::from("unknown"))
+        } else {
+            Variant::Int32(0)
+        };
+        let health_type = if non_numeric_health {
+            DataTypeId::String.into()
+        } else {
+            DataTypeId::Int32.into()
+        };
         let double: NodeId = DataTypeId::Double.into();
         let variables: Vec<(u32, &str, NodeId, Variant, NodeId)> = vec![
             (
@@ -1201,8 +1294,8 @@ mod tests {
                 317,
                 "DeviceHealth",
                 identification.clone(),
-                Variant::Int32(0),
-                int32,
+                health_value,
+                health_type,
             ),
             (
                 318,
@@ -1240,9 +1333,23 @@ mod tests {
                 .component_of(parent.clone())
                 .insert(space);
         }
+        if absent_documentation_value {
+            VariableBuilder::new(
+                &NodeId::new(ns, 332),
+                "UnavailableManual",
+                "UnavailableManual",
+            )
+            .data_type(DataTypeId::String)
+            .component_of(NodeId::new(ns, 330))
+            .insert(space);
+        }
     }
 
     async fn spawn_lab_server(config: LabConfig) -> LabServer {
+        spawn_lab_server_with_options(config, LabOptions::default()).await
+    }
+
+    async fn spawn_lab_server_with_options(config: LabConfig, options: LabOptions) -> LabServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -1255,7 +1362,9 @@ mod tests {
             .port(port)
             .discovery_urls(vec!["/".to_owned()])
             .with_node_manager(simple_node_manager(lab_namespace, "lab"));
-        let token_ids = if config.require_username {
+        let token_ids = if options.no_user_tokens {
+            Vec::new()
+        } else if config.require_username {
             vec!["lab-user-token".to_string()]
         } else {
             let mut ids = vec![opcua::client::ANONYMOUS_USER_TOKEN_ID.to_string()];
@@ -1264,7 +1373,10 @@ mod tests {
             }
             ids
         };
-        builder = builder.add_endpoint("none", ServerEndpoint::new_none("/", &token_ids));
+        for index in 0..options.endpoint_count.unwrap_or(1) {
+            let id = format!("none-{index}");
+            builder = builder.add_endpoint(id, ServerEndpoint::new_none("/", &token_ids));
+        }
         if config.username || config.require_username {
             builder = builder.add_user_token(
                 "lab-user-token",
@@ -1295,6 +1407,19 @@ mod tests {
                 "DeviceSet",
                 &ObjectId::ObjectsFolder.into(),
             );
+            if options.extra_browse_children > 0 {
+                space.add_folder(
+                    &NodeId::new(ns, 400),
+                    "ManyChildren",
+                    "ManyChildren",
+                    &ObjectId::ObjectsFolder.into(),
+                );
+                for id in 401..401 + options.extra_browse_children as u32 {
+                    ObjectBuilder::new(&NodeId::new(ns, id), "Child", "Child")
+                        .organized_by(NodeId::new(ns, 400))
+                        .insert(&mut *space);
+                }
+            }
             if config.aliases {
                 MethodBuilder::new(&NodeId::new(ns, 121), "FindAlias", "FindAlias")
                     .component_of(NodeId::new(ns, 111))
@@ -1308,39 +1433,134 @@ mod tests {
                     )
                     .insert(&mut *space);
             }
-            ObjectBuilder::new(&NodeId::new(ns, 300), "LabAsset", "OT Lab Asset")
-                .organized_by(NodeId::new(ns, 200))
+            if !options.omit_asset {
+                ObjectBuilder::new(&NodeId::new(ns, 300), "LabAsset", "OT Lab Asset")
+                    .organized_by(NodeId::new(ns, 200))
+                    .insert(&mut *space);
+                if !options.empty_asset {
+                    ObjectBuilder::new(&NodeId::new(ns, 310), "Identification", "Identification")
+                        .component_of(NodeId::new(ns, 300))
+                        .insert(&mut *space);
+                    ObjectBuilder::new(
+                        &NodeId::new(ns, 330),
+                        "DocumentationLinks",
+                        "DocumentationLinks",
+                    )
+                    .component_of(NodeId::new(ns, 300))
+                    .insert(&mut *space);
+                    ObjectBuilder::new(
+                        &NodeId::new(ns, 340),
+                        "OperationCounters",
+                        "OperationCounters",
+                    )
+                    .component_of(NodeId::new(ns, 300))
+                    .insert(&mut *space);
+                    add_variables(
+                        &mut space,
+                        ns,
+                        options.absent_documentation_value,
+                        options.non_numeric_health,
+                    );
+                    if options.extra_asset_references {
+                        ObjectBuilder::new(
+                            &NodeId::new(ns, 350),
+                            "UnexpectedAssetGroup",
+                            "UnexpectedAssetGroup",
+                        )
+                        .component_of(NodeId::new(ns, 300))
+                        .insert(&mut *space);
+                        ObjectBuilder::new(
+                            &NodeId::new(ns, 352),
+                            "UnexpectedIdentificationGroup",
+                            "UnexpectedIdentificationGroup",
+                        )
+                        .component_of(NodeId::new(ns, 310))
+                        .insert(&mut *space);
+                        VariableBuilder::new(
+                            &NodeId::new(ns, 353),
+                            "UnsupportedProperty",
+                            "UnsupportedProperty",
+                        )
+                        .value("ignored")
+                        .data_type(DataTypeId::String)
+                        .component_of(NodeId::new(ns, 310))
+                        .insert(&mut *space);
+                        ObjectBuilder::new(
+                            &NodeId::new(ns, 354),
+                            "UnexpectedDocumentationObject",
+                            "UnexpectedDocumentationObject",
+                        )
+                        .component_of(NodeId::new(ns, 330))
+                        .insert(&mut *space);
+                        ObjectBuilder::new(
+                            &NodeId::new(ns, 355),
+                            "UnexpectedCounterObject",
+                            "UnexpectedCounterObject",
+                        )
+                        .component_of(NodeId::new(ns, 340))
+                        .insert(&mut *space);
+                    }
+                    if options.duplicate_manufacturer_reference {
+                        VariableBuilder::new(&NodeId::new(ns, 351), "Manufacturer", "Manufacturer")
+                            .value(LocalizedText::from("Duplicate Manufacturer"))
+                            .data_type(DataTypeId::LocalizedText)
+                            .component_of(NodeId::new(ns, 300))
+                            .insert(&mut *space);
+                    }
+                }
+            }
+            if options.extra_asset_references {
+                VariableBuilder::new(
+                    &NodeId::new(ns, 356),
+                    "UnexpectedDeviceSetVariable",
+                    "UnexpectedDeviceSetVariable",
+                )
+                .value("ignored")
+                .data_type(DataTypeId::String)
+                .component_of(NodeId::new(ns, 200))
                 .insert(&mut *space);
-            ObjectBuilder::new(&NodeId::new(ns, 310), "Identification", "Identification")
-                .component_of(NodeId::new(ns, 300))
-                .insert(&mut *space);
-            ObjectBuilder::new(
-                &NodeId::new(ns, 330),
-                "DocumentationLinks",
-                "DocumentationLinks",
-            )
-            .component_of(NodeId::new(ns, 300))
-            .insert(&mut *space);
-            ObjectBuilder::new(
-                &NodeId::new(ns, 340),
-                "OperationCounters",
-                "OperationCounters",
-            )
-            .component_of(NodeId::new(ns, 300))
-            .insert(&mut *space);
-            add_variables(&mut space, ns);
+            }
         }
         if config.aliases {
+            let reject_alias = options.reject_alias;
+            let malformed_alias_response = options.malformed_alias_response;
+            let duplicate_alias_response = options.duplicate_alias_response;
             manager
                 .inner()
                 .add_method_callback(NodeId::new(ns, 121), move |_| {
+                    if reject_alias {
+                        return Err(StatusCode::BadUnexpectedError);
+                    }
+                    if malformed_alias_response {
+                        let extension = ExtensionObject::from_message(TimeZoneDataType {
+                            offset: 0,
+                            daylight_saving_in_offset: false,
+                        });
+                        return Ok(vec![
+                            Variant::String(UAString::from("not an array")),
+                            Variant::Array(Box::new(Array {
+                                value_type: VariantScalarTypeId::String,
+                                values: vec![Variant::String(UAString::from("not an extension"))],
+                                dimensions: None,
+                            })),
+                            Variant::Array(Box::new(Array {
+                                value_type: VariantScalarTypeId::ExtensionObject,
+                                values: vec![Variant::ExtensionObject(extension)],
+                                dimensions: None,
+                            })),
+                        ]);
+                    }
+                    let mut referenced_nodes = vec![ExpandedNodeId {
+                        node_id: NodeId::new(ns, 300),
+                        namespace_uri: UAString::null(),
+                        server_index: 0,
+                    }];
+                    if duplicate_alias_response {
+                        referenced_nodes.push(referenced_nodes[0].clone());
+                    }
                     let alias = AliasNameDataType {
                         alias_name: QualifiedName::new(ns, "LAB-ASSET-1"),
-                        referenced_nodes: Some(vec![ExpandedNodeId {
-                            node_id: NodeId::new(ns, 300),
-                            namespace_uri: UAString::null(),
-                            server_index: 0,
-                        }]),
+                        referenced_nodes: Some(referenced_nodes),
                     };
                     let array = Variant::Array(Box::new(Array {
                         value_type: VariantScalarTypeId::ExtensionObject,
@@ -1351,6 +1571,18 @@ mod tests {
                     }));
                     Ok(vec![array])
                 });
+            if options.absent_documentation_value {
+                manager
+                    .inner()
+                    .add_read_callback(NodeId::new(ns, 332), |_, _, _| Ok(DataValue::null()));
+            }
+            if options.unreadable_health {
+                manager
+                    .inner()
+                    .add_read_callback(NodeId::new(ns, 317), |_, _, _| {
+                        Err(StatusCode::BadUserAccessDenied)
+                    });
+            }
         }
 
         let mut tasks = JoinSet::new();
@@ -1370,6 +1602,22 @@ mod tests {
             ports: vec![server.port],
             ..ProbeSettings::default()
         }
+    }
+
+    async fn connect_lab_anonymously(server: &LabServer) -> (Arc<Session>, JoinSet<StatusCode>) {
+        let mut client = build_client().unwrap();
+        let url = format!("opc.tcp://127.0.0.1:{}", server.port);
+        let endpoints = client.get_endpoints(url.as_str(), &[], &[]).await.unwrap();
+        let endpoint = Client::find_matching_endpoint(
+            &endpoints,
+            &url,
+            SecurityPolicy::None,
+            MessageSecurityMode::None,
+        )
+        .unwrap();
+        connect_session(&mut client, endpoint, IdentityToken::Anonymous)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1445,6 +1693,299 @@ mod tests {
         })
         .await
         .expect("dropped session owner left its event loop running");
+    }
+
+    #[tokio::test]
+    async fn ignores_malformed_find_alias_outputs_and_uses_device_set() {
+        let server = spawn_lab_server_with_options(
+            LabConfig {
+                username: false,
+                aliases: true,
+                require_username: false,
+            },
+            LabOptions {
+                malformed_alias_response: true,
+                ..LabOptions::default()
+            },
+        )
+        .await;
+
+        let finding = probe(Ipv4Addr::LOCALHOST, &settings_for(&server))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(finding.fields["name"], "LAB-ASSET-1");
+        assert_eq!(finding.raw["assets"].as_array().unwrap().len(), 1);
+        assert!(
+            finding
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("OPC UA FindAlias")),
+            "{:?}",
+            finding.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn deduplicates_aliases_and_non_object_device_set_members() {
+        let server = spawn_lab_server_with_options(
+            LabConfig {
+                username: false,
+                aliases: true,
+                require_username: false,
+            },
+            LabOptions {
+                duplicate_alias_response: true,
+                ..LabOptions::default()
+            },
+        )
+        .await;
+        let finding = probe(Ipv4Addr::LOCALHOST, &settings_for(&server))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(finding.raw["assets"].as_array().unwrap().len(), 1);
+
+        let server = spawn_lab_server_with_options(
+            LabConfig {
+                username: false,
+                aliases: false,
+                require_username: false,
+            },
+            LabOptions {
+                extra_asset_references: true,
+                ..LabOptions::default()
+            },
+        )
+        .await;
+        let finding = probe(Ipv4Addr::LOCALHOST, &settings_for(&server))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(finding.raw["assets"].as_array().unwrap().len(), 1);
+        assert!(finding.fields.contains_key("vendor"));
+    }
+
+    #[tokio::test]
+    async fn retains_endpoint_evidence_within_the_64_endpoint_limit() {
+        let server = spawn_lab_server_with_options(
+            LabConfig {
+                username: false,
+                aliases: true,
+                require_username: false,
+            },
+            LabOptions {
+                endpoint_count: Some(65),
+                ..LabOptions::default()
+            },
+        )
+        .await;
+
+        let finding = probe(Ipv4Addr::LOCALHOST, &settings_for(&server))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            finding.raw["endpointCoverage"],
+            json!({"returned": 65, "retained": 64, "outcome": "limit-reached"})
+        );
+        assert_eq!(finding.raw["endpoints"].as_array().unwrap().len(), 64);
+    }
+
+    #[tokio::test]
+    async fn refuses_to_follow_browse_continuation_points() {
+        let server = spawn_lab_server_with_options(
+            LabConfig {
+                username: false,
+                aliases: false,
+                require_username: false,
+            },
+            LabOptions {
+                extra_browse_children: 65,
+                ..LabOptions::default()
+            },
+        )
+        .await;
+        let (session, event_loops) = connect_lab_anonymously(&server).await;
+
+        assert_eq!(
+            browse_children(&session, &NodeId::new(2, 400))
+                .await
+                .unwrap_err(),
+            "OPC UA browse continuation points are not followed"
+        );
+        drop(session);
+        drop(event_loops);
+    }
+
+    #[tokio::test]
+    async fn rejects_find_alias_method_errors() {
+        let server = spawn_lab_server_with_options(
+            LabConfig {
+                username: false,
+                aliases: true,
+                require_username: false,
+            },
+            LabOptions {
+                reject_alias: true,
+                ..LabOptions::default()
+            },
+        )
+        .await;
+        let (session, event_loops) = connect_lab_anonymously(&server).await;
+
+        assert!(
+            find_alias(&session, &NodeId::new(2, 111), &NodeId::new(2, 121))
+                .await
+                .unwrap_err()
+                .contains("FindAlias failed")
+        );
+
+        drop(session);
+        drop(event_loops);
+    }
+
+    #[tokio::test]
+    async fn preserves_absent_and_unreadable_asset_reads() {
+        let server = spawn_lab_server_with_options(
+            LabConfig {
+                username: false,
+                aliases: true,
+                require_username: false,
+            },
+            LabOptions {
+                unreadable_health: true,
+                absent_documentation_value: true,
+                ..LabOptions::default()
+            },
+        )
+        .await;
+
+        let finding = probe(Ipv4Addr::LOCALHOST, &settings_for(&server))
+            .await
+            .unwrap()
+            .unwrap();
+        let outcomes = finding.raw["assets"][0]["readOutcomes"].as_array().unwrap();
+
+        assert!(outcomes.iter().any(|outcome| {
+            outcome["field"] == "DeviceHealth" && outcome["outcome"] == "bad-status"
+        }));
+        assert!(
+            outcomes.iter().any(|outcome| {
+                outcome["field"] == "UnavailableManual" && outcome["outcome"] == "absent"
+            }),
+            "{outcomes:?}"
+        );
+        assert!(!finding.fields.contains_key("status"));
+    }
+
+    #[tokio::test]
+    async fn ignores_unusable_credentials_and_non_numeric_health() {
+        let server = spawn_lab_server_with_options(
+            LabConfig {
+                username: true,
+                aliases: true,
+                require_username: false,
+            },
+            LabOptions {
+                non_numeric_health: true,
+                duplicate_manufacturer_reference: true,
+                extra_asset_references: true,
+                ..LabOptions::default()
+            },
+        )
+        .await;
+        let mut settings = settings_for(&server);
+        settings.credentials = vec![Credential {
+            username: Some(String::new()),
+            password: Some("unused".into()),
+        }];
+
+        let finding = probe(Ipv4Addr::LOCALHOST, &settings)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            finding.raw["assets"][0]["identification"]["Manufacturer"],
+            "Duplicate Manufacturer"
+        );
+        assert!(!finding.fields.contains_key("status"));
+    }
+
+    #[tokio::test]
+    async fn handles_empty_assets_and_servers_without_asset_entry_points() {
+        let base = LabConfig {
+            username: false,
+            aliases: false,
+            require_username: false,
+        };
+        let empty_asset = spawn_lab_server_with_options(
+            base,
+            LabOptions {
+                empty_asset: true,
+                ..LabOptions::default()
+            },
+        )
+        .await;
+        let finding = probe(Ipv4Addr::LOCALHOST, &settings_for(&empty_asset))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(finding.raw["assets"][0]["readOutcomes"], json!([]));
+
+        let no_assets = spawn_lab_server_with_options(
+            LabConfig {
+                username: false,
+                aliases: false,
+                require_username: false,
+            },
+            LabOptions {
+                omit_asset: true,
+                ..LabOptions::default()
+            },
+        )
+        .await;
+        let finding = probe(Ipv4Addr::LOCALHOST, &settings_for(&no_assets))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(finding.raw["assets"], json!([]));
+        assert!(
+            finding
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("no asset entry points"))
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_unsupported_user_token_policies() {
+        let server = spawn_lab_server_with_options(
+            LabConfig {
+                username: false,
+                aliases: false,
+                require_username: false,
+            },
+            LabOptions {
+                no_user_tokens: true,
+                ..LabOptions::default()
+            },
+        )
+        .await;
+        let finding = probe(Ipv4Addr::LOCALHOST, &settings_for(&server))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(finding.raw["userTokenPolicies"], json!([]));
+        assert!(
+            finding
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("offers no authentication mode supported"))
+        );
     }
 
     #[tokio::test]
