@@ -508,15 +508,17 @@ From the management checkout containing `otserver-otter/`:
 
 ```bash
 pnpm install --frozen-lockfile
-./otserver-otter/lab/test-controller.sh
+OTTER_MANAGEMENT_SKIP_UI=1 ./otserver-otter/lab/test-controller.sh
 ```
 
 Requires Linux, Rust, Node.js 22, pnpm 10, Python 3, OpenSSL with development headers, and Docker or
 Podman. Set `CONTAINER_RUNTIME=podman` to choose explicitly. The gate builds the headless client,
-tests controller behavior and HTTPS recovery, and runs the full management integration suite.
+tests controller behavior and HTTPS recovery, and runs the management integration tests. Otter CI
+and releases exclude suites devoted to frontend components. Suites that also test backend behavior
+still run. Without `OTTER_MANAGEMENT_SKIP_UI`, the script runs the full suite for OTserver's own CI.
 It owns its replica set/upload directory and ignores caller and `.env` database settings.
 Coverage includes enrollment/inventory, configurations/secrets, run lifecycle, scheduling, sync/queued
-imports, authorization, auditing, rotation, revocation, and UI component controls. Managed tests
+imports, authorization, auditing, rotation, and revocation. Managed tests
 disable discovery probes; protocol interoperability remains the separate lab's responsibility.
 Any failed stage fails the gate; preserve stage logs, MongoDB logs, and management JUnit reports.
 
@@ -544,7 +546,7 @@ cargo llvm-cov --lib --fail-under-lines 90 --codecov --output-path target/codeco
 ./lab/test.sh
 ./lab/test-pnio.sh
 python3 lab/controller_verify.py target/debug/otserver-otter
-./lab/test-controller.sh
+OTTER_MANAGEMENT_SKIP_UI=1 ./lab/test-controller.sh
 git diff --check
 ```
 
@@ -553,9 +555,10 @@ belongs in the Docker lab. The controller HTTPS lab is also runnable standalone 
 build. Management's `pnpm test:otter-client` builds the headless executable and exercises enrollment,
 import, and saved-credential restart against Payload REST and the integration-test replica set.
 Its `tests/int/otter-client.int.spec.ts` also accepts an existing build via `OTTER_CLIENT_BIN`.
-`./lab/test-controller.sh` is the full remote-management CI gate. Run from an Otter checkout at
-`MANAGEMENT/otserver-otter` with management dependencies installed; it builds/tests the controller,
-runs the HTTPS lab, and runs the entire management integration suite with the real client enabled.
+`./lab/test-controller.sh` is the remote-management CI gate. Run from an Otter checkout at
+`MANAGEMENT/otserver-otter` with management dependencies installed. The gate fails if a required
+suite for the real client, controller, security, importer, site policy, scanner deletion, or signed
+releases is missing or has skipped tests.
 It owns a disposable Docker/Podman MongoDB replica set and must never reuse operator database URLs.
 Reports live under `lab/artifacts/controller.*/` and record both source revisions plus the client
 binary digest. PRs, main and release tags use the management SHA committed in
