@@ -891,6 +891,7 @@ fn configuration_maps_profile_options_and_separate_credentials() {
         "allowDcpSource",
         "noS7",
         "noEnip",
+        "noIoLink",
         "noBacnet",
         "noFins",
         "noFox",
@@ -918,6 +919,7 @@ fn configuration_maps_profile_options_and_separate_credentials() {
         !options.protocols.arp
             && !options.protocols.profinet
             && !options.protocols.pn_epm
+            && !options.protocols.io_link
             && !options.protocols.netbios
             && !options.protocols.smb
             && !options.protocols.rpc

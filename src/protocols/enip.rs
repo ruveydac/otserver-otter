@@ -1,6 +1,6 @@
 use super::{Finding, TIMEOUT, hex, port, text};
 use crate::contract::Source;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -11,8 +11,10 @@ use tokio::time::timeout;
 const LIST_IDENTITY: [u8; 24] = [
     0x63, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xc1, 0xde, 0xbe, 0xd1, 0, 0, 0, 0,
 ];
+const SIG200_VENDOR_ID: u64 = 0x0328;
+const SIG200_PRODUCT_CODE: u64 = 0x4100;
 
-pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
+pub async fn probe(target: Ipv4Addr, io_link_enabled: bool) -> Result<Option<Finding>, String> {
     let mut request = LIST_IDENTITY;
     request[12..20].copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[..8]);
     let (tcp, udp) = tokio::join!(tcp(target, &request), udp(target, &request));
@@ -39,106 +41,242 @@ pub async fn probe(target: Ipv4Addr) -> Result<Option<Finding>, String> {
             Err(error) => warnings.push(format!("EtherNet/IP {target} {protocol}: {error}")),
         }
     }
-    let Some((_, fields, mut raw)) = responses.first().cloned() else {
-        if let Some(error) = warnings.into_iter().next() {
-            return Err(error);
-        }
-        return Ok(None);
+    let Some((_, fields, raw)) = responses.first().cloned() else {
+        return no_identity(warnings);
     };
-    if let Value::Object(raw) = &mut raw {
-        raw.insert(
-            "fieldSources".into(),
-            json!({
-                "model": {"command": "0x0063", "itemType": "0x000C", "field": "productName"},
-                "vendor": {"command": "0x0063", "field": "vendorId", "derivation": "vendor-lookup"},
-                "serialNumber": {"command": "0x0063", "field": "serialNumber"},
-                "firmwareVersion": {"command": "0x0063", "field": "revision"}
-            }),
-        );
-        if responses
-            .iter()
-            .any(|(transport, _, _)| *transport == "tcp")
-        {
-            match cip_reads(target).await {
-                Ok(records) => {
-                    for record in &records {
-                        let outcome = record["outcome"].as_str().unwrap_or("unknown");
-                        if outcome != "success" {
-                            let service = record["service"].as_u64().unwrap_or_default();
-                            let class = record["class"].as_u64().unwrap_or_default();
-                            let attribute = record["attribute"]
-                                .as_u64()
-                                .map(|value| format!(", attribute {value}"))
-                                .unwrap_or_default();
-                            let status = record["status"]
-                                .as_u64()
-                                .map(|value| format!(", status 0x{value:02X}"))
-                                .unwrap_or_default();
-                            let detail = record["detail"]
-                                .as_str()
-                                .map(|value| format!(": {value}"))
-                                .unwrap_or_default();
-                            warnings.push(format!(
-                                "EtherNet/IP CIP service 0x{service:02X} class 0x{class:02X}{attribute} returned {outcome}{status}{detail}."
-                            ));
-                        }
+    let mut raw = raw
+        .as_object()
+        .expect("ListIdentity parser returns an object")
+        .clone();
+    raw.insert(
+        "fieldSources".into(),
+        json!({
+            "model": {"command": "0x0063", "itemType": "0x000C", "field": "productName"},
+            "vendor": {"command": "0x0063", "field": "vendorId", "derivation": "vendor-lookup"},
+            "serialNumber": {"command": "0x0063", "field": "serialNumber"},
+            "firmwareVersion": {"command": "0x0063", "field": "revision"}
+        }),
+    );
+    if responses
+        .iter()
+        .any(|(transport, _, _)| *transport == "tcp")
+    {
+        let list_identity = Value::Object(raw.clone());
+        match cip_reads(target, io_link_enabled, &list_identity).await {
+            Ok(records) => {
+                for record in &records {
+                    let outcome = record["outcome"].as_str().unwrap_or("unknown");
+                    if outcome != "success" {
+                        let service = record["service"].as_u64().unwrap_or_default();
+                        let class = record["class"].as_u64().unwrap_or_default();
+                        let attribute = record["attribute"]
+                            .as_u64()
+                            .map(|value| format!(", attribute {value}"))
+                            .unwrap_or_default();
+                        let status = record["status"]
+                            .as_u64()
+                            .map(|value| format!(", status 0x{value:02X}"))
+                            .unwrap_or_default();
+                        let detail = record["detail"]
+                            .as_str()
+                            .map(|value| format!(": {value}"))
+                            .unwrap_or_default();
+                        warnings.push(format!(
+                            "EtherNet/IP CIP service 0x{service:02X} class 0x{class:02X}{attribute} returned {outcome}{status}{detail}."
+                        ));
                     }
-                    if let Some(identity) = records.first().and_then(|record| record.get("value")) {
-                        for key in [
-                            "vendorId",
-                            "deviceType",
-                            "productCode",
-                            "revisionMajor",
-                            "revisionMinor",
-                            "serialNumber",
-                        ] {
-                            if identity.get(key).is_some_and(|value| {
-                                !value.is_null() && raw.get(key) != Some(value)
-                            }) {
-                                warnings.push(format!(
-                                    "EtherNet/IP CIP Identity differs from ListIdentity for {key}"
-                                ));
-                            }
-                        }
-                    }
-                    raw.insert("cipReads".into(), json!(records));
                 }
-                Err(error) => warnings.push(format!("EtherNet/IP CIP {target}: {error}")),
+                if let Some(identity) = records.first().and_then(|record| record.get("value")) {
+                    for key in identity_differences(&raw, identity) {
+                        warnings.push(format!(
+                            "EtherNet/IP CIP Identity differs from ListIdentity for {key}"
+                        ));
+                    }
+                }
+                let physical_entities = sig200_physical_entities(&records);
+                if !physical_entities.is_empty() {
+                    raw.insert("physicalEntities".into(), json!(physical_entities));
+                }
+                raw.insert("cipReads".into(), json!(records));
             }
+            Err(error) => warnings.push(format!("EtherNet/IP CIP {target}: {error}")),
         }
-        let scope = serial_scope(raw.get("deviceType").and_then(Value::as_u64).unwrap_or(0));
-        raw.insert(
-            "transportResponses".into(),
-            responses
-                .into_iter()
-                .map(|(transport, _, identity)| {
-                    json!({
-                        "transport": transport,
-                        "identity": identity,
-                    })
-                })
-                .collect(),
-        );
-        raw.insert(
-            "serialClaim".into(),
-            json!({
-                "scope": scope,
-                "issuer": fields.get("vendor"),
-                "manufacturerId": raw.get("vendorId"),
-                "original": fields.get("serialNumber"),
-                "encoding": "cip-uint32-hex",
-                "catalogNumber": raw.get("productCode").and_then(Value::as_u64).map(|code| code.to_string()),
-                "normalizationVersion": 1,
-            }),
-        );
     }
+    let scope = serial_scope(raw.get("deviceType").and_then(Value::as_u64).unwrap_or(0));
+    raw.insert(
+        "transportResponses".into(),
+        responses
+            .into_iter()
+            .map(|(transport, _, identity)| {
+                json!({
+                    "transport": transport,
+                    "identity": identity,
+                })
+            })
+            .collect(),
+    );
+    raw.insert(
+        "serialClaim".into(),
+        json!({
+            "scope": scope,
+            "issuer": fields.get("vendor"),
+            "manufacturerId": raw.get("vendorId"),
+            "original": fields.get("serialNumber"),
+            "encoding": "cip-uint32-hex",
+            "catalogNumber": raw.get("productCode").and_then(Value::as_u64).map(|code| code.to_string()),
+            "normalizationVersion": 1,
+        }),
+    );
     Ok(Some(Finding {
         source: Source::EthernetIp,
         fields,
-        raw,
+        raw: Value::Object(raw),
         ports,
         warnings,
     }))
+}
+
+fn no_identity(warnings: Vec<String>) -> Result<Option<Finding>, String> {
+    match warnings.into_iter().next() {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
+}
+
+fn identity_differences(raw: &Map<String, Value>, identity: &Value) -> Vec<&'static str> {
+    [
+        "vendorId",
+        "deviceType",
+        "productCode",
+        "revisionMajor",
+        "revisionMinor",
+        "serialNumber",
+    ]
+    .into_iter()
+    .filter(|key| {
+        identity
+            .get(*key)
+            .is_some_and(|value| !value.is_null() && raw.get(*key) != Some(value))
+    })
+    .collect()
+}
+
+fn is_sig200_identity(identity: &Value) -> bool {
+    identity["vendorId"].as_u64() == Some(SIG200_VENDOR_ID)
+        && identity["productCode"].as_u64() == Some(SIG200_PRODUCT_CODE)
+}
+
+fn confirms_sig200_identity(list_identity: &Value, cip_identity: &Value) -> bool {
+    is_sig200_identity(list_identity)
+        && is_sig200_identity(cip_identity)
+        && list_identity["vendorId"] == cip_identity["vendorId"]
+        && list_identity["productCode"] == cip_identity["productCode"]
+}
+
+fn cip_request_body(class: u8, instance: u8, service: u8, attribute: Option<u8>) -> Vec<u8> {
+    let mut cip = vec![
+        service,
+        if attribute.is_some() { 3 } else { 2 },
+        0x20,
+        class,
+        0x24,
+        instance,
+    ];
+    if let Some(attribute) = attribute {
+        cip.extend([0x30, attribute]);
+    }
+    let mut body = vec![0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0xb2, 0];
+    body.extend((cip.len() as u16).to_le_bytes());
+    body.extend(cip);
+    body
+}
+
+fn decode_sig200_port_status(instance: u8, value: &[u8]) -> Option<Value> {
+    if !(1..=4).contains(&instance)
+        || value.len() != 25
+        || value[0] != 1
+        || value[1] != 0
+        || value[2..4] != [0, 0]
+        || value[4] != instance
+        || value[8] != 0
+        || value[17] != 0
+        || value[18] != 1
+        || value[19..22] != [0, 0, 0]
+        || value[22] != 1
+        || value[23..25] != [0, 0]
+    {
+        return None;
+    }
+    let status = value[5];
+    let status_name = match status {
+        0 => "running",
+        1 => "input",
+        2 => "output",
+        3 => "deactivated",
+        4 => "no-device",
+        5 => "wrong-device",
+        6 => "fault",
+        255 => "unavailable",
+        _ => "vendor-specific",
+    };
+    Some(json!({
+        "portNumber": instance,
+        "portStatusInfo": status,
+        "portStatus": status_name,
+        "portQualifier": value[6],
+        "portStatusFlags": value[7],
+        "revisionId": value[9],
+        "transmissionRate": value[10],
+        "cycleTime": value[11],
+        "vendorId": u16::from_be_bytes([value[12], value[13]]),
+        "deviceId": u32::from_be_bytes([0, value[14], value[15], value[16]]),
+        "connected": matches!(status, 0 | 5),
+    }))
+}
+
+fn sig200_physical_entities(records: &[Value]) -> Vec<Value> {
+    let mut entities = Vec::new();
+    for record in records.iter().filter(|record| {
+        record["class"].as_u64() == Some(0x96)
+            && record["service"].as_u64() == Some(0x36)
+            && record["outcome"] == "success"
+    }) {
+        let Some(port) = record["instance"]
+            .as_u64()
+            .and_then(|value| u8::try_from(value).ok())
+        else {
+            continue;
+        };
+        let status = &record["value"];
+        let port_ref = format!("enip:io-link-port:{port}");
+        entities.push(json!({
+            "ref": port_ref,
+            "class": "port",
+            "componentType": "io-link-port",
+            "portId": format!("S{port}"),
+            "portNumber": port,
+            "portStatusInfo": status["portStatusInfo"],
+            "portStatus": status["portStatus"],
+        }));
+        if status["connected"] != true {
+            continue;
+        }
+        entities.push(json!({
+            "ref": format!("enip:io-link-device:{port}"),
+            "parentRef": port_ref,
+            "parentPosition": port,
+            "class": "unknown",
+            "componentType": "io-link-device",
+            "ioLinkVendorId": status["vendorId"],
+            "ioLinkDeviceId": status["deviceId"],
+            "portStatus": status["portStatus"],
+        }));
+    }
+    entities
+}
+
+fn is_connection_refused(error: &std::io::Error) -> bool {
+    error.kind() == ErrorKind::ConnectionRefused
 }
 
 fn serial_scope(device_type: u64) -> &'static str {
@@ -154,7 +292,7 @@ async fn tcp(target: Ipv4Addr, request: &[u8]) -> Result<Option<Vec<u8>>, String
     crate::traffic::wait().await;
     let mut stream = match timeout(TIMEOUT, TcpStream::connect(address)).await {
         Ok(Ok(stream)) => stream,
-        Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => {
+        Ok(Err(error)) if is_connection_refused(&error) => {
             return Err("TCP connection refused on port 44818".into());
         }
         Ok(Err(error)) => return Err(error.to_string()),
@@ -207,7 +345,7 @@ async fn udp(target: Ipv4Addr, request: &[u8]) -> Result<Option<Vec<u8>>, String
                 }
                 rejected = true;
             }
-            Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => {
+            Ok(Err(error)) if is_connection_refused(&error) => {
                 return Err("UDP port 44818 returned connection refused".into());
             }
             Ok(Err(error)) => return Err(error.to_string()),
@@ -349,7 +487,11 @@ async fn encapsulation(
     Ok(result)
 }
 
-async fn cip_reads(target: Ipv4Addr) -> Result<Vec<Value>, String> {
+async fn cip_reads(
+    target: Ipv4Addr,
+    io_link_enabled: bool,
+    list_identity: &Value,
+) -> Result<Vec<Value>, String> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
     crate::traffic::wait().await;
     let mut stream = timeout(TIMEOUT, TcpStream::connect((target, 44818)))
@@ -377,20 +519,7 @@ async fn cip_reads(target: Ipv4Addr) -> Result<Vec<Value>, String> {
         (0xf5, Some(5_u8), 0x0e),
         (0xf5, Some(6), 0x0e),
     ] {
-        let mut cip = vec![
-            service,
-            if attribute.is_some() { 3 } else { 2 },
-            0x20,
-            class,
-            0x24,
-            1,
-        ];
-        if let Some(attribute) = attribute {
-            cip.extend([0x30, attribute]);
-        }
-        let mut body = vec![0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0xb2, 0];
-        body.extend((cip.len() as u16).to_le_bytes());
-        body.extend(cip);
+        let body = cip_request_body(class, 1, service, attribute);
         context[0] = context[0].wrapping_add(1);
         let response = match tokio::time::timeout_at(
             deadline,
@@ -427,6 +556,84 @@ async fn cip_reads(target: Ipv4Addr) -> Result<Vec<Value>, String> {
             Err(error) => {
                 records.push(json!({"class": class, "attribute": attribute, "outcome": "malformed", "detail": error}));
                 break;
+            }
+        }
+    }
+    let cip_identity = records
+        .iter()
+        .find(|record| {
+            record["class"].as_u64() == Some(1)
+                && record["instance"].as_u64() == Some(1)
+                && record["outcome"] == "success"
+        })
+        .and_then(|record| record.get("value"));
+    if io_link_enabled
+        && cip_identity.is_some_and(|identity| confirms_sig200_identity(list_identity, identity))
+    {
+        for instance in 1..=4 {
+            let class = 0x96;
+            let service = 0x36;
+            let body = cip_request_body(class, instance, service, None);
+            context[0] = context[0].wrapping_add(1);
+            let response = match tokio::time::timeout_at(
+                deadline,
+                encapsulation(&mut stream, 0x6f, session, &body, context),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    records.push(json!({
+                        "class": class,
+                        "instance": instance,
+                        "service": service,
+                        "outcome": "read-error",
+                        "detail": error,
+                    }));
+                    break;
+                }
+                Err(_) => {
+                    records.push(json!({
+                        "class": class,
+                        "instance": instance,
+                        "service": service,
+                        "outcome": "timeout",
+                    }));
+                    break;
+                }
+            };
+            match cip_payload(&response, service) {
+                Ok((status, value)) => {
+                    let decoded = (status == 0)
+                        .then(|| decode_sig200_port_status(instance, value))
+                        .flatten();
+                    let outcome = match status {
+                        0 if decoded.is_some() => "success",
+                        0 => "malformed",
+                        0x08 | 0x05 | 0x14 => "unsupported",
+                        0x0f => "access-denied",
+                        _ => "protocol-error",
+                    };
+                    records.push(json!({
+                        "class": class,
+                        "instance": instance,
+                        "service": service,
+                        "status": status,
+                        "outcome": outcome,
+                        "value": decoded,
+                        "response": hex(&response),
+                    }));
+                }
+                Err(error) => {
+                    records.push(json!({
+                        "class": class,
+                        "instance": instance,
+                        "service": service,
+                        "outcome": "malformed",
+                        "detail": error,
+                    }));
+                    break;
+                }
             }
         }
     }
@@ -507,6 +714,32 @@ mod tests {
         response
     }
 
+    fn cip_identity_value(vendor_id: u16, product_code: u16) -> Vec<u8> {
+        let mut value = Vec::new();
+        value.extend(vendor_id.to_le_bytes());
+        value.extend(12_u16.to_le_bytes());
+        value.extend(product_code.to_le_bytes());
+        value.extend([1, 0]);
+        value.extend(0_u16.to_le_bytes());
+        value.extend(0x1234_5678_u32.to_le_bytes());
+        value.push(6);
+        value.extend_from_slice(b"SIG200");
+        value.push(3);
+        value
+    }
+
+    fn sig200_port_status_value(instance: u8, status: u8) -> Vec<u8> {
+        let mut value = vec![0; 25];
+        value[0] = 1;
+        value[4] = instance;
+        value[5] = status;
+        value[12..14].copy_from_slice(&(SIG200_VENDOR_ID as u16).to_be_bytes());
+        value[14..17].copy_from_slice(&[0x12, 0x34, instance]);
+        value[18] = 1;
+        value[22] = 1;
+        value
+    }
+
     #[test]
     fn parses_list_identity() {
         let mut response = identity_response();
@@ -527,6 +760,63 @@ mod tests {
         for (device_type, expected_scope) in [(12, "adapter"), (14, "cpu"), (2, "device")] {
             assert_eq!(serial_scope(device_type), expected_scope);
         }
+    }
+
+    #[test]
+    fn no_identity_preserves_transport_errors_and_silence() {
+        assert!(matches!(no_identity(Vec::new()), Ok(None)));
+        assert_eq!(
+            no_identity(vec!["TCP refused".into(), "UDP timeout".into()]).err(),
+            Some("TCP refused".into())
+        );
+    }
+
+    #[test]
+    fn compares_cip_identity_without_overriding_list_identity() {
+        let raw = json!({
+            "vendorId": 1,
+            "deviceType": 12,
+            "productCode": 158,
+            "revisionMajor": 3,
+            "revisionMinor": 7,
+            "serialNumber": "0000002A",
+        });
+        let identity = json!({
+            "vendorId": 1,
+            "deviceType": 12,
+            "productCode": 158,
+            "revisionMajor": 3,
+            "revisionMinor": 7,
+            "serialNumber": "0000002A",
+        });
+        assert!(identity_differences(raw.as_object().unwrap(), &identity).is_empty());
+
+        let identity = json!({
+            "vendorId": 1,
+            "deviceType": 14,
+            "productCode": 158,
+            "revisionMajor": 3,
+            "revisionMinor": 7,
+            "serialNumber": "0000002A",
+        });
+        assert_eq!(
+            identity_differences(raw.as_object().unwrap(), &identity),
+            ["deviceType"]
+        );
+        assert!(identity_differences(raw.as_object().unwrap(), &json!({})).is_empty());
+        assert!(
+            identity_differences(raw.as_object().unwrap(), &json!({"vendorId": null})).is_empty()
+        );
+    }
+
+    #[test]
+    fn detects_refused_and_other_socket_errors() {
+        assert!(is_connection_refused(&std::io::Error::from(
+            ErrorKind::ConnectionRefused
+        )));
+        assert!(!is_connection_refused(&std::io::Error::other(
+            "network down"
+        )));
     }
 
     #[test]
@@ -688,6 +978,50 @@ mod tests {
     }
 
     #[test]
+    fn sig200_identity_requires_matching_list_and_cip_identity_ids() {
+        let identity = json!({"vendorId": SIG200_VENDOR_ID, "productCode": SIG200_PRODUCT_CODE});
+        assert!(confirms_sig200_identity(&identity, &identity));
+        assert!(!confirms_sig200_identity(
+            &identity,
+            &json!({"vendorId": SIG200_VENDOR_ID, "productCode": 1})
+        ));
+        assert!(!confirms_sig200_identity(
+            &json!({"vendorId": 1, "productCode": SIG200_PRODUCT_CODE}),
+            &identity
+        ));
+        assert!(!confirms_sig200_identity(&identity, &json!({})));
+    }
+
+    #[test]
+    fn sig200_port_status_requires_a_successful_live_status_layout() {
+        let mut value = vec![0; 25];
+        value[0] = 1;
+        value[4] = 2;
+        value[5] = 5;
+        value[6] = 0xC0;
+        value[7] = 3;
+        value[9] = 0x11;
+        value[10] = 3;
+        value[11] = 16;
+        value[12..14].copy_from_slice(&808_u16.to_be_bytes());
+        value[14..17].copy_from_slice(&[0x12, 0x34, 0x56]);
+        value[18] = 1;
+        value[22] = 1;
+        let decoded = decode_sig200_port_status(2, &value).unwrap();
+        assert_eq!(decoded["portStatus"], "wrong-device");
+        assert_eq!(decoded["connected"], true);
+        assert_eq!(decoded["vendorId"], 808);
+        assert_eq!(decoded["deviceId"], 0x123456);
+        assert!(decode_sig200_port_status(1, &value).is_none());
+        assert!(decode_sig200_port_status(2, &[0; 24]).is_none());
+        value[0] = 0;
+        assert!(decode_sig200_port_status(2, &value).is_none());
+        value[0] = 1;
+        value[22] = 0;
+        assert!(decode_sig200_port_status(2, &value).is_none());
+    }
+
+    #[test]
     fn cip_payload_rejects_each_malformed_cpf_and_cip_shape() {
         let mut valid = vec![0; 24];
         valid.extend([
@@ -796,7 +1130,12 @@ mod tests {
                 stream.write_all(&body).await.unwrap();
             });
 
-            assert_eq!(cip_reads(Ipv4Addr::LOCALHOST).await.unwrap_err(), expected);
+            assert_eq!(
+                cip_reads(Ipv4Addr::LOCALHOST, false, &Value::Null,)
+                    .await
+                    .unwrap_err(),
+                expected
+            );
             responder.await.unwrap();
         }
     }
@@ -847,10 +1186,144 @@ mod tests {
                 stream.write_all(&result).await.unwrap();
             }
         });
-        let records = cip_reads(Ipv4Addr::LOCALHOST).await.unwrap();
+        let records = cip_reads(
+            Ipv4Addr::LOCALHOST,
+            true,
+            &json!({"vendorId": 1, "productCode": 158}),
+        )
+        .await
+        .unwrap();
         assert_eq!(records.len(), 3);
         assert_eq!(records[0]["value"]["serialNumber"], "00000001");
         assert_eq!(records[2]["value"]["hostname"], "PLC");
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sig200_status_reads_require_matching_live_identity_and_enabled_option() {
+        let _network = crate::network_test_lock().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 44818))
+            .await
+            .unwrap();
+        let responder = tokio::spawn(async move {
+            for (cip_matches, read_io_link) in [(false, true), (true, false), (true, true)] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_count = if cip_matches && read_io_link { 8 } else { 4 };
+                for index in 0..request_count {
+                    let mut header = [0; 24];
+                    stream.read_exact(&mut header).await.unwrap();
+                    let mut body = vec![0; u16::from_le_bytes([header[2], header[3]]) as usize];
+                    stream.read_exact(&mut body).await.unwrap();
+
+                    let response_body = if index == 0 {
+                        assert_eq!(header[..2], [0x65, 0]);
+                        assert_eq!(body, [1, 0, 0, 0]);
+                        vec![1, 0, 0, 0]
+                    } else {
+                        assert_eq!(header[..2], [0x6f, 0]);
+                        let request = &body[16..];
+                        let (service, value) = match index {
+                            1 => {
+                                assert_eq!(request, [1, 2, 0x20, 1, 0x24, 1]);
+                                (
+                                    1,
+                                    cip_identity_value(
+                                        if cip_matches {
+                                            SIG200_VENDOR_ID as u16
+                                        } else {
+                                            1
+                                        },
+                                        if cip_matches {
+                                            SIG200_PRODUCT_CODE as u16
+                                        } else {
+                                            158
+                                        },
+                                    ),
+                                )
+                            }
+                            2 => {
+                                assert_eq!(request, [0x0e, 3, 0x20, 0xf5, 0x24, 1, 0x30, 5]);
+                                (0x0e, vec![0; 22])
+                            }
+                            3 => {
+                                assert_eq!(request, [0x0e, 3, 0x20, 0xf5, 0x24, 1, 0x30, 6]);
+                                (0x0e, vec![0, 0])
+                            }
+                            _ => {
+                                assert_eq!(request.len(), 6);
+                                assert_eq!(request[0], 0x36);
+                                assert_eq!(request[2..4], [0x20, 0x96]);
+                                assert_eq!(request[4], 0x24);
+                                assert_eq!(request[5], (index - 3) as u8);
+                                (
+                                    0x36,
+                                    sig200_port_status_value(request[5], [0, 4, 5, 6][index - 4]),
+                                )
+                            }
+                        };
+                        let mut cip = vec![service | 0x80, 0, 0, 0];
+                        cip.extend(value);
+                        let mut response = body[..14].to_vec();
+                        response.extend((cip.len() as u16).to_le_bytes());
+                        response.extend(cip);
+                        response
+                    };
+
+                    let mut response = [0; 24];
+                    response[..2].copy_from_slice(&header[..2]);
+                    response[2..4].copy_from_slice(&(response_body.len() as u16).to_le_bytes());
+                    response[4..8].copy_from_slice(&if index == 0 {
+                        42_u32.to_le_bytes()
+                    } else {
+                        header[4..8].try_into().unwrap()
+                    });
+                    response[12..20].copy_from_slice(&header[12..20]);
+                    stream.write_all(&response).await.unwrap();
+                    stream.write_all(&response_body).await.unwrap();
+                }
+            }
+        });
+
+        let list_identity = json!({
+            "vendorId": SIG200_VENDOR_ID,
+            "productCode": SIG200_PRODUCT_CODE,
+        });
+        let mismatch = cip_reads(Ipv4Addr::LOCALHOST, true, &list_identity)
+            .await
+            .unwrap();
+        assert_eq!(mismatch.len(), 3);
+
+        let disabled = cip_reads(Ipv4Addr::LOCALHOST, false, &list_identity)
+            .await
+            .unwrap();
+        assert_eq!(disabled.len(), 3);
+
+        let records = cip_reads(Ipv4Addr::LOCALHOST, true, &list_identity)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 7);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["class"] == 0x96 && record["service"] == 0x36)
+                .count(),
+            4
+        );
+        let entities = sig200_physical_entities(&records);
+        assert_eq!(
+            entities
+                .iter()
+                .filter(|entity| entity["componentType"] == "io-link-port")
+                .count(),
+            4
+        );
+        assert_eq!(
+            entities
+                .iter()
+                .filter(|entity| entity["componentType"] == "io-link-device")
+                .count(),
+            2
+        );
         responder.await.unwrap();
     }
 
@@ -896,7 +1369,9 @@ mod tests {
             }
         });
 
-        let records = cip_reads(Ipv4Addr::LOCALHOST).await.unwrap();
+        let records = cip_reads(Ipv4Addr::LOCALHOST, false, &Value::Null)
+            .await
+            .unwrap();
 
         assert_eq!(records[0]["outcome"], "malformed");
         assert_eq!(records[1]["outcome"], "unsupported");
@@ -934,7 +1409,7 @@ mod tests {
             udp.send_to(&response, peer).await.unwrap();
         });
 
-        let finding = probe(Ipv4Addr::LOCALHOST).await.unwrap().unwrap();
+        let finding = probe(Ipv4Addr::LOCALHOST, false).await.unwrap().unwrap();
         assert_eq!(finding.fields["model"], "PLC1");
         assert_eq!(finding.ports.len(), 2);
         assert_eq!(
@@ -1009,7 +1484,7 @@ mod tests {
             udp.send_to(&response, peer).await.unwrap();
         });
 
-        let finding = probe(Ipv4Addr::LOCALHOST).await.unwrap().unwrap();
+        let finding = probe(Ipv4Addr::LOCALHOST, false).await.unwrap().unwrap();
         assert_eq!(finding.fields["model"], "PLC1");
         assert_eq!(
             finding.fields["serialNumber"],
@@ -1037,7 +1512,7 @@ mod tests {
             udp.send_to(&response, peer).await.unwrap();
         });
 
-        let finding = probe(Ipv4Addr::LOCALHOST).await.unwrap().unwrap();
+        let finding = probe(Ipv4Addr::LOCALHOST, false).await.unwrap().unwrap();
 
         assert_eq!(finding.fields["model"], "PLC1");
         assert_eq!(finding.ports.len(), 1);
@@ -1051,11 +1526,11 @@ mod tests {
     async fn closed_loopback_ports_report_an_error_or_no_response() {
         let _network = crate::network_test_lock().await;
 
-        match probe(Ipv4Addr::LOCALHOST).await {
+        match probe(Ipv4Addr::LOCALHOST, false).await {
             Err(error) => {
                 let has_tcp = error.contains(" tcp:");
                 let has_udp = error.contains(" udp:");
-                assert!(has_tcp || has_udp, "{error}");
+                assert!(has_tcp | has_udp, "{error}");
             }
             Ok(None) => {}
             Ok(Some(_)) => panic!("closed ports cannot return an identity"),
@@ -1078,7 +1553,7 @@ mod tests {
             stream.write_all(&response).await.unwrap();
         });
 
-        let error = match probe(Ipv4Addr::LOCALHOST).await {
+        let error = match probe(Ipv4Addr::LOCALHOST, false).await {
             Err(error) => error,
             Ok(_) => panic!("expected malformed ListIdentity data to fail"),
         };
@@ -1192,7 +1667,7 @@ mod tests {
             cip.read_exact(&mut read_body).await.unwrap();
         });
 
-        let finding = probe(Ipv4Addr::LOCALHOST).await.unwrap().unwrap();
+        let finding = probe(Ipv4Addr::LOCALHOST, false).await.unwrap().unwrap();
 
         assert_eq!(finding.fields["model"], "PLC1");
         assert_eq!(finding.raw["cipReads"][0]["outcome"], "read-error");

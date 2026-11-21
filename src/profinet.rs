@@ -355,6 +355,7 @@ impl PnioDiagnostics {
 pub fn enrich_pnio(
     interface: &str,
     source_mac: &str,
+    io_link_enabled: bool,
     devices: &mut [Device],
     targets: &BTreeSet<Ipv4Addr>,
     cancelled: &AtomicBool,
@@ -379,6 +380,7 @@ pub fn enrich_pnio(
             &selected.name,
             source,
             source_ip,
+            io_link_enabled,
             devices,
             targets,
             cancelled,
@@ -386,11 +388,19 @@ pub fn enrich_pnio(
     }
     #[cfg(target_os = "linux")]
     {
-        enrich_linux_pnio(interface, source, source_ip, devices, targets, cancelled)
+        enrich_linux_pnio(
+            interface,
+            source,
+            source_ip,
+            io_link_enabled,
+            devices,
+            targets,
+            cancelled,
+        )
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
-        let _ = (source, source_ip, targets);
+        let _ = (source, source_ip, io_link_enabled, targets);
         Err("PROFINET PNIO reads are supported on Windows and Linux.".into())
     }
 }
@@ -461,6 +471,7 @@ fn attach_pnio_records(device: &mut Device, target_ip: Ipv4Addr, scan: pnio::Rec
 fn read_device_records(
     devices: &mut [Device],
     targets: &BTreeSet<Ipv4Addr>,
+    io_link_enabled: bool,
     cancelled: &AtomicBool,
     mut transact: impl FnMut(
         [u8; 6],
@@ -519,9 +530,10 @@ fn read_device_records(
                 ));
                 continue;
             }
-            match pnio::read_records(
+            match pnio::read_records_with_io_link(
                 pnio::RESPONSE_TIMEOUT,
                 cancelled,
+                io_link_enabled,
                 |port, request, timeout, cancelled| {
                     transact(mac, ip, port, request, timeout, cancelled)
                 },
@@ -717,6 +729,37 @@ fn pnio_physical_entities(records: &[pnio::RecordRead]) -> Value {
         component["class"] = json!("port");
         component["statistics"] = record.parsed["statistics"].clone();
     }
+    for record in records.iter().filter(|record| {
+        record.target.api == pnio::IO_LINK_API
+            && (pnio::IO_LINK_PORT_STATUS_FIRST..=0xB2FF).contains(&record.target.index)
+            && record.parsed["deviceConnected"] == true
+    }) {
+        let port = record.parsed["portNumber"].as_u64().unwrap_or_default();
+        let reference = format!(
+            "pnio:{}:{}:{}:port:{port}",
+            record.target.api, record.target.slot, record.target.subslot
+        );
+        entities.insert(
+            reference.clone(),
+            json!({
+                "ref": reference,
+                "parentRef": format!(
+                    "pnio:{}:{}:{}",
+                    record.target.api, record.target.slot, record.target.subslot
+                ),
+                "parentPosition": port,
+                "class": "unknown",
+                "componentType": "io-link-device",
+                "api": record.target.api,
+                "slot": record.target.slot,
+                "subslot": record.target.subslot,
+                "portNumber": port,
+                "ioLinkVendorId": record.parsed["vendorId"],
+                "ioLinkDeviceId": record.parsed["deviceId"],
+                "portStatus": record.parsed["portStatus"],
+            }),
+        );
+    }
     entities.into_values().collect()
 }
 
@@ -725,6 +768,7 @@ fn enrich_linux_pnio(
     interface: &str,
     source_mac: [u8; 6],
     source_ip: Ipv4Addr,
+    io_link_enabled: bool,
     devices: &mut [Device],
     targets: &BTreeSet<Ipv4Addr>,
     cancelled: &AtomicBool,
@@ -812,6 +856,7 @@ fn enrich_linux_pnio(
     Ok(read_device_records(
         devices,
         targets,
+        io_link_enabled,
         cancelled,
         |target_mac, target_ip, target_port, request, timeout, cancelled| {
             pnio::exchange(
@@ -835,6 +880,7 @@ fn enrich_windows_pnio(
     interface: &str,
     source_mac: [u8; 6],
     source_ip: Ipv4Addr,
+    io_link_enabled: bool,
     devices: &mut [Device],
     targets: &BTreeSet<Ipv4Addr>,
     cancelled: &AtomicBool,
@@ -842,6 +888,7 @@ fn enrich_windows_pnio(
     Ok(read_device_records(
         devices,
         targets,
+        io_link_enabled,
         cancelled,
         |target_mac, target_ip, target_port, request, timeout, cancelled| {
             let (request_header, _) = pnio::parse_rpc_fragment(request)?;
@@ -889,16 +936,7 @@ fn enrich_windows_pnio(
                         return Ok(None);
                     }
                     let ack = if header.requires_fragment_ack() {
-                        let payload = pnio::build_fragment_ack(&header);
-                        Some(pnio::ethernet_ipv4_udp_frame(
-                            source_mac,
-                            target_mac,
-                            source_ip,
-                            target_ip,
-                            pnio::rpc_port(),
-                            target_port,
-                            &payload,
-                        )?)
+                        Some(pnio::build_fragment_ack_frame(&udp, &header)?)
                     } else {
                         None
                     };
@@ -2037,6 +2075,51 @@ mod tests {
     }
 
     #[test]
+    fn pnio_io_link_entities_require_a_live_connected_status() {
+        let entities = pnio_physical_entities(&[
+            pnio_record(
+                pnio::IO_LINK_API,
+                1,
+                1,
+                pnio::IO_LINK_PORT_STATUS_START,
+                json!({
+                    "portNumber": 1,
+                    "portStatusInfo": 0,
+                    "portStatus": "io-link-mode",
+                    "portQualifierInfo": 0,
+                    "deviceConnected": false,
+                    "vendorId": 0x1234,
+                    "deviceId": 0x12345678,
+                }),
+            ),
+            pnio_record(
+                pnio::IO_LINK_API,
+                1,
+                1,
+                pnio::IO_LINK_PORT_STATUS_START + 1,
+                json!({
+                    "portNumber": 2,
+                    "portStatusInfo": 0,
+                    "portStatus": "io-link-mode",
+                    "portQualifierInfo": 0x20,
+                    "deviceConnected": true,
+                    "vendorId": 0x1234,
+                    "deviceId": 0x12345678,
+                }),
+            ),
+        ]);
+        let entities = entities.as_array().unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0]["ref"], "pnio:19969:1:1:port:2");
+        assert_eq!(entities[0]["parentRef"], "pnio:19969:1:1");
+        assert_eq!(entities[0]["class"], "unknown");
+        assert_eq!(entities[0]["componentType"], "io-link-device");
+        assert_eq!(entities[0]["ioLinkVendorId"], 0x1234);
+        assert_eq!(entities[0]["ioLinkDeviceId"], 0x12345678);
+        assert_eq!(pnio_physical_entities(&[]).as_array().unwrap().len(), 0);
+    }
+
+    #[test]
     fn pnio_record_diagnostics_keep_the_target_ip() {
         let mut diagnostics = PnioDiagnostics::default();
         append_pnio_diagnostics(
@@ -2116,6 +2199,7 @@ mod tests {
         let warnings = read_device_records(
             &mut devices,
             &targets,
+            true,
             &AtomicBool::new(false),
             |mac, ip, port, _, timeout, _| {
                 assert_eq!(port, 34964);
@@ -2148,6 +2232,7 @@ mod tests {
             read_device_records(
                 &mut devices,
                 &targets,
+                true,
                 &AtomicBool::new(true),
                 |_, _, _, _, _, _| panic!("cancelled scans must not transmit")
             )
@@ -2157,6 +2242,7 @@ mod tests {
             enrich_pnio(
                 "invalid-interface",
                 "00:11:22:33:44:55",
+                true,
                 &mut devices,
                 &targets,
                 &AtomicBool::new(false)
@@ -2167,6 +2253,7 @@ mod tests {
             enrich_pnio(
                 "invalid-interface",
                 "invalid",
+                true,
                 &mut devices,
                 &targets,
                 &AtomicBool::new(true)
@@ -2183,6 +2270,7 @@ mod tests {
             "missing-interface",
             [0; 6],
             Ipv4Addr::LOCALHOST,
+            true,
             &mut [],
             &BTreeSet::new(),
             &AtomicBool::new(false),

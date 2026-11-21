@@ -101,6 +101,8 @@ pub struct ScanArgs {
     #[arg(long)]
     pub disable_pn_epm: bool,
     #[arg(long)]
+    pub no_io_link: bool,
+    #[arg(long)]
     pub allow_dcp_source: bool,
     #[arg(long)]
     pub no_s7: bool,
@@ -216,6 +218,8 @@ pub struct ScannerConfig {
     pub no_profinet: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_pn_epm: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_io_link: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_dcp_source: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -386,6 +390,7 @@ pub struct ProtocolOptions {
     pub arp: bool,
     pub profinet: bool,
     pub pn_epm: bool,
+    pub io_link: bool,
     pub s7: bool,
     pub enip: bool,
     pub bacnet: bool,
@@ -410,6 +415,7 @@ impl Default for ProtocolOptions {
             arp: true,
             profinet: true,
             pn_epm: true,
+            io_link: true,
             s7: true,
             enip: true,
             bacnet: true,
@@ -831,6 +837,7 @@ pub fn resolve_scan(
         arp: !(args.no_arp || config.no_arp.unwrap_or(false)),
         profinet: !(args.no_profinet || config.no_profinet.unwrap_or(false)),
         pn_epm: !(args.disable_pn_epm || config.disable_pn_epm.unwrap_or(false)),
+        io_link: !(args.no_io_link || config.no_io_link.unwrap_or(false)),
         s7: !(no_native_protocols || args.no_s7 || config.no_s7.unwrap_or(false)),
         enip: !(no_native_protocols || args.no_enip || config.no_enip.unwrap_or(false)),
         bacnet: !(no_native_protocols || args.no_bacnet || config.no_bacnet.unwrap_or(false)),
@@ -1469,9 +1476,16 @@ async fn scan_with_cdp_capture(
         let mac = source_mac.clone();
         let targets = probe_targets.clone();
         let cancellation = Arc::clone(cancelled);
+        let io_link_enabled = options.protocols.io_link;
         let (enriched, result) = tokio::task::spawn_blocking(move || {
-            let result =
-                profinet::enrich_pnio(&selected, &mac, &mut devices, &targets, &cancellation);
+            let result = profinet::enrich_pnio(
+                &selected,
+                &mac,
+                io_link_enabled,
+                &mut devices,
+                &targets,
+                &cancellation,
+            );
             (devices, result)
         })
         .await
@@ -1498,6 +1512,7 @@ async fn scan_with_cdp_capture(
     let native_selection = protocols::Selection {
         s7: options.protocols.s7,
         enip: options.protocols.enip,
+        io_link: options.protocols.io_link,
         bacnet: options.protocols.bacnet,
         fins: options.protocols.fins,
         fox: options.protocols.fox,
@@ -2796,6 +2811,7 @@ mod tests {
             arp: false,
             profinet: false,
             pn_epm: false,
+            io_link: false,
             s7: false,
             enip: false,
             bacnet: false,
@@ -2891,6 +2907,7 @@ mod tests {
                 "output":"configured.json",
                 "snmp":[{"version":"3","username":"ops","authProtocol":"sha256","authPassword":"secret"}],
                 "noProtocols":true,
+                "noIoLink":true,
                 "allowDcpSource":true,
                 "serverUrl":"https://otserver.example/base/",
                 "site":"site-1",
@@ -2912,6 +2929,7 @@ mod tests {
         assert!(resolved.protocols.arp);
         assert!(resolved.protocols.profinet);
         assert!(resolved.protocols.pn_epm);
+        assert!(!resolved.protocols.io_link);
         assert!(resolved.allow_dcp_source);
         assert!(!resolved.protocols.s7);
         assert!(!resolved.protocols.enip);
@@ -2980,6 +2998,7 @@ mod tests {
             no_arp: Some(true),
             no_profinet: Some(false),
             disable_pn_epm: Some(false),
+            no_io_link: Some(false),
             allow_dcp_source: Some(false),
             no_s7: Some(true),
             no_enip: Some(false),
@@ -3257,6 +3276,7 @@ mod tests {
             "--no-arp",
             "--no-profinet",
             "--disable-pn-epm",
+            "--no-io-link",
             "--no-s7",
             "--no-enip",
             "--no-bacnet",
@@ -3285,6 +3305,7 @@ mod tests {
         assert!(args.no_arp);
         assert!(args.no_profinet);
         assert!(args.disable_pn_epm);
+        assert!(args.no_io_link);
         assert!(args.no_s7);
         assert!(args.no_enip);
         assert!(args.no_bacnet);
@@ -3348,6 +3369,22 @@ mod tests {
             let options = resolve_scan(cli, config, None).unwrap();
             assert_eq!(options.protocols.cdp, !(cli_disabled || config_disabled));
             assert!(options.protocols.lldp);
+        }
+    }
+
+    #[test]
+    fn io_link_can_be_disabled_by_cli_or_config_without_changing_profinet() {
+        for (cli_disabled, config_disabled) in [(false, false), (true, false), (false, true)] {
+            let mut cli = args();
+            cli.no_io_link = cli_disabled;
+            let mut config = complete_config("Test", "192.0.2.1", "test.json");
+            config.no_io_link = Some(config_disabled);
+            let options = resolve_scan(cli, config, None).unwrap();
+            assert_eq!(
+                options.protocols.io_link,
+                !(cli_disabled || config_disabled)
+            );
+            assert!(options.protocols.profinet);
         }
     }
 
@@ -5736,6 +5773,7 @@ mod tests {
                         arp: false,
                         profinet: false,
                         pn_epm: false,
+                        io_link: false,
                         s7: false,
                         enip: false,
                         bacnet: false,

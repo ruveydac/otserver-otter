@@ -17,6 +17,7 @@
   "noFox",
   "noHttp",
   "noIec61850",
+  "noIoLink",
   "noLldp",
   "noNetbios",
   "noOpcua",
