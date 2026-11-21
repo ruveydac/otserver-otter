@@ -183,12 +183,7 @@ async fn probe_port(
     // The scanner only uses unsecured channels. The endpoint a server advertises may carry a
     // hostname that is unreachable from the scanned address, so the client substitutes the host
     // it actually connected to.
-    let Some(endpoint) = Client::find_matching_endpoint(
-        &endpoints,
-        &url,
-        SecurityPolicy::None,
-        MessageSecurityMode::None,
-    ) else {
+    let Some(endpoint) = find_none_security_endpoint(&endpoints, &url) else {
         warnings.push(
             "OPC UA server offers no endpoint with SecurityPolicy None; asset details were not read."
                 .into(),
@@ -230,17 +225,7 @@ async fn probe_port(
     let mut fields = base_fields();
     match collect_build_info(&session).await {
         Ok(info) => {
-            if let Some(outcomes) = info["readOutcomes"].as_array() {
-                for outcome in outcomes {
-                    if outcome["outcome"] == "bad-status" {
-                        warnings.push(format!(
-                            "OPC UA BuildInfo read for {} returned status {}.",
-                            outcome["field"].as_str().unwrap_or("unknown field"),
-                            outcome["status"].as_str().unwrap_or("unknown")
-                        ));
-                    }
-                }
-            }
+            warnings.extend(build_info_warnings(&info));
             raw.insert("serverBuildInfo".into(), info);
         }
         Err(error) => warnings.push(format!("OPC UA server BuildInfo: {error}")),
@@ -276,6 +261,42 @@ fn endpoint_evidence(endpoint: &EndpointDescription) -> Value {
     })
 }
 
+fn find_none_security_endpoint(
+    endpoints: &[EndpointDescription],
+    url: &str,
+) -> Option<EndpointDescription> {
+    Client::find_matching_endpoint(
+        endpoints,
+        url,
+        SecurityPolicy::None,
+        MessageSecurityMode::None,
+    )
+}
+
+fn build_info_warnings(info: &Value) -> Vec<String> {
+    info["readOutcomes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|outcome| outcome["outcome"] == "bad-status")
+        .map(|outcome| {
+            format!(
+                "OPC UA BuildInfo read for {} returned status {}.",
+                outcome["field"].as_str().unwrap_or("unknown field"),
+                outcome["status"].as_str().unwrap_or("unknown")
+            )
+        })
+        .collect()
+}
+
+fn validate_read_count(actual: usize, expected: usize, context: &str) -> Result<(), String> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!("{context} result count mismatch"))
+    }
+}
+
 async fn collect_build_info(session: &Session) -> Result<Value, String> {
     let names = [
         "ProductName",
@@ -301,9 +322,7 @@ async fn collect_build_info(session: &Session) -> Result<Value, String> {
     .await
     .map_err(|_| "read timed out".to_string())?
     .map_err(|error| error.to_string())?;
-    if values.len() != reads.len() {
-        return Err("read result count mismatch".into());
-    }
+    validate_read_count(values.len(), reads.len(), "read")?;
     let mut fields = Map::new();
     let mut outcomes = Vec::new();
     for ((name, read), value) in names.into_iter().zip(reads).zip(values) {
@@ -634,9 +653,7 @@ async fn collect_asset(
     .await
     .map_err(|_| "OPC UA read timed out".to_string())?
     .map_err(|error| format!("OPC UA read: {error}"))?;
-    if values.len() != targets.len() {
-        return Err("OPC UA read result count mismatch".into());
-    }
+    validate_read_count(values.len(), targets.len(), "OPC UA read")?;
     for (target, value) in targets.iter().zip(values) {
         entry.read_outcomes.push(json!({"field": target.key, "section": target.section, "nodeId": target.node.to_string(), "status": value.status.map(|status| status.to_string()), "outcome": if value.status.is_some_and(|status| !status.is_good()) {"bad-status"} else if value.value.is_none() {"absent"} else {"success"}}));
         if value.status.is_some_and(|status| !status.is_good()) {
@@ -1136,6 +1153,13 @@ mod tests {
             MessageSecurityMode::SignAndEncrypt,
             opcua::types::UserTokenPolicy::anonymous(),
         ));
+        assert!(
+            find_none_security_endpoint(
+                std::slice::from_ref(&endpoint),
+                endpoint.endpoint_url.as_ref()
+            )
+            .is_none()
+        );
         endpoint.server_certificate = opcua::types::ByteString::from(vec![42; 16_385]);
         let raw = endpoint_evidence(&endpoint);
         assert_eq!(raw["endpointUrl"], "opc.tcp://outside-scan:4840");
@@ -1156,6 +1180,30 @@ mod tests {
         )
         .unwrap();
         assert!(finding.warnings[0].contains("BadUnexpectedError"));
+    }
+
+    #[test]
+    fn reports_bad_build_info_reads_and_ignores_missing_outcomes() {
+        let info = json!({
+            "readOutcomes": [
+                {"field": "SoftwareVersion", "status": "BadUserAccessDenied", "outcome": "bad-status"},
+                {"field": "BuildNumber", "outcome": "success"},
+            ]
+        });
+        assert_eq!(
+            build_info_warnings(&info),
+            ["OPC UA BuildInfo read for SoftwareVersion returned status BadUserAccessDenied."]
+        );
+        assert!(build_info_warnings(&json!({})).is_empty());
+        assert_eq!(validate_read_count(2, 2, "OPC UA read"), Ok(()));
+        assert_eq!(
+            validate_read_count(1, 2, "OPC UA read"),
+            Err("OPC UA read result count mismatch".into())
+        );
+        assert_eq!(
+            validate_read_count(1, 2, "read"),
+            Err("read result count mismatch".into())
+        );
     }
 
     #[tokio::test]
@@ -1191,6 +1239,7 @@ mod tests {
     struct LabOptions {
         endpoint_count: Option<usize>,
         no_user_tokens: bool,
+        omit_device_set: bool,
         omit_asset: bool,
         empty_asset: bool,
         unreadable_health: bool,
@@ -1393,20 +1442,23 @@ mod tests {
         {
             let mut space = manager.address_space().write();
             space.add_namespace("urn:otserver:lab:opcua", ns);
-            // Extend the standard Objects/Aliases category (i=23470) with an Assets category,
-            // mirroring the OPC UA asset management companion specification layout.
-            ObjectBuilder::new(&NodeId::new(ns, 110), "Assets", "Assets")
-                .organized_by(NodeId::new(0, 23470))
-                .insert(&mut *space);
-            ObjectBuilder::new(&NodeId::new(ns, 111), "AssetsByAssetId", "AssetsByAssetId")
-                .organized_by(NodeId::new(ns, 110))
-                .insert(&mut *space);
-            space.add_folder(
-                &NodeId::new(ns, 200),
-                "DeviceSet",
-                "DeviceSet",
-                &ObjectId::ObjectsFolder.into(),
-            );
+            if config.aliases {
+                // Extend the standard Objects/Aliases category with an Assets category.
+                ObjectBuilder::new(&NodeId::new(ns, 110), "Assets", "Assets")
+                    .organized_by(NodeId::new(0, 23470))
+                    .insert(&mut *space);
+                ObjectBuilder::new(&NodeId::new(ns, 111), "AssetsByAssetId", "AssetsByAssetId")
+                    .organized_by(NodeId::new(ns, 110))
+                    .insert(&mut *space);
+            }
+            if !options.omit_device_set {
+                space.add_folder(
+                    &NodeId::new(ns, 200),
+                    "DeviceSet",
+                    "DeviceSet",
+                    &ObjectId::ObjectsFolder.into(),
+                );
+            }
             if options.extra_browse_children > 0 {
                 space.add_folder(
                     &NodeId::new(ns, 400),
@@ -1484,6 +1536,15 @@ mod tests {
                         .value("ignored")
                         .data_type(DataTypeId::String)
                         .component_of(NodeId::new(ns, 310))
+                        .insert(&mut *space);
+                        VariableBuilder::new(
+                            &NodeId::new(ns, 357),
+                            "UnknownAssetProperty",
+                            "UnknownAssetProperty",
+                        )
+                        .value("ignored")
+                        .data_type(DataTypeId::String)
+                        .component_of(NodeId::new(ns, 300))
                         .insert(&mut *space);
                         ObjectBuilder::new(
                             &NodeId::new(ns, 354),
@@ -1911,6 +1972,11 @@ mod tests {
             finding.raw["assets"][0]["identification"]["Manufacturer"],
             "Duplicate Manufacturer"
         );
+        assert!(
+            finding.raw["assets"][0]["identification"]
+                .get("UnknownAssetProperty")
+                .is_none()
+        );
         assert!(!finding.fields.contains_key("status"));
     }
 
@@ -1943,6 +2009,7 @@ mod tests {
             },
             LabOptions {
                 omit_asset: true,
+                omit_device_set: true,
                 ..LabOptions::default()
             },
         )

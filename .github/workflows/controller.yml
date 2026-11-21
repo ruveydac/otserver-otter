@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      MANAGEMENT_REF: ${{ github.event_name == 'schedule' && 'main' || inputs.management_ref || '5474ae11cc22b20fbc020594cd913d8f3e6cc272' }}
+      MANAGEMENT_REF: ${{ github.event_name == 'schedule' && 'main' || inputs.management_ref || '3fe070fa6811bf4d7baf823f9a7547d0b0e9966d' }}
     steps:
       - name: Require a reproducible management revision
         if: github.event_name != 'schedule'
@@ -62,7 +62,9 @@ jobs:
       - name: Install management dependencies
         working-directory: management
         run: pnpm install --frozen-lockfile --ignore-scripts
-      - name: Run full integration gate
+      - name: Run Otter controller integration gate
+        env:
+          OTTER_MANAGEMENT_SKIP_UI: '1'
         run: ./management/otserver-otter/lab/test-controller.sh
       - name: Upload integration reports
         if: always()

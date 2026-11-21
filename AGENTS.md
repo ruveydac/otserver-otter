@@ -41,6 +41,14 @@ instructions are in `README.md`; detailed operator and development guidance foll
 - `--allow-dcp-source`, `allowDcpSource`, and the GUI toggle run DCP before ARP, add reported DCP IPs
   to the ARP sweep, and allow unambiguous DCP identities outside the configured range into later IP
   probes; preserve MAC correlation and OUI vendor resolution.
+- IO-Link discovery uses only read-only status reads: PROFINET API `0x4E01` master info `0xB000`
+  and PortStatus indexes `0xB200 + port - 1` (S1 is `0xB200`). PROFINET status `0` means IO-Link
+  mode, not device presence; use the live PQI DevCom bit to establish a connected device.
+  SIG200 EtherNet/IP uses service `0x36`, class `0x96`, instances 1–4. Gate those requests on
+  matching ListIdentity and CIP Identity vendor `0x0328` and product `0x4100`. Only successful live
+  statuses showing an IO-Link device create connected-device evidence; configured IDs and failed
+  reads never do. `--no-io-link`, `noIoLink`, and the GUI toggle disable these reads. Managed
+  disablement requires scanner version 0.18.0 or newer.
 - Keep discovery read-only. Do not add configuration writes, DCP Set, SNMP SET, DNP3 writes,
   operates, class assignment, freezes, or restarts, brute force, exploits, vulnerability scripts, or
   Modbus requests without an explicit product decision and safety review.
@@ -253,11 +261,12 @@ after enrollment. Run enrollment/installation off the UI thread, require the aut
 and never persist the token or managed protocol credentials.
 
 All discovery protocols are enabled by default. CLI `--no-<protocol>` switches and JSON `noArp`,
-`noProfinet`, `noS7`, `noEnip`, `noBacnet`, `noFins`, `noFox`, `noDnp3`, `noIec61850`, `noNetbios`,
+`noProfinet`, `noS7`, `noEnip`, `noIoLink`, `noBacnet`, `noFins`, `noFox`, `noDnp3`, `noIec61850`, `noNetbios`,
 `noSmb`, `noRpc`, `noHttp`, `noAds`, `noOpcua`, `noSnmp`, `noLldp`, and `noCdp` disable them
 individually. SNMP inventory and LLDP/CDP neighbor evidence share credentials but have independent
 switches. The GUI exposes matching toggles. Managed CDP disablement requires a scanner version that
-supports `noCdp`; management omits the default `noCdp: false` for older scanners.
+supports `noCdp`; management omits the default `noCdp: false` for older scanners. Managed IO-Link
+disablement requires scanner version 0.18.0 or newer; management omits the default `noIoLink: false`.
 `--disable-pn-epm` and `disablePnEpm` independently disable PROFINET PNIO EPM/record reads while
 leaving DCP enabled; the GUI exposes a matching toggle.
 
@@ -499,15 +508,17 @@ From the management checkout containing `otserver-otter/`:
 
 ```bash
 pnpm install --frozen-lockfile
-./otserver-otter/lab/test-controller.sh
+OTTER_MANAGEMENT_SKIP_UI=1 ./otserver-otter/lab/test-controller.sh
 ```
 
 Requires Linux, Rust, Node.js 22, pnpm 10, Python 3, OpenSSL with development headers, and Docker or
 Podman. Set `CONTAINER_RUNTIME=podman` to choose explicitly. The gate builds the headless client,
-tests controller behavior and HTTPS recovery, and runs the full management integration suite.
+tests controller behavior and HTTPS recovery, and runs the management integration tests. Otter CI
+and releases exclude suites devoted to frontend components. Suites that also test backend behavior
+still run. Without `OTTER_MANAGEMENT_SKIP_UI`, the script runs the full suite for OTserver's own CI.
 It owns its replica set/upload directory and ignores caller and `.env` database settings.
 Coverage includes enrollment/inventory, configurations/secrets, run lifecycle, scheduling, sync/queued
-imports, authorization, auditing, rotation, revocation, and UI component controls. Managed tests
+imports, authorization, auditing, rotation, and revocation. Managed tests
 disable discovery probes; protocol interoperability remains the separate lab's responsibility.
 Any failed stage fails the gate; preserve stage logs, MongoDB logs, and management JUnit reports.
 
@@ -535,7 +546,7 @@ cargo llvm-cov --lib --fail-under-lines 90 --codecov --output-path target/codeco
 ./lab/test.sh
 ./lab/test-pnio.sh
 python3 lab/controller_verify.py target/debug/otserver-otter
-./lab/test-controller.sh
+OTTER_MANAGEMENT_SKIP_UI=1 ./lab/test-controller.sh
 git diff --check
 ```
 
@@ -544,9 +555,10 @@ belongs in the Docker lab. The controller HTTPS lab is also runnable standalone 
 build. Management's `pnpm test:otter-client` builds the headless executable and exercises enrollment,
 import, and saved-credential restart against Payload REST and the integration-test replica set.
 Its `tests/int/otter-client.int.spec.ts` also accepts an existing build via `OTTER_CLIENT_BIN`.
-`./lab/test-controller.sh` is the full remote-management CI gate. Run from an Otter checkout at
-`MANAGEMENT/otserver-otter` with management dependencies installed; it builds/tests the controller,
-runs the HTTPS lab, and runs the entire management integration suite with the real client enabled.
+`./lab/test-controller.sh` is the remote-management CI gate. Run from an Otter checkout at
+`MANAGEMENT/otserver-otter` with management dependencies installed. The gate fails if a required
+suite for the real client, controller, security, importer, site policy, scanner deletion, or signed
+releases is missing or has skipped tests.
 It owns a disposable Docker/Podman MongoDB replica set and must never reuse operator database URLs.
 Reports live under `lab/artifacts/controller.*/` and record both source revisions plus the client
 binary digest. PRs, main and release tags use the management SHA committed in

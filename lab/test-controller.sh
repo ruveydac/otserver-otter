@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Full remote-management gate: real client, HTTPS fault recovery, and OTserver integration suite.
 set -euo pipefail
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 MANAGEMENT=$(CDPATH='' cd -- "${1:-$ROOT/..}" && pwd -P)
+REQUIRED_SUITES=(
+  tests/int/{otter-client,otter-management,otter-security}.int.spec.ts
+  tests/int/{otserver-otter,import-site-policy,otter-deletion,otter-releases}.int.spec.ts
+)
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 
@@ -12,8 +15,7 @@ for tool in cargo cut git openssl node pnpm python3 sha256sum; do
 done
 [[ $(node -p 'process.versions.node.split(".")[0]') == 22 ]] || fail 'Node.js 22 is required.'
 [[ $(pnpm --version) == 10.* ]] || fail 'pnpm 10 is required.'
-for file in package.json pnpm-lock.yaml vitest.config.mts tests/int/otter-client.int.spec.ts \
-  tests/int/otter-management.int.spec.ts tests/int/otter-security.int.spec.ts; do
+for file in package.json pnpm-lock.yaml vitest.config.mts "${REQUIRED_SUITES[@]}"; do
   [[ -f "$MANAGEMENT/$file" ]] || fail "Missing $file in $MANAGEMENT; select an OTserver checkout with controller-v1 tests."
 done
 [[ -d "$MANAGEMENT/node_modules" ]] || fail "Install management dependencies first: pnpm --dir \"$MANAGEMENT\" install --frozen-lockfile"
@@ -106,22 +108,29 @@ export OTSERVER_VULNERABILITY_FEEDS=off
 export OTSERVER_QUEUED_IMPORTS=off
 export NODE_ENV=test
 
-# Run the whole management suite: UI controls, authorization, schedules, imports, workers,
-# migrations, and the real Rust REST client (which normally skips without OTTER_CLIENT_BIN).
-coverage=()
-if [[ ${OTTER_MANAGEMENT_COVERAGE:-0} == 1 ]]; then coverage=(--coverage); fi
+test_args=()
+if [[ ${OTTER_MANAGEMENT_SKIP_UI:-0} == 1 ]]; then
+  # Exclude only UI-only suites; files with backend assertions still run.
+  for suite in tests/int/components.int.spec.ts \
+    tests/int/{asset-security,device-catalog-ui,device-identity-ui,import-status,manual-asset-tags}.int.spec.tsx \
+    tests/int/{otter-bulk-updates,otter-release-ui,tag-group-tabs,tag-rule-field}.int.spec.tsx \
+    tests/int/{vulnerability-feed-ui,vulnerability-review-ui}.int.spec.tsx; do
+    test_args+=(--exclude "$suite")
+  done
+fi
+if [[ ${OTTER_MANAGEMENT_COVERAGE:-0} == 1 ]]; then test_args+=(--coverage); fi
 step management pnpm --dir "$MANAGEMENT" test:int \
-  "${coverage[@]}" --reporter=default --reporter=junit --outputFile.junit="$ARTIFACTS/management.junit.xml"
-step management-report python3 -I - "$ARTIFACTS/management.junit.xml" <<'PY'
+  "${test_args[@]}" --reporter=default --reporter=junit --outputFile.junit="$ARTIFACTS/management.junit.xml"
+step management-report python3 -I - "$ARTIFACTS/management.junit.xml" "${REQUIRED_SUITES[@]}" <<'PY'
 import sys
 import xml.etree.ElementTree as ET
 
 report = ET.parse(sys.argv[1]).getroot()
-for name in ("otter-client", "otter-management", "otter-security"):
-    suite = report.find(f"testsuite[@name='tests/int/{name}.int.spec.ts']")
+for name in sys.argv[2:]:
+    suite = report.find(f"testsuite[@name='{name}']")
     assert suite is not None, f"Missing required suite: {name}"
     assert int(suite.get("tests", "0")) > 0, f"Empty required suite: {name}"
     assert all(int(suite.get(key, "0")) == 0 for key in ("skipped", "failures", "errors")), name
 print("All required remote-management suites ran without skipped or failed tests.")
 PY
-printf '\nFull Otter remote-management integration passed.\n'
+printf '\nOtter remote-management integration passed.\n'

@@ -108,8 +108,7 @@ async fn exchange(target: Ipv4Addr, port: u16) -> Result<Option<(String, bool)>,
     crate::traffic::wait().await;
     let mut stream = match timeout(TIMEOUT, TcpStream::connect(address)).await {
         Ok(Ok(stream)) => stream,
-        Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => return Ok(None),
-        Ok(Err(error)) => return Err(format!("Niagara Fox {target}:{port}: {error}")),
+        Ok(Err(error)) => return connection_error(target, port, error),
         Err(_) => return Ok(None),
     };
     if let Ok(response) = request(&mut stream).await
@@ -140,6 +139,18 @@ async fn exchange(target: Ipv4Addr, port: u16) -> Result<Option<(String, bool)>,
     };
     let response = request(&mut stream).await?;
     Ok(response.starts_with("fox a 0").then_some((response, true)))
+}
+
+fn connection_error(
+    target: Ipv4Addr,
+    port: u16,
+    error: std::io::Error,
+) -> Result<Option<(String, bool)>, String> {
+    if error.kind() == ErrorKind::ConnectionRefused {
+        Ok(None)
+    } else {
+        Err(format!("Niagara Fox {target}:{port}: {error}"))
+    }
 }
 
 async fn request(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> Result<String, String> {
@@ -220,6 +231,27 @@ mod tests {
     fn rejects_non_hello_prefixes_and_missing_response_bodies() {
         assert!(parse("fox a 1\n{\nhostName=s:station-1\n};;").is_none());
         assert!(parse("fox a 0\nhostName=s:station-1\n};;").is_none());
+    }
+
+    #[test]
+    fn distinguishes_refused_fox_connections_from_other_failures() {
+        assert_eq!(
+            connection_error(
+                Ipv4Addr::LOCALHOST,
+                1911,
+                std::io::Error::from(ErrorKind::ConnectionRefused)
+            ),
+            Ok(None)
+        );
+        assert!(
+            connection_error(
+                Ipv4Addr::LOCALHOST,
+                1911,
+                std::io::Error::other("network down")
+            )
+            .unwrap_err()
+            .contains("network down")
+        );
     }
 
     #[tokio::test]

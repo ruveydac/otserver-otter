@@ -872,6 +872,7 @@ fn mapped_config(
         "allowDcpSource",
         "noS7",
         "noEnip",
+        "noIoLink",
         "noBacnet",
         "noFins",
         "noFox",

@@ -74,6 +74,7 @@ pub struct ProbeOutcome {
 pub struct Selection {
     pub s7: bool,
     pub enip: bool,
+    pub io_link: bool,
     pub bacnet: bool,
     pub fins: bool,
     pub fox: bool,
@@ -132,6 +133,7 @@ impl Default for Selection {
         Self {
             s7: true,
             enip: true,
+            io_link: true,
             bacnet: true,
             fins: true,
             fox: true,
@@ -202,7 +204,11 @@ pub async fn scan_with_cancellation(
     let probes = async {
         tokio::join!(
             collect_probe(0, probe_if(selection.s7, s7::probe(target)), &completed),
-            collect_probe(1, probe_if(selection.enip, enip::probe(target)), &completed),
+            collect_probe(
+                1,
+                probe_if(selection.enip, enip::probe(target, selection.io_link),),
+                &completed,
+            ),
             collect_probe(
                 2,
                 probe_if(selection.bacnet, bacnet::probe(target)),
@@ -241,10 +247,10 @@ pub async fn scan_with_cancellation(
             collect_probe(
                 13,
                 async {
-                    let checkpoint = |finding| store_probe_result(13, Ok(finding), &completed);
+                    let mut checkpoint = |finding| store_probe_result(13, Ok(finding), &completed);
                     probe_if(
                         selection.ads,
-                        ads::probe(target, ads_settings, cancelled, checkpoint),
+                        ads::probe(target, ads_settings, cancelled, &mut checkpoint),
                     )
                     .await
                 },
@@ -315,58 +321,7 @@ pub async fn scan_with_cancellation(
             ads::mark_cancelled(finding);
         }
         let endpoint = endpoint(protocol, target, opcua, ads_settings);
-        let (status, stage, messages) = match &result {
-            Ok(Some(finding))
-                if protocol == "beckhoff-ads" && cancelled.load(Ordering::Relaxed) =>
-            {
-                (
-                    ProbeStatus::Cancelled,
-                    "collection",
-                    finding.warnings.clone(),
-                )
-            }
-            Ok(Some(finding))
-                if finding
-                    .warnings
-                    .iter()
-                    .all(|warning| informational_warning(warning)) =>
-            {
-                (ProbeStatus::Success, "probe", finding.warnings.clone())
-            }
-            Ok(Some(finding)) => (ProbeStatus::Partial, "collection", finding.warnings.clone()),
-            Ok(None) if cancelled.load(Ordering::Relaxed) => (
-                ProbeStatus::Cancelled,
-                "probe",
-                vec!["Probe cancelled before a response was collected.".into()],
-            ),
-            Ok(None) => (
-                ProbeStatus::NoResponse,
-                "response",
-                vec![format!(
-                    "No response received from {endpoint} (timeout {}).",
-                    timeout(protocol)
-                )],
-            ),
-            Err(error) if connection_refused(error) || timed_out(error) || peer_closed(error) => (
-                ProbeStatus::NoResponse,
-                if connection_refused(error) {
-                    "connect"
-                } else {
-                    "response"
-                },
-                vec![error.clone()],
-            ),
-            Err(error) if cancelled.load(Ordering::Relaxed) && error.contains("cancelled") => (
-                ProbeStatus::Cancelled,
-                diagnostic_stage(protocol, error),
-                vec![error.clone()],
-            ),
-            Err(error) => (
-                ProbeStatus::Failure,
-                diagnostic_stage(protocol, error),
-                vec![error.clone()],
-            ),
-        };
+        let (status, stage, messages) = classify_result(protocol, &endpoint, cancelled, &result);
         outcomes.push(ProbeOutcome {
             source,
             protocol,
@@ -567,6 +522,62 @@ fn peer_closed(message: &str) -> bool {
         || message.contains("peer closed")
 }
 
+fn classify_result(
+    protocol: &str,
+    endpoint: &str,
+    cancelled: &AtomicBool,
+    result: &Result<Option<Finding>, String>,
+) -> (ProbeStatus, &'static str, Vec<String>) {
+    match result {
+        Ok(Some(finding)) if protocol == "beckhoff-ads" && cancelled.load(Ordering::Relaxed) => (
+            ProbeStatus::Cancelled,
+            "collection",
+            finding.warnings.clone(),
+        ),
+        Ok(Some(finding))
+            if finding
+                .warnings
+                .iter()
+                .all(|warning| informational_warning(warning)) =>
+        {
+            (ProbeStatus::Success, "probe", finding.warnings.clone())
+        }
+        Ok(Some(finding)) => (ProbeStatus::Partial, "collection", finding.warnings.clone()),
+        Ok(None) if cancelled.load(Ordering::Relaxed) => (
+            ProbeStatus::Cancelled,
+            "probe",
+            vec!["Probe cancelled before a response was collected.".into()],
+        ),
+        Ok(None) => (
+            ProbeStatus::NoResponse,
+            "response",
+            vec![format!(
+                "No response received from {endpoint} (timeout {}).",
+                timeout(protocol)
+            )],
+        ),
+        Err(error) if connection_refused(error) || timed_out(error) || peer_closed(error) => (
+            ProbeStatus::NoResponse,
+            if connection_refused(error) {
+                "connect"
+            } else {
+                "response"
+            },
+            vec![error.clone()],
+        ),
+        Err(error) if cancelled.load(Ordering::Relaxed) && error.contains("cancelled") => (
+            ProbeStatus::Cancelled,
+            diagnostic_stage(protocol, error),
+            vec![error.clone()],
+        ),
+        Err(error) => (
+            ProbeStatus::Failure,
+            diagnostic_stage(protocol, error),
+            vec![error.clone()],
+        ),
+    }
+}
+
 type CompletedProbes = Mutex<Vec<(usize, Result<Option<Finding>, String>)>>;
 
 async fn collect_probe(
@@ -701,6 +712,7 @@ mod tests {
         let selection = Selection {
             s7: false,
             enip: false,
+            io_link: false,
             bacnet: false,
             fins: false,
             fox: false,
@@ -759,6 +771,7 @@ mod tests {
         let selection = Selection {
             s7: false,
             enip: false,
+            io_link: false,
             bacnet: true,
             fins: false,
             fox: true,
@@ -857,6 +870,7 @@ mod tests {
         let selection = Selection {
             s7: false,
             enip: false,
+            io_link: false,
             bacnet: false,
             fins: false,
             fox: false,
@@ -952,6 +966,7 @@ mod tests {
         let selection = Selection {
             s7: false,
             enip: false,
+            io_link: false,
             bacnet: false,
             fins: false,
             fox: false,
@@ -1073,6 +1088,7 @@ mod tests {
         let selection = Selection {
             s7: false,
             enip: false,
+            io_link: false,
             bacnet: false,
             fins: false,
             fox: true,
@@ -1110,6 +1126,116 @@ mod tests {
         ] {
             assert_eq!(status.label(), expected);
         }
+    }
+
+    #[test]
+    fn classifies_protocol_results_by_response_and_cancellation_state() {
+        let endpoint = "tcp/44818";
+        let active = AtomicBool::new(false);
+        let cancelled = AtomicBool::new(true);
+        let informational = Finding {
+            source: Source::OpcUa,
+            fields: BTreeMap::new(),
+            raw: serde_json::json!({}),
+            ports: Vec::new(),
+            warnings: vec!["server value differs from identity".into()],
+        };
+        let result = Ok(Some(informational));
+        assert_eq!(
+            classify_result("opc-ua", endpoint, &active, &result).0,
+            ProbeStatus::Success
+        );
+
+        let partial = Finding {
+            source: Source::OpcUa,
+            fields: BTreeMap::new(),
+            raw: serde_json::json!({}),
+            ports: Vec::new(),
+            warnings: vec!["malformed property response".into()],
+        };
+        let result = Ok(Some(partial));
+        assert_eq!(
+            classify_result("opc-ua", endpoint, &active, &result).0,
+            ProbeStatus::Partial
+        );
+
+        assert_eq!(
+            classify_result("opc-ua", endpoint, &active, &Ok(None)).0,
+            ProbeStatus::NoResponse
+        );
+        assert_eq!(
+            classify_result("opc-ua", endpoint, &cancelled, &Ok(None)).0,
+            ProbeStatus::Cancelled
+        );
+        assert_eq!(
+            classify_result("s7", endpoint, &active, &Err("connection refused".into())).1,
+            "connect"
+        );
+        assert_eq!(
+            classify_result("s7", endpoint, &active, &Err("response timed out".into())).0,
+            ProbeStatus::NoResponse
+        );
+        assert_eq!(
+            classify_result("s7", endpoint, &active, &Err("peer closed".into())).0,
+            ProbeStatus::NoResponse
+        );
+        assert_eq!(
+            classify_result("s7", endpoint, &active, &Err("malformed response".into())).0,
+            ProbeStatus::Failure
+        );
+        assert_eq!(
+            classify_result(
+                "s7",
+                endpoint,
+                &cancelled,
+                &Err("operation cancelled".into())
+            )
+            .0,
+            ProbeStatus::Cancelled
+        );
+        let ads = Ok(Some(Finding {
+            source: Source::BeckhoffAds,
+            fields: BTreeMap::new(),
+            raw: serde_json::json!({}),
+            ports: Vec::new(),
+            warnings: Vec::new(),
+        }));
+        assert_eq!(
+            classify_result("beckhoff-ads", endpoint, &cancelled, &ads).0,
+            ProbeStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_ads_scan_does_not_start_a_probe() {
+        let selection = Selection {
+            s7: false,
+            enip: false,
+            io_link: false,
+            bacnet: false,
+            fins: false,
+            fox: false,
+            dnp3: false,
+            iec61850: false,
+            netbios: false,
+            smb: false,
+            rpc: false,
+            http: false,
+            opcua: false,
+            ads: true,
+        };
+        let result = scan_with_cancellation(
+            Ipv4Addr::LOCALHOST,
+            None,
+            selection,
+            &opcua::ProbeSettings::default(),
+            &AdsSettings::default(),
+            &AtomicBool::new(true),
+        )
+        .await;
+        assert_eq!(result.outcomes.len(), 1);
+        assert_eq!(result.outcomes[0].status, ProbeStatus::Cancelled);
+        assert!(result.ports.is_empty());
     }
 
     #[test]
@@ -1176,6 +1302,7 @@ mod tests {
         let disabled = Selection {
             s7: false,
             enip: false,
+            io_link: false,
             bacnet: false,
             fins: false,
             fox: false,
