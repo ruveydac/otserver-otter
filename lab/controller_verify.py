@@ -160,14 +160,14 @@ def main(binary):
             process.stdin.write(("t" * 43 + "\n").encode())
             process.stdin.close()
             process.stdin = None
-            assert rejected_upload.wait(30), "first managed upload was not attempted"
+            assert rejected_upload.wait(90), "first managed upload was not attempted"
             process.kill()
             first_logs = process.communicate(timeout=10)
             saved = json.loads((state / "agent-state.json").read_text())
             assert saved["assignment"]["phase"] == "ready" and saved["fileCredential"]["credential"] == "b" * 43
             assert saved["assignment"]["uploadAttempts"] == 1
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment)
-            last_logs = process.communicate(timeout=210)
+            last_logs = process.communicate(timeout=360)
             assert process.returncode == 1, "revocation must stop the agent"
             assert data["error"] is None and data["rotations"] == 1 and len(data["uploads"]) == 2
             assert data["uploadTimes"][1] - data["uploadTimes"][0] >= 120

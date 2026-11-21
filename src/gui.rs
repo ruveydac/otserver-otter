@@ -260,6 +260,7 @@ pub struct GuiApp {
     arp_enabled: bool,
     profinet_enabled: bool,
     pn_epm_enabled: bool,
+    io_link_enabled: bool,
     allow_dcp_source: bool,
     s7_enabled: bool,
     enip_enabled: bool,
@@ -336,6 +337,7 @@ impl GuiApp {
             arp_enabled: true,
             profinet_enabled: true,
             pn_epm_enabled: true,
+            io_link_enabled: true,
             allow_dcp_source: false,
             s7_enabled: true,
             enip_enabled: true,
@@ -424,6 +426,7 @@ impl GuiApp {
         self.arp_enabled = !config.no_arp.unwrap_or(false);
         self.profinet_enabled = !config.no_profinet.unwrap_or(false);
         self.pn_epm_enabled = !config.disable_pn_epm.unwrap_or(false);
+        self.io_link_enabled = !config.no_io_link.unwrap_or(false);
         self.allow_dcp_source = config.allow_dcp_source.unwrap_or(false);
         self.s7_enabled = !(legacy_native_disabled || config.no_s7.unwrap_or(false));
         self.enip_enabled = !(legacy_native_disabled || config.no_enip.unwrap_or(false));
@@ -565,6 +568,7 @@ impl GuiApp {
         config.no_arp = (!self.arp_enabled).then_some(true);
         config.no_profinet = (!self.profinet_enabled).then_some(true);
         config.disable_pn_epm = (!self.pn_epm_enabled).then_some(true);
+        config.no_io_link = (!self.io_link_enabled).then_some(true);
         config.allow_dcp_source = self.allow_dcp_source.then_some(true);
         config.no_s7 = (!self.s7_enabled).then_some(true);
         config.no_enip = (!self.enip_enabled).then_some(true);
@@ -1137,6 +1141,7 @@ impl GuiApp {
                                 ("ARP", &mut self.arp_enabled),
                                 ("PROFINET DCP", &mut self.profinet_enabled),
                                 ("PROFINET PNIO EPM", &mut self.pn_epm_enabled),
+                                ("IO-Link devices", &mut self.io_link_enabled),
                                 ("Allow DCP source", &mut self.allow_dcp_source),
                                 ("S7", &mut self.s7_enabled),
                                 ("EtherNet/IP", &mut self.enip_enabled),
@@ -2634,6 +2639,24 @@ mod tests {
             assert_eq!(app.to_config().no_protocols, None);
             app.cdp_enabled = !app.cdp_enabled;
             assert_eq!(app.to_config().no_cdp, (!disabled).then_some(true));
+        }
+    }
+
+    #[test]
+    fn io_link_toggle_roundtrips_independently_of_legacy_disable() {
+        for (no_io_link, no_protocols) in [(None, None), (Some(true), None), (None, Some(true))] {
+            let config = ScannerConfig {
+                no_io_link,
+                no_protocols,
+                ..ScannerConfig::default()
+            };
+            let mut app = GuiApp::new(ScannerConfigs::Single(Box::new(config)));
+            let disabled = no_io_link.unwrap_or(false);
+            assert_eq!(app.io_link_enabled, !disabled);
+            assert_eq!(app.to_config().no_io_link, disabled.then_some(true));
+            assert_eq!(app.to_config().no_protocols, None);
+            app.io_link_enabled = !app.io_link_enabled;
+            assert_eq!(app.to_config().no_io_link, (!disabled).then_some(true));
         }
     }
 

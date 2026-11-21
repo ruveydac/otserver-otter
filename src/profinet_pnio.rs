@@ -19,9 +19,15 @@ const DEVICE_DIAGNOSIS_INDEX: u16 = 0xF80C;
 const PORT_DATA_INDEX: u16 = 0x802A;
 const PORT_CHECK_INDEX: u16 = 0x802B;
 const PORT_STATISTICS_INDEX: u16 = 0x8072;
+pub(super) const IO_LINK_API: u32 = 0x4E01;
+pub(super) const IO_LINK_MASTER_INFO_INDEX: u16 = 0xB000;
+pub(super) const IO_LINK_PORT_STATUS_START: u16 = 0xB200;
+pub(super) const IO_LINK_PORT_STATUS_FIRST: u16 = IO_LINK_PORT_STATUS_START;
 const PORT_SUBSLOT_START: u16 = 0x8001;
 const PORT_SUBSLOT_END: u16 = 0x80FF;
 const MAX_PORT_TARGETS: usize = 16;
+const MAX_IOLINK_MASTERS: usize = 16;
+const MAX_IOLINK_PORTS: usize = 16;
 pub(crate) const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 const EPM_INTERFACE: &str = "e1af8308-5d1f-11c9-91a4-08002b14a0fa";
@@ -177,9 +183,19 @@ pub(crate) fn response_source_port_matches(request_port: u16, response_port: u16
     response_port == request_port || response_port == EPM_PORT
 }
 
+#[cfg(test)]
 pub(crate) fn read_records(
     timeout: Duration,
     cancelled: &AtomicBool,
+    transact: impl FnMut(u16, &[u8], Duration, &AtomicBool) -> Result<(RpcHeader, Vec<u8>), String>,
+) -> Result<RecordScan, String> {
+    read_records_with_io_link(timeout, cancelled, true, transact)
+}
+
+pub(crate) fn read_records_with_io_link(
+    timeout: Duration,
+    cancelled: &AtomicBool,
+    io_link_enabled: bool,
     mut transact: impl FnMut(u16, &[u8], Duration, &AtomicBool) -> Result<(RpcHeader, Vec<u8>), String>,
 ) -> Result<RecordScan, String> {
     if cancelled.load(Ordering::Relaxed) {
@@ -220,6 +236,7 @@ pub(crate) fn read_records(
         data_length: DEFAULT_RECORD_DATA_LENGTH,
     };
     let mut result = RecordScan::default();
+    let mut io_link_info = Vec::new();
     let mut read_one = |target: RecordTarget, optional: bool| -> Option<RecordRead> {
         if cancelled.load(Ordering::Relaxed) {
             return None;
@@ -230,6 +247,13 @@ pub(crate) fn read_records(
             let (header, body) = transact(endpoint.port, &request, timeout, cancelled)?;
             let response = parse_read_response(&header, &body, &target)?;
             let parsed = parse_record(target.index, &response.data)?;
+            if (IO_LINK_PORT_STATUS_FIRST..IO_LINK_PORT_STATUS_START + 0x100)
+                .contains(&target.index)
+                && parsed["portNumber"].as_u64()
+                    != Some(u64::from(target.index - IO_LINK_PORT_STATUS_START + 1))
+            {
+                return Err("PortStatus record returned a mismatched port number.".into());
+            }
             Ok(RecordRead {
                 target: response.target,
                 data: response.data,
@@ -265,6 +289,10 @@ pub(crate) fn read_records(
         })
         .filter(|values| !values.is_empty())
         .unwrap_or_else(|| vec![0]);
+    let apis = apis
+        .into_iter()
+        .filter(|api| io_link_enabled || *api != IO_LINK_API)
+        .collect::<Vec<_>>();
     result.records.extend(api_record);
 
     let mut module_targets = BTreeSet::new();
@@ -292,6 +320,58 @@ pub(crate) fn read_records(
             }
             collect_module_targets(&record.parsed, api, &mut module_targets);
             result.records.push(record);
+        }
+    }
+    if io_link_enabled {
+        let candidates = module_targets
+            .iter()
+            .filter(|(api, _, _)| *api == IO_LINK_API)
+            .copied()
+            .collect::<Vec<_>>();
+        if candidates.len() > MAX_IOLINK_MASTERS {
+            io_link_info.push(format!(
+                "IO-Link API contains {} proxy submodules; reading at most {MAX_IOLINK_MASTERS} masters.",
+                candidates.len()
+            ));
+        }
+        for (api, slot, subslot) in candidates.into_iter().take(MAX_IOLINK_MASTERS) {
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            let info_target = RecordTarget {
+                api,
+                slot,
+                subslot,
+                index: IO_LINK_MASTER_INFO_INDEX,
+                data_length: DEFAULT_RECORD_DATA_LENGTH,
+            };
+            let Some(info) = read_one(info_target, true) else {
+                continue;
+            };
+            let port_count = info.parsed["portCount"].as_u64().unwrap_or(0) as usize;
+            result.records.push(info);
+            if port_count > MAX_IOLINK_PORTS {
+                io_link_info.push(format!(
+                    "IO-Link master API {api}, slot {slot}, subslot {subslot} reports {port_count} ports; reading at most {MAX_IOLINK_PORTS}."
+                ));
+            }
+            for port in 1..=port_count.min(MAX_IOLINK_PORTS) {
+                if cancelled.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Some(record) = read_one(
+                    RecordTarget {
+                        api,
+                        slot,
+                        subslot,
+                        index: IO_LINK_PORT_STATUS_START + port as u16 - 1,
+                        data_length: DEFAULT_RECORD_DATA_LENGTH,
+                    },
+                    true,
+                ) {
+                    result.records.push(record);
+                }
+            }
         }
     }
     module_targets.insert((0, 0, 1));
@@ -371,6 +451,7 @@ pub(crate) fn read_records(
             }
         }
     }
+    result.info.extend(io_link_info);
     if cancelled.load(Ordering::Relaxed) {
         result
             .warnings
@@ -482,16 +563,7 @@ pub(crate) fn exchange(
             continue;
         }
         if header.requires_fragment_ack() {
-            let ack = build_fragment_ack(&header);
-            let ack_frame = ethernet_ipv4_udp_frame(
-                source_mac,
-                target_mac,
-                source_ip,
-                target_ip,
-                client_port,
-                target_port,
-                &ack,
-            )?;
+            let ack_frame = build_fragment_ack_frame(&udp, &header)?;
             send_frame(&ack_frame)?;
         }
         push_rpc_fragment(&mut fragments, header, body)?;
@@ -785,6 +857,22 @@ pub(crate) fn build_fragment_ack(header: &RpcHeader) -> Vec<u8> {
     encode_rpc_header(&ack)
 }
 
+pub(crate) fn build_fragment_ack_frame(
+    response: &UdpFrame<'_>,
+    header: &RpcHeader,
+) -> Result<Vec<u8>, String> {
+    let ack = build_fragment_ack(header);
+    ethernet_ipv4_udp_frame(
+        response.destination_mac,
+        response.source_mac,
+        response.destination_ip,
+        response.source_ip,
+        response.destination_port,
+        response.source_port,
+        &ack,
+    )
+}
+
 pub(crate) fn parse_rpc_fragment(packet: &[u8]) -> Result<(RpcHeader, Vec<u8>), String> {
     let header = parse_rpc_header(packet)?;
     let end = RPC_HEADER_LENGTH + usize::from(header.body_length);
@@ -974,12 +1062,81 @@ pub(crate) fn parse_record(index: u16, data: &[u8]) -> Result<Value, String> {
         0xF821 => parse_api_record(data, 0x001A),
         0xF000 => parse_api_record(data, 0x0013),
         0xF840 => parse_filter_record(data),
+        IO_LINK_MASTER_INFO_INDEX => parse_iolink_master_info(data),
         DEVICE_DIAGNOSIS_INDEX => parse_device_diagnosis(data),
         PORT_DATA_INDEX => parse_port_data_real(data),
         PORT_CHECK_INDEX => parse_port_data_check(data),
         PORT_STATISTICS_INDEX => parse_port_statistics(data),
+        IO_LINK_PORT_STATUS_FIRST..=0xB2FF => parse_iolink_port_status(data),
         _ => Err(format!("Unsupported PROFINET record index 0x{index:04X}.")),
     }
+}
+
+fn parse_iolink_master_info(data: &[u8]) -> Result<Value, String> {
+    if data.len() < 7 || data[..4] != [1, 0, 0, 0] {
+        return Err("IO-Link master information record is malformed or truncated.".into());
+    }
+    Ok(json!({
+        "versionHigh": data[0],
+        "versionLow": data[1],
+        "portCount": data[4],
+        "clientAccessPoint": format!("0x{:04X}", read_be16(data, 5)?),
+    }))
+}
+
+fn parse_iolink_port_status(data: &[u8]) -> Result<Value, String> {
+    if data.len() < 17 || data[..2] != [1, 0] || data[2] == 0 {
+        return Err("IO-Link PortStatus record is malformed or truncated.".into());
+    }
+    let event_count = usize::from(data[16]);
+    let event_end = 17_usize
+        .checked_add(
+            event_count
+                .checked_mul(3)
+                .ok_or_else(|| "IO-Link PortStatus event count overflowed.".to_string())?,
+        )
+        .ok_or_else(|| "IO-Link PortStatus event length overflowed.".to_string())?;
+    if event_end > data.len() {
+        return Err("IO-Link PortStatus record contains truncated events.".into());
+    }
+    let events = (0..event_count)
+        .map(|index| {
+            let offset = 17 + index * 3;
+            Ok(json!({
+                "qualifier": data[offset],
+                "code": format!("0x{:04X}", read_be16(data, offset + 1)?),
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let status = data[3];
+    let status_name = match status {
+        0 => "io-link-mode",
+        1 => "digital-input-mode",
+        2 => "digital-output-mode",
+        3 => "deactivated",
+        4 => "no-device",
+        5 => "incorrect-device",
+        6 => "error",
+        255 => "unavailable",
+        _ => "vendor-specific",
+    };
+    Ok(json!({
+        "versionHigh": data[0],
+        "versionLow": data[1],
+        "portNumber": data[2],
+        "portStatusInfo": status,
+        "portStatus": status_name,
+        "portQualifierInfo": data[4],
+        "deviceConnected": data[4] & 0x20 != 0,
+        "portStatusFlags": data[5],
+        "fieldbusStatus": data[6],
+        "revisionId": data[7],
+        "transmissionRate": data[8],
+        "masterCycleTime": data[9],
+        "vendorId": read_be16(data, 10)?,
+        "deviceId": read_be32(data, 12)?,
+        "events": events,
+    }))
 }
 
 fn parse_im0(data: &[u8]) -> Result<Value, String> {
@@ -2261,6 +2418,92 @@ mod tests {
         }
     }
 
+    fn io_link_api_list_record() -> Vec<u8> {
+        let mut payload = 1_u16.to_be_bytes().to_vec();
+        payload.extend(IO_LINK_API.to_be_bytes());
+        block_record(0x001A, (1, 0), &payload)
+    }
+
+    fn io_link_identification_record(block_type: u16) -> Vec<u8> {
+        let mut payload = 1_u16.to_be_bytes().to_vec();
+        payload.extend(IO_LINK_API.to_be_bytes());
+        payload.extend(1_u16.to_be_bytes());
+        payload.extend(1_u16.to_be_bytes());
+        payload.extend(0x1111_u32.to_be_bytes());
+        payload.extend(1_u16.to_be_bytes());
+        payload.extend(1_u16.to_be_bytes());
+        payload.extend(0x2222_u32.to_be_bytes());
+        block_record(block_type, (1, u8::from(block_type == 0x0013)), &payload)
+    }
+
+    fn io_link_master_info_record(port_count: u8) -> Vec<u8> {
+        vec![1, 0, 0, 0, port_count, 0xB4, 0]
+    }
+
+    fn io_link_port_status_record(port: u8, status: u8, device_communication: bool) -> Vec<u8> {
+        let mut record = vec![0; 17];
+        record[..2].copy_from_slice(&[1, 0]);
+        record[2] = port;
+        record[3] = status;
+        record[4] = if device_communication { 0x20 } else { 0 };
+        record[10..12].copy_from_slice(&0x1234_u16.to_be_bytes());
+        record[12..16].copy_from_slice(&0x1234_5678_u32.to_be_bytes());
+        record
+    }
+
+    fn scan_io_link_records(enabled: bool) -> (RecordScan, Vec<u16>) {
+        let cancelled = AtomicBool::new(false);
+        let endpoint = endpoint(false);
+        let mut requested = Vec::new();
+        let scan = read_records_with_io_link(
+            Duration::from_millis(10),
+            &cancelled,
+            enabled,
+            |port, request, _, _| {
+                let header = parse_rpc_header(request)?;
+                if header.operation == 2 {
+                    let handle = EpmHandle {
+                        entry: 7,
+                        uuid: uuid("11111111-2222-3333-4444-555555555555"),
+                    };
+                    return parse_rpc_fragment(&epm_response_packet(
+                        &header,
+                        Some(&endpoint),
+                        &handle,
+                    ));
+                }
+                assert_eq!(port, PNIO_PORT);
+                let target = RecordTarget {
+                    api: read_u32(request, 124, true)?,
+                    slot: read_u16(request, 128, true)?,
+                    subslot: read_u16(request, 130, true)?,
+                    index: read_u16(request, 134, true)?,
+                    data_length: read_u32(request, 136, true)?,
+                };
+                requested.push(target.index);
+                let data = match target.index {
+                    0xF821 => io_link_api_list_record(),
+                    0xF840 => io_link_identification_record(0x0030),
+                    0xF000 => io_link_identification_record(0x0013),
+                    IO_LINK_MASTER_INFO_INDEX => io_link_master_info_record(2),
+                    0xB200 => io_link_port_status_record(1, 0, false),
+                    0xB201 => io_link_port_status_record(2, 0, true),
+                    _ => record_for_index(target.index),
+                };
+                let mut response_endpoint = endpoint.clone();
+                response_endpoint.activity_uuid = header.activity_uuid;
+                parse_rpc_fragment(&response_packet(
+                    &target,
+                    &response_endpoint,
+                    &data,
+                    header.sequence,
+                ))
+            },
+        )
+        .unwrap();
+        (scan, requested)
+    }
+
     fn uuid_floor(value: Uuid) -> Vec<u8> {
         let mut floor = Vec::new();
         put_u16(&mut floor, 19, false);
@@ -2400,6 +2643,73 @@ mod tests {
         assert!(records.iter().any(|record| {
             record.target.slot == 1 && record.target.subslot == 1 && record.target.index == 0xAFF5
         }));
+    }
+
+    #[test]
+    fn io_link_reads_use_one_based_port_indexes_and_can_be_disabled() {
+        let (scan, requested) = scan_io_link_records(true);
+        assert!(requested.contains(&IO_LINK_MASTER_INFO_INDEX));
+        assert!(requested.contains(&0xB200));
+        assert!(requested.contains(&0xB201));
+        assert!(!requested.contains(&0xB202));
+        assert!(scan.warnings.is_empty());
+        assert!(scan.records.iter().any(|record| {
+            record.target.index == 0xB201
+                && record.parsed["portNumber"] == 2
+                && record.parsed["portStatus"] == "io-link-mode"
+                && record.parsed["deviceConnected"] == true
+        }));
+        assert!(scan.records.iter().any(|record| {
+            record.target.index == 0xB200
+                && record.parsed["portNumber"] == 1
+                && record.parsed["deviceConnected"] == false
+        }));
+
+        let (_, disabled_requests) = scan_io_link_records(false);
+        assert!(!disabled_requests.contains(&IO_LINK_MASTER_INFO_INDEX));
+        assert!(
+            !disabled_requests
+                .iter()
+                .any(|index| { (IO_LINK_PORT_STATUS_FIRST..=0xB2FF).contains(index) })
+        );
+    }
+
+    #[test]
+    fn io_link_port_status_decodes_device_presence_states_and_rejects_truncation() {
+        assert_eq!(
+            parse_record(IO_LINK_MASTER_INFO_INDEX, &io_link_master_info_record(4)).unwrap()["portCount"],
+            4
+        );
+        assert!(parse_record(IO_LINK_MASTER_INFO_INDEX, &[0; 7]).is_err());
+        for (status, name) in [
+            (0, "io-link-mode"),
+            (1, "digital-input-mode"),
+            (2, "digital-output-mode"),
+            (3, "deactivated"),
+            (4, "no-device"),
+            (5, "incorrect-device"),
+            (6, "error"),
+            (255, "unavailable"),
+        ] {
+            let parsed = parse_record(
+                IO_LINK_PORT_STATUS_FIRST,
+                &io_link_port_status_record(1, status, false),
+            )
+            .unwrap();
+            assert_eq!(parsed["portStatusInfo"], status);
+            assert_eq!(parsed["portStatus"], name);
+            assert_eq!(parsed["vendorId"], 0x1234);
+            assert_eq!(parsed["deviceId"], 0x1234_5678);
+            assert_eq!(parsed["deviceConnected"], false);
+        }
+        let parsed = parse_record(
+            IO_LINK_PORT_STATUS_FIRST,
+            &io_link_port_status_record(1, 0, true),
+        )
+        .unwrap();
+        assert_eq!(parsed["deviceConnected"], true);
+        assert!(parse_record(IO_LINK_PORT_STATUS_FIRST, &[0; 16]).is_err());
+        assert!(parse_record(IO_LINK_PORT_STATUS_FIRST, &[0; 17]).is_err());
     }
 
     #[test]
@@ -2792,6 +3102,7 @@ mod tests {
         let diagnostics = super::super::read_device_records(
             &mut devices,
             &BTreeSet::from([ip]),
+            true,
             &AtomicBool::new(false),
             |_, _, _, request, _, _| {
                 record_reply(request, |target| match target.index {
@@ -3054,6 +3365,8 @@ mod tests {
         let ack = parse_ipv4_udp_frame(&sent[1]).unwrap();
         let (ack_header, ack_body) = parse_rpc_fragment(ack.payload).unwrap();
         assert_eq!(ack_header.packet_type, 9);
+        assert_eq!(ack.source_port, rpc_port());
+        assert_eq!(ack.destination_port, EPM_PORT);
         assert!(ack_body.is_empty());
     }
 

@@ -252,7 +252,7 @@ fn decode_for(response: &[u8], property: u32, invoke: u8, instance: Option<u64>)
         return None;
     }
     let value = tag(response, &mut offset)?;
-    if value.context || value.opening || value.closing {
+    if value.context {
         return None;
     }
     let closing = tag(response, &mut offset)?;
@@ -549,6 +549,26 @@ mod tests {
             Some("BACnet Error response with an unrecognized error-class/code encoding")
         );
         assert_eq!(error_outcome(&unrecognized, 8), None);
+
+        let short_error = [0x81, 0x0a, 0, 9, 1, 4, 0x50, 7, 0];
+        let wrong_error_service = [0x81, 0x0a, 0, 11, 1, 4, 0x50, 7, 0x0d, 0x19, 2];
+        let malformed_reject = [0x81, 0x0a, 0, 10, 1, 4, 0x60, 7, 0x19, 1];
+        let malformed_abort = [0x81, 0x0a, 0, 10, 1, 4, 0x71, 7, 0x19, 1];
+        assert_eq!(error_outcome(&short_error, 7), None);
+        assert_eq!(error_outcome(&wrong_error_service, 7), None);
+        assert_eq!(error_outcome(&malformed_reject, 7), None);
+        assert_eq!(error_outcome(&malformed_abort, 7), None);
+    }
+
+    #[test]
+    fn rejects_non_context_property_and_value_tags() {
+        let mut wrong_property = response(0x4d, 1, false);
+        wrong_property[14] = 0x11;
+        assert_eq!(decode(&wrong_property, 0x4d, 1), None);
+
+        let mut context_value = response(0x4d, 1, false);
+        context_value[17] = 0x0e;
+        assert_eq!(decode(&context_value, 0x4d, 1), None);
     }
 
     #[tokio::test]

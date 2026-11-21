@@ -293,7 +293,7 @@ pub async fn probe(
     target: Ipv4Addr,
     settings: &ProbeSettings,
     cancelled: &AtomicBool,
-    mut checkpoint: impl FnMut(Option<Finding>),
+    checkpoint: &mut (dyn FnMut(Option<Finding>) + Send),
 ) -> Result<Option<Finding>, String> {
     if cancelled.load(Ordering::Relaxed) {
         return Ok(None);
@@ -1276,7 +1276,7 @@ mod tests {
             ams_ports: vec![851],
         };
 
-        let finding = probe(target, &settings, &cancelled, |_| {})
+        let finding = probe(target, &settings, &cancelled, &mut |_| {})
             .await
             .unwrap()
             .unwrap();
@@ -1332,7 +1332,7 @@ mod tests {
             ..ProbeSettings::default()
         };
 
-        let finding = probe(target, &settings, &cancelled, |_| {})
+        let finding = probe(target, &settings, &cancelled, &mut |_| {})
             .await
             .unwrap()
             .unwrap();
@@ -1492,7 +1492,7 @@ mod tests {
             ams_ports: vec![851],
             ..ProbeSettings::default()
         };
-        let finding = probe(target, &settings, &AtomicBool::new(false), |_| {})
+        let finding = probe(target, &settings, &AtomicBool::new(false), &mut |_| {})
             .await
             .unwrap()
             .unwrap();
@@ -1516,7 +1516,7 @@ mod tests {
             ..ProbeSettings::default()
         };
 
-        let finding = probe(target, &settings, &AtomicBool::new(false), |_| {})
+        let finding = probe(target, &settings, &AtomicBool::new(false), &mut |_| {})
             .await
             .unwrap()
             .unwrap();
@@ -1542,7 +1542,7 @@ mod tests {
         let cancelled = AtomicBool::new(true);
 
         assert!(
-            probe(Ipv4Addr::LOCALHOST, &settings, &cancelled, |_| {})
+            probe(Ipv4Addr::LOCALHOST, &settings, &cancelled, &mut |_| {})
                 .await
                 .unwrap()
                 .is_none()
@@ -1570,7 +1570,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             &ProbeSettings::default(),
             &cancelled,
-            |_| {
+            &mut |_| {
                 checkpoints += 1;
                 if checkpoints == 1 {
                     cancelled.store(true, Ordering::Relaxed);
@@ -1643,7 +1643,7 @@ mod tests {
             ams_ports: vec![851, 801, 10_000],
         };
 
-        let finding = probe(target, &settings, &AtomicBool::new(false), |_| {})
+        let finding = probe(target, &settings, &AtomicBool::new(false), &mut |_| {})
             .await
             .unwrap()
             .unwrap();
@@ -1797,7 +1797,7 @@ mod tests {
         let cancelled = AtomicBool::new(false);
         let mut checkpoints = 0;
 
-        let finding = probe(target, &settings, &cancelled, |_| {
+        let finding = probe(target, &settings, &cancelled, &mut |_| {
             checkpoints += 1;
             if checkpoints == 2 {
                 cancelled.store(true, Ordering::Relaxed);
@@ -1839,7 +1839,7 @@ mod tests {
             ..ProbeSettings::default()
         };
 
-        let finding = probe(target, &settings, &AtomicBool::new(false), |_| {})
+        let finding = probe(target, &settings, &AtomicBool::new(false), &mut |_| {})
             .await
             .unwrap()
             .unwrap();
@@ -1902,7 +1902,7 @@ mod tests {
             ..ProbeSettings::default()
         };
 
-        let finding = probe(target, &settings, &AtomicBool::new(false), |_| {})
+        let finding = probe(target, &settings, &AtomicBool::new(false), &mut |_| {})
             .await
             .unwrap()
             .unwrap();

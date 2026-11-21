@@ -507,7 +507,7 @@ def assert_pnio(result: dict) -> None:
     )
     by_index = {record["index"]: record["parsed"] for record in records}
     assert by_index["0xF821"]["apis"][0]["api"] == 0
-    assert by_index["0xF000"]["apis"][0]["modules"][0]["slot"] == 1
+    assert [module["slot"] for module in by_index["0xF000"]["apis"][0]["modules"]] == [0, 1]
     assert by_index["0xAFF0"]["softwareRevision"] == "V1.2.3"
     assert by_index["0xAFF0"]["imSupported"] == 0x003E
     assert (
@@ -595,6 +595,7 @@ def main() -> None:
             "--no-protocols",
             "--no-snmp",
             "--no-lldp",
+            expect_partial=fallback,
         )
         if fallback:
             assert_pnio_fallback(result)
